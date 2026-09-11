@@ -2,7 +2,7 @@
 
 #include "vitadaw/audio/AudioDeviceState.h"
 #include "vitadaw/audio/IAudioEngineControl.h"
-#include "vitadaw/audio/RealtimePlaybackCursor.h"
+#include "vitadaw/audio/RealtimeAudioEngine.h"
 
 #include <juce_audio_devices/juce_audio_devices.h>
 
@@ -14,85 +14,66 @@
 
 namespace vitadaw::platform::juce_adapter {
 
-// JUCE platform adapter: owns device, WAV decoding and the RT playback callback.
-// Portable application/domain code only sees IAudioEngineControl.
 class JuceAudioDeviceAdapter final : public audio::IAudioEngineControl,
                                      private juce::AudioIODeviceCallback,
                                      private juce::ChangeListener {
 public:
     using StateChangedCallback = std::function<void(const audio::AudioDeviceState&)>;
+    static constexpr std::size_t preparationMemoryBudgetBytes = 512U * 1024U * 1024U;
 
     JuceAudioDeviceAdapter();
     ~JuceAudioDeviceAdapter() override;
-
     JuceAudioDeviceAdapter(const JuceAudioDeviceAdapter&) = delete;
     JuceAudioDeviceAdapter& operator=(const JuceAudioDeviceAdapter&) = delete;
 
     [[nodiscard]] bool initialise();
     [[nodiscard]] bool reinitialise();
     void shutdown() noexcept;
-
+    void pollDeviceLifecycle();
     [[nodiscard]] const audio::AudioDeviceState& state() const noexcept;
     void setStateChangedCallback(StateChangedCallback callback);
 
-    [[nodiscard]] audio::AudioFileLoadResult loadWav(
-        const std::filesystem::path& file,
+    [[nodiscard]] audio::AudioFilePreparationResult prepareWav(
+        const std::filesystem::path& file, tracks::AudioTrackSlot track,
         timeline::SampleRate projectSampleRate) override;
+    [[nodiscard]] bool commitPreparedWav(
+        audio::PreparedAudioFilePtr prepared,
+        audio::AudioFileCommitAction modelCommit) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestStop() noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
 
 private:
     void audioDeviceIOCallbackWithContext(
-        const float* const* inputChannelData,
-        int numInputChannels,
-        float* const* outputChannelData,
-        int numOutputChannels,
-        int numSamples,
-        const juce::AudioIODeviceCallbackContext& context) noexcept override;
-    void audioDeviceAboutToStart(juce::AudioIODevice* device) noexcept override;
+        const float* const*, int, float* const*, int, int,
+        const juce::AudioIODeviceCallbackContext&) noexcept override;
+    void audioDeviceAboutToStart(juce::AudioIODevice*) noexcept override;
     void audioDeviceStopped() noexcept override;
-    void changeListenerCallback(juce::ChangeBroadcaster* source) override;
+    void audioDeviceError(const juce::String&) override;
+    void changeListenerCallback(juce::ChangeBroadcaster*) override;
+
+    enum class PendingLifecycleEvent : std::uint8_t { none, stopped, error };
+    struct PreparedAudio;
+    struct PreparedJuceAudioFile;
 
     void closeDevice(bool publishClosedState) noexcept;
     void refreshState();
     void publishState();
-
-    enum class RealtimeCommand {
-        play,
-        stop,
-    };
-
-    struct QueuedRealtimeCommand {
-        RealtimeCommand command{RealtimeCommand::stop};
-        audio::AudioCommandSequence sequence{};
-    };
-
-    static constexpr std::size_t realtimeCommandCapacity = 8;
-
-    [[nodiscard]] audio::AudioControlRequestResult enqueueRealtimeCommand(
-        RealtimeCommand command) noexcept;
-    void consumeRealtimeCommands() noexcept;
-    void publishRealtimeTransport() noexcept;
-    void clearRealtimeCommands() noexcept;
     void detachAudioCallback() noexcept;
     void attachAudioCallback();
-
-    struct PreparedAudio;
+    void configureRealtimeEngine() noexcept;
+    [[nodiscard]] timeline::ProjectFrameCount preparedDuration() const noexcept;
+    [[nodiscard]] std::size_t preparedBytes() const noexcept;
 
     juce::AudioDeviceManager deviceManager_;
     audio::AudioDeviceStateModel stateModel_;
     StateChangedCallback stateChangedCallback_;
-    std::unique_ptr<PreparedAudio> preparedAudio_;
-    std::array<QueuedRealtimeCommand, realtimeCommandCapacity> realtimeCommands_{};
-    std::atomic<std::size_t> commandWriteIndex_{};
-    std::atomic<std::size_t> commandReadIndex_{};
-    std::atomic<bool> preparedAudioAvailable_{};
-    audio::RealtimePlaybackCursor playbackCursor_;
-    audio::RealtimeTransportExchange transportExchange_;
+    std::array<std::unique_ptr<PreparedAudio>, tracks::audioTrackCount> preparedTracks_;
+    audio::RealtimeAudioEngine realtimeEngine_;
+    timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;
-    audio::AudioCommandSequence nextCommandSequence_{1};
-    audio::AudioCommandSequence lastProcessedCommandSequence_{};
+    std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
+    std::atomic<bool> suppressLifecycleNotification_{};
     bool callbackRegistered_{};
     bool changeListenerRegistered_{};
 };

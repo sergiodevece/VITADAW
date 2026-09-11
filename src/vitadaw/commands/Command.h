@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vitadaw/tracks/AudioTrack.h"
+
 #include <filesystem>
 #include <string>
 #include <variant>
@@ -12,6 +14,7 @@ struct AddAudioTrack {
 
 struct LoadAudioFile {
     std::filesystem::path file;
+    tracks::AudioTrackSlot track{tracks::AudioTrackSlot::first};
 };
 
 struct Play {};

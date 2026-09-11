@@ -1,10 +1,14 @@
 #include "vitadaw/platform/juce/JuceAudioDeviceAdapter.h"
+#include "vitadaw/audio/AudioPreparationPolicy.h"
 
 #include <juce_audio_formats/juce_audio_formats.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -13,42 +17,60 @@ namespace vitadaw::platform::juce_adapter {
 struct JuceAudioDeviceAdapter::PreparedAudio {
     juce::AudioBuffer<float> samples;
     timeline::SampleRate sourceSampleRate;
+};
+
+struct JuceAudioDeviceAdapter::PreparedJuceAudioFile final
+    : audio::PreparedAudioFile {
+    PreparedJuceAudioFile(audio::AudioFileMetadata metadata,
+                          tracks::AudioTrackSlot destination,
+                          timeline::SampleRate projectRate,
+                          std::unique_ptr<PreparedAudio> resource) noexcept
+        : audio::PreparedAudioFile(metadata), track(destination),
+          projectSampleRate(projectRate), audioResource(std::move(resource)) {}
+
+    tracks::AudioTrackSlot track;
     timeline::SampleRate projectSampleRate;
-    timeline::ProjectFrameCount projectDuration;
+    std::unique_ptr<PreparedAudio> audioResource;
 };
 
 JuceAudioDeviceAdapter::JuceAudioDeviceAdapter() = default;
-
-JuceAudioDeviceAdapter::~JuceAudioDeviceAdapter() {
-    shutdown();
-}
+JuceAudioDeviceAdapter::~JuceAudioDeviceAdapter() { shutdown(); }
 
 bool JuceAudioDeviceAdapter::initialise() {
     closeDevice(false);
-    playbackCursor_.stopAndRewind();
-    clearRealtimeCommands();
-
+    pendingLifecycleEvent_.store(PendingLifecycleEvent::none, std::memory_order_release);
+    realtimeEngine_.deviceInitialising();
     deviceManager_.addChangeListener(this);
     changeListenerRegistered_ = true;
-
     const auto error = deviceManager_.initialiseWithDefaultDevices(0, 2);
     if (error.isNotEmpty()) {
+        realtimeEngine_.deviceError();
         stateModel_.markError(error.toStdString());
         publishState();
         return false;
     }
-
     attachAudioCallback();
     refreshState();
     return stateModel_.state().status == audio::AudioDeviceStatus::active;
 }
 
-bool JuceAudioDeviceAdapter::reinitialise() {
-    return initialise();
-}
+bool JuceAudioDeviceAdapter::reinitialise() { return initialise(); }
+void JuceAudioDeviceAdapter::shutdown() noexcept { closeDevice(true); }
 
-void JuceAudioDeviceAdapter::shutdown() noexcept {
-    closeDevice(true);
+void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
+    const auto event = pendingLifecycleEvent_.exchange(PendingLifecycleEvent::none,
+                                                        std::memory_order_acq_rel);
+    if (event == PendingLifecycleEvent::error) {
+        stateModel_.markError("Audio output device reported an error");
+        publishState();
+    } else if (event == PendingLifecycleEvent::stopped) {
+        stateModel_.markError("Audio output device stopped");
+        publishState();
+    } else if (realtimeEngine_.deviceState() ==
+                   audio::DeviceProcessingState::operational &&
+               stateModel_.state().status != audio::AudioDeviceStatus::active) {
+        refreshState();
+    }
 }
 
 const audio::AudioDeviceState& JuceAudioDeviceAdapter::state() const noexcept {
@@ -60,190 +82,176 @@ void JuceAudioDeviceAdapter::setStateChangedCallback(StateChangedCallback callba
     publishState();
 }
 
-audio::AudioFileLoadResult JuceAudioDeviceAdapter::loadWav(
-    const std::filesystem::path& filePath,
+audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
+    const std::filesystem::path& filePath, tracks::AudioTrackSlot track,
     timeline::SampleRate projectSampleRate) {
-    const auto nativePath = filePath.wstring();
-    const juce::File file{juce::String(nativePath.c_str())};
-    if (!file.hasFileExtension("wav")) {
-        return {false, {}, "Only WAV files are supported"};
-    }
-    if (!file.existsAsFile()) {
-        return {false, {}, "WAV file does not exist"};
-    }
+    try {
+        const auto trackIndex = tracks::toIndex(track);
+        if (trackIndex >= preparedTracks_.size()) {
+            return {nullptr, "Invalid audio track slot"};
+        }
+        if (!projectSampleRate.isValid()) {
+            return {nullptr, "Project sample rate must be finite and positive"};
+        }
 
-    juce::WavAudioFormat wavFormat;
-    auto inputStream = file.createInputStream();
-    if (inputStream == nullptr) {
-        return {false, {}, "WAV file could not be opened"};
+        const auto nativePath = filePath.wstring();
+        const juce::File file{juce::String(nativePath.c_str())};
+        if (!file.hasFileExtension("wav")) {
+            return {nullptr, "Only WAV files are supported"};
+        }
+        if (!file.existsAsFile()) {
+            return {nullptr, "WAV file does not exist"};
+        }
+        juce::WavAudioFormat wavFormat;
+        auto inputStream = file.createInputStream();
+        if (inputStream == nullptr) {
+            return {nullptr, "WAV file could not be opened"};
+        }
+        std::unique_ptr<juce::AudioFormatReader> reader{
+            wavFormat.createReaderFor(inputStream.release(), true)};
+        if (reader == nullptr || reader->lengthInSamples <= 0) {
+            return {nullptr, "WAV is invalid or is not mono/stereo PCM or float"};
+        }
+        if (reader->lengthInSamples > std::numeric_limits<int>::max()) {
+            return {nullptr, "WAV file is too large to prepare safely"};
+        }
+
+        const auto frameCount = static_cast<std::uint64_t>(reader->lengthInSamples);
+        const auto channelCount = static_cast<std::uint64_t>(reader->numChannels);
+        const auto validation = audio::validatePreparationShape(
+            timeline::SampleRate{reader->sampleRate}, channelCount, frameCount,
+            preparedBytes(), preparationMemoryBudgetBytes);
+        if (!validation.isValid()) {
+            if (validation.error ==
+                audio::PreparationValidationError::memoryBudgetExceeded) {
+                return {nullptr,
+                        "WAV exceeds the 512 MiB preparation memory budget"};
+            }
+            if (validation.error ==
+                audio::PreparationValidationError::sizeOverflow) {
+                return {nullptr,
+                        "WAV decoded size overflows the platform size type"};
+            }
+            return {nullptr, "WAV has invalid sample rate, channels, or length"};
+        }
+
+        auto prepared = std::make_unique<PreparedAudio>();
+        prepared->sourceSampleRate = timeline::SampleRate{reader->sampleRate};
+        prepared->samples.setSize(static_cast<int>(channelCount),
+                                  static_cast<int>(frameCount), false, true, false);
+        std::vector<float*> destinationChannels(static_cast<std::size_t>(channelCount));
+        for (std::size_t channel = 0; channel < destinationChannels.size(); ++channel) {
+            destinationChannels[channel] =
+                prepared->samples.getWritePointer(static_cast<int>(channel));
+        }
+        if (!reader->read(destinationChannels.data(), static_cast<int>(channelCount),
+                          0, static_cast<int>(frameCount))) {
+            return {nullptr, "WAV samples could not be decoded"};
+        }
+        for (const auto* samples : destinationChannels) {
+            if (!audio::containsOnlyFiniteSamples(
+                    {samples, static_cast<std::size_t>(frameCount)})) {
+                return {nullptr, "WAV contains non-finite float samples"};
+            }
+        }
+        const audio::AudioFileMetadata metadata{
+            prepared->sourceSampleRate, static_cast<std::uint32_t>(channelCount),
+            {frameCount}, {static_cast<double>(frameCount) / reader->sampleRate}};
+
+        return {std::make_unique<PreparedJuceAudioFile>(
+                    metadata, track, projectSampleRate, std::move(prepared)),
+                {}};
+    } catch (const std::bad_alloc&) {
+        return {nullptr, "Not enough memory to prepare WAV"};
+    } catch (const std::exception&) {
+        return {nullptr, "Unexpected error while preparing WAV"};
+    } catch (...) {
+        return {nullptr, "Unknown error while preparing WAV"};
     }
+}
 
-    std::unique_ptr<juce::AudioFormatReader> reader{
-        wavFormat.createReaderFor(inputStream.release(), true)};
-    if (reader == nullptr || reader->sampleRate <= 0.0 || reader->numChannels == 0 ||
-        reader->lengthInSamples <= 0) {
-        return {false, {}, "WAV file is invalid or uses an unsupported encoding"};
+bool JuceAudioDeviceAdapter::commitPreparedWav(
+    audio::PreparedAudioFilePtr prepared,
+    audio::AudioFileCommitAction modelCommit) noexcept {
+    auto* candidate = dynamic_cast<PreparedJuceAudioFile*>(prepared.get());
+    if (candidate == nullptr || !modelCommit.isValid() ||
+        tracks::toIndex(candidate->track) >= preparedTracks_.size() ||
+        candidate->audioResource == nullptr) {
+        return false;
     }
-
-    if (reader->lengthInSamples > std::numeric_limits<int>::max() ||
-        reader->numChannels > static_cast<unsigned int>(std::numeric_limits<int>::max())) {
-        return {false, {}, "WAV file is too large to prepare safely"};
-    }
-
-    const auto frameCount = static_cast<int>(reader->lengthInSamples);
-    const auto channelCount = static_cast<int>(reader->numChannels);
-    auto prepared = std::make_unique<PreparedAudio>();
-    prepared->sourceSampleRate = timeline::SampleRate{reader->sampleRate};
-    prepared->projectSampleRate = projectSampleRate;
-    prepared->projectDuration = timeline::sourceFramesToProjectFrames(
-        {static_cast<std::uint64_t>(reader->lengthInSamples)},
-        prepared->sourceSampleRate,
-        projectSampleRate);
-    prepared->samples.setSize(channelCount, frameCount, false, true, false);
-
-    std::vector<float*> destinationChannels(static_cast<std::size_t>(channelCount));
-    for (int channel = 0; channel < channelCount; ++channel) {
-        destinationChannels[static_cast<std::size_t>(channel)] =
-            prepared->samples.getWritePointer(channel);
-    }
-
-    if (!reader->read(destinationChannels.data(), channelCount, 0, frameCount)) {
-        return {false, {}, "WAV samples could not be decoded"};
-    }
-
-    const audio::AudioFileMetadata metadata{
-        timeline::SampleRate{reader->sampleRate},
-        static_cast<std::uint32_t>(reader->numChannels),
-        {static_cast<std::uint64_t>(reader->lengthInSamples)},
-        {static_cast<double>(reader->lengthInSamples) / reader->sampleRate}};
 
     const auto callbackWasRegistered = callbackRegistered_;
     detachAudioCallback();
-    preparedAudio_ = std::move(prepared);
-    preparedAudioAvailable_.store(true, std::memory_order_release);
-    playbackCursor_.prepare({static_cast<std::uint64_t>(frameCount)});
-    clearRealtimeCommands();
-    publishRealtimeTransport();
+
+    // Commit point: from here to modelCommit.execute() every operation is a
+    // no-throw scalar assignment, pointer swap or portable no-throw configure.
+    // The callback stays quiescent until both engine and ProjectState are new.
+    const auto trackIndex = tracks::toIndex(candidate->track);
+    preparedTracks_[trackIndex].swap(candidate->audioResource);
+    projectSampleRate_ = candidate->projectSampleRate;
+    configureRealtimeEngine();
+    modelCommit.execute();
+
+    // candidate now owns the previous buffer. Its destruction happens on this
+    // application thread after the engine no longer exposes that view.
     if (callbackWasRegistered) {
-        attachAudioCallback();
+        try {
+            attachAudioCallback();
+        } catch (...) {
+            realtimeEngine_.deviceError();
+            pendingLifecycleEvent_.store(PendingLifecycleEvent::error,
+                                         std::memory_order_release);
+        }
     }
-
-    return {true, metadata, {}};
-}
-
-void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
-    detachAudioCallback();
-
-    if (changeListenerRegistered_) {
-        deviceManager_.removeChangeListener(this);
-        changeListenerRegistered_ = false;
-    }
-
-    deviceManager_.closeAudioDevice();
-    playbackCursor_.stopAndRewind();
-    clearRealtimeCommands();
-
-    if (publishClosedState) {
-        preparedAudioAvailable_.store(false, std::memory_order_release);
-        preparedAudio_.reset();
-        playbackCursor_.prepare({0});
-        publishRealtimeTransport();
-    }
-
-    if (publishClosedState) {
-        stateModel_.markClosed();
-        publishState();
-    }
+    return true;
 }
 
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestPlay() noexcept {
-    if (!preparedAudioAvailable_.load(std::memory_order_acquire) ||
-        !callbackRegistered_) {
-        return {};
-    }
-    return enqueueRealtimeCommand(RealtimeCommand::play);
+    return realtimeEngine_.tryRequestPlay();
 }
-
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestStop() noexcept {
-    if (!callbackRegistered_) {
-        const auto sequence = nextCommandSequence_++;
-        playbackCursor_.stopAndRewind();
-        lastProcessedCommandSequence_ = sequence;
-        clearRealtimeCommands();
-        publishRealtimeTransport();
-        return {true, sequence};
-    }
-    return enqueueRealtimeCommand(RealtimeCommand::stop);
+    return realtimeEngine_.tryRequestStop();
 }
-
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
-    return transportExchange_.snapshot();
+    return realtimeEngine_.transportSnapshot();
 }
 
 void JuceAudioDeviceAdapter::audioDeviceIOCallbackWithContext(
-    const float* const* inputChannelData,
-    int numInputChannels,
-    float* const* outputChannelData,
-    int numOutputChannels,
-    int numSamples,
-    const juce::AudioIODeviceCallbackContext& context) noexcept {
-    static_cast<void>(inputChannelData);
-    static_cast<void>(numInputChannels);
-    static_cast<void>(context);
-
-    for (int channel = 0; channel < numOutputChannels; ++channel) {
-        if (auto* output = outputChannelData[channel]; output != nullptr) {
-            std::fill_n(output, numSamples, 0.0F);
-        }
-    }
-
-    consumeRealtimeCommands();
-
-    const auto* prepared = preparedAudio_.get();
-    if (!playbackCursor_.isPlaying() || prepared == nullptr ||
-        !deviceSampleRate_.isValid()) {
-        return;
-    }
-
-    const auto sourceFrameCount = prepared->samples.getNumSamples();
-    const auto sourceChannelCount = prepared->samples.getNumChannels();
-    const auto sourceFramesPerDeviceFrame = timeline::sourceFramesForDeviceFrames(
-        {1}, prepared->sourceSampleRate, deviceSampleRate_);
-
-    for (int frame = 0; frame < numSamples; ++frame) {
-        if (!playbackCursor_.isPlaying()) {
-            break;
-        }
-
-        const auto sourcePosition = playbackCursor_.position();
-        const auto sourceFrame = static_cast<int>(sourcePosition.value);
-        const auto nextSourceFrame = std::min(sourceFrame + 1, sourceFrameCount - 1);
-        const auto fraction = static_cast<float>(sourcePosition.value - sourceFrame);
-
-        for (int channel = 0; channel < numOutputChannels; ++channel) {
-            auto* output = outputChannelData[channel];
-            if (output == nullptr) {
-                continue;
-            }
-
-            const auto sourceChannel = std::min(channel, sourceChannelCount - 1);
-            const auto* source = prepared->samples.getReadPointer(sourceChannel);
-            output[frame] = source[sourceFrame] +
-                            fraction * (source[nextSourceFrame] - source[sourceFrame]);
-        }
-
-        playbackCursor_.advance(sourceFramesPerDeviceFrame);
-    }
-
-    publishRealtimeTransport();
+    const float* const*, int, float* const* output, int channels, int frames,
+    const juce::AudioIODeviceCallbackContext&) noexcept {
+    realtimeEngine_.processBlock(
+        {output, static_cast<std::size_t>(std::max(0, channels)),
+         static_cast<std::size_t>(std::max(0, frames))},
+        deviceSampleRate_);
 }
 
 void JuceAudioDeviceAdapter::audioDeviceAboutToStart(juce::AudioIODevice* device) noexcept {
-    deviceSampleRate_ =
-        timeline::SampleRate{device != nullptr ? device->getCurrentSampleRate() : 0.0};
+    deviceSampleRate_ = timeline::SampleRate{
+        device != nullptr ? device->getCurrentSampleRate() : 0.0};
+    if (deviceSampleRate_.isValid()) {
+        pendingLifecycleEvent_.store(PendingLifecycleEvent::none, std::memory_order_release);
+        // JUCE also invokes this synchronously when merely adding a callback.
+        // It only enters "initializing"; actual processing is confirmed by
+        // isPlaying() after registration or by callback entry.
+        realtimeEngine_.deviceInitialising();
+    } else {
+        realtimeEngine_.deviceError();
+    }
 }
 
-void JuceAudioDeviceAdapter::audioDeviceStopped() noexcept {}
+void JuceAudioDeviceAdapter::audioDeviceStopped() noexcept {
+    realtimeEngine_.deviceStopped();
+    if (!suppressLifecycleNotification_.load(std::memory_order_acquire)) {
+        pendingLifecycleEvent_.store(PendingLifecycleEvent::stopped,
+                                     std::memory_order_release);
+    }
+}
+
+void JuceAudioDeviceAdapter::audioDeviceError(const juce::String&) {
+    realtimeEngine_.deviceError();
+    pendingLifecycleEvent_.store(PendingLifecycleEvent::error,
+                                 std::memory_order_release);
+}
 
 void JuceAudioDeviceAdapter::changeListenerCallback(juce::ChangeBroadcaster* source) {
     if (source == &deviceManager_ && changeListenerRegistered_) {
@@ -251,14 +259,37 @@ void JuceAudioDeviceAdapter::changeListenerCallback(juce::ChangeBroadcaster* sou
     }
 }
 
+void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
+    detachAudioCallback();
+    if (changeListenerRegistered_) {
+        deviceManager_.removeChangeListener(this);
+        changeListenerRegistered_ = false;
+    }
+    suppressLifecycleNotification_.store(true, std::memory_order_release);
+    deviceManager_.closeAudioDevice();
+    suppressLifecycleNotification_.store(false, std::memory_order_release);
+    realtimeEngine_.deviceUnavailable();
+    if (publishClosedState) {
+        preparedTracks_ = {};
+        projectSampleRate_ = {};
+        configureRealtimeEngine();
+        stateModel_.markClosed();
+        publishState();
+    }
+}
+
 void JuceAudioDeviceAdapter::refreshState() {
     auto* device = deviceManager_.getCurrentAudioDevice();
-    if (device == nullptr) {
-        stateModel_.markError("No active audio output device");
+    if (device != nullptr && callbackRegistered_ && device->isPlaying()) {
+        realtimeEngine_.deviceConsumerStarted();
+    }
+    if (device == nullptr || !callbackRegistered_ || !device->isPlaying() ||
+        realtimeEngine_.deviceState() !=
+            audio::DeviceProcessingState::operational) {
+        stateModel_.markError("No operational audio output device");
         publishState();
         return;
     }
-
     audio::AudioDeviceInfo info;
     info.outputDeviceName = device->getName().toStdString();
     info.sampleRate = device->getCurrentSampleRate();
@@ -268,7 +299,6 @@ void JuceAudioDeviceAdapter::refreshState() {
         static_cast<std::uint32_t>(device->getInputChannelNames().size());
     info.availableOutputChannels =
         static_cast<std::uint32_t>(device->getOutputChannelNames().size());
-
     stateModel_.markActive(std::move(info));
     publishState();
 }
@@ -279,70 +309,11 @@ void JuceAudioDeviceAdapter::publishState() {
     }
 }
 
-audio::AudioControlRequestResult JuceAudioDeviceAdapter::enqueueRealtimeCommand(
-    RealtimeCommand command) noexcept {
-    const auto write = commandWriteIndex_.load(std::memory_order_relaxed);
-    const auto next = (write + 1) % realtimeCommandCapacity;
-    if (next == commandReadIndex_.load(std::memory_order_acquire)) {
-        return {};
-    }
-
-    const auto sequence = nextCommandSequence_++;
-    realtimeCommands_[write] = {command, sequence};
-    commandWriteIndex_.store(next, std::memory_order_release);
-    return {true, sequence};
-}
-
-void JuceAudioDeviceAdapter::consumeRealtimeCommands() noexcept {
-    auto read = commandReadIndex_.load(std::memory_order_relaxed);
-    const auto write = commandWriteIndex_.load(std::memory_order_acquire);
-
-    while (read != write) {
-        const auto queued = realtimeCommands_[read];
-        read = (read + 1) % realtimeCommandCapacity;
-
-        if (queued.command == RealtimeCommand::stop) {
-            playbackCursor_.stopAndRewind();
-        } else {
-            static_cast<void>(playbackCursor_.play());
-        }
-        lastProcessedCommandSequence_ = queued.sequence;
-    }
-
-    commandReadIndex_.store(read, std::memory_order_release);
-    publishRealtimeTransport();
-}
-
-void JuceAudioDeviceAdapter::publishRealtimeTransport() noexcept {
-    const auto* prepared = preparedAudio_.get();
-    if (prepared == nullptr) {
-        transportExchange_.publish(
-            {false, {0}, {0}, lastProcessedCommandSequence_});
-        return;
-    }
-
-    auto projectPosition = timeline::sourcePositionToProjectPosition(
-        playbackCursor_.position(),
-        prepared->sourceSampleRate,
-        prepared->projectSampleRate);
-    if (projectPosition.value > prepared->projectDuration.value) {
-        projectPosition = {prepared->projectDuration.value};
-    }
-
-    transportExchange_.publish({playbackCursor_.isPlaying(),
-                                projectPosition,
-                                prepared->projectDuration,
-                                lastProcessedCommandSequence_});
-}
-
-void JuceAudioDeviceAdapter::clearRealtimeCommands() noexcept {
-    commandReadIndex_.store(0, std::memory_order_relaxed);
-    commandWriteIndex_.store(0, std::memory_order_relaxed);
-}
-
 void JuceAudioDeviceAdapter::detachAudioCallback() noexcept {
     if (callbackRegistered_) {
+        suppressLifecycleNotification_.store(true, std::memory_order_release);
         deviceManager_.removeAudioCallback(this);
+        suppressLifecycleNotification_.store(false, std::memory_order_release);
         callbackRegistered_ = false;
     }
 }
@@ -351,7 +322,55 @@ void JuceAudioDeviceAdapter::attachAudioCallback() {
     if (!callbackRegistered_ && deviceManager_.getCurrentAudioDevice() != nullptr) {
         deviceManager_.addAudioCallback(this);
         callbackRegistered_ = true;
+        auto* device = deviceManager_.getCurrentAudioDevice();
+        if (device != nullptr && device->isPlaying() && deviceSampleRate_.isValid()) {
+            realtimeEngine_.deviceConsumerStarted();
+        }
     }
+}
+
+void JuceAudioDeviceAdapter::configureRealtimeEngine() noexcept {
+    std::array<audio::PreparedTrackView, tracks::audioTrackCount> views{};
+    for (std::size_t index = 0; index < preparedTracks_.size(); ++index) {
+        const auto* prepared = preparedTracks_[index].get();
+        if (prepared == nullptr) {
+            continue;
+        }
+        auto& view = views[index];
+        view.channelCount = static_cast<std::uint32_t>(prepared->samples.getNumChannels());
+        view.frameCount = {static_cast<std::uint64_t>(prepared->samples.getNumSamples())};
+        view.sourceSampleRate = prepared->sourceSampleRate;
+        for (std::size_t channel = 0; channel < view.channelCount; ++channel) {
+            view.channels[channel] =
+                prepared->samples.getReadPointer(static_cast<int>(channel));
+        }
+    }
+    realtimeEngine_.configure({projectSampleRate_, preparedDuration()}, views);
+}
+
+timeline::ProjectFrameCount JuceAudioDeviceAdapter::preparedDuration() const noexcept {
+    timeline::ProjectFrameCount duration;
+    for (const auto& track : preparedTracks_) {
+        if (track != nullptr) {
+            duration.value = std::max(
+                duration.value,
+                timeline::sourceFramesToProjectDuration(
+                    {static_cast<std::uint64_t>(track->samples.getNumSamples())},
+                    track->sourceSampleRate, projectSampleRate_).value);
+        }
+    }
+    return duration;
+}
+
+std::size_t JuceAudioDeviceAdapter::preparedBytes() const noexcept {
+    std::size_t bytes{};
+    for (const auto& track : preparedTracks_) {
+        if (track != nullptr) {
+            bytes += static_cast<std::size_t>(track->samples.getNumChannels()) *
+                     static_cast<std::size_t>(track->samples.getNumSamples()) * sizeof(float);
+        }
+    }
+    return bytes;
 }
 
 } // namespace vitadaw::platform::juce_adapter

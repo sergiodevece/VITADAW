@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.0.4 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.0.8 LANGUAGES C CXX)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -9,6 +9,7 @@ option(VITADAW_FETCH_JUCE "Download the pinned JUCE version when it is not insta
 add_library(vitadaw_core
     src/vitadaw/application/DawApplication.cpp
     src/vitadaw/audio/AudioDeviceState.cpp
+    src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
     src/vitadaw/project/ProjectState.cpp
     src/vitadaw/timeline/Time.cpp
@@ -99,4 +100,16 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_transport_state_tests tests/TransportStateTests.cpp)
     target_link_libraries(vitadaw_transport_state_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_transport_state_tests COMMAND vitadaw_transport_state_tests)
+
+    add_executable(vitadaw_two_track_playback_tests tests/TwoTrackPlaybackTests.cpp)
+    target_link_libraries(vitadaw_two_track_playback_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_two_track_playback_tests COMMAND vitadaw_two_track_playback_tests)
+
+    add_executable(vitadaw_realtime_audio_engine_tests tests/RealtimeAudioEngineTests.cpp)
+    target_link_libraries(vitadaw_realtime_audio_engine_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_realtime_audio_engine_tests COMMAND vitadaw_realtime_audio_engine_tests)
+
+    add_executable(vitadaw_audio_preparation_tests tests/AudioPreparationTests.cpp)
+    target_link_libraries(vitadaw_audio_preparation_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_audio_preparation_tests COMMAND vitadaw_audio_preparation_tests)
 endif()

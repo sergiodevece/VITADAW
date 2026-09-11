@@ -16,10 +16,16 @@ public:
         transportLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
         addAndMakeVisible(transportLabel_);
 
-        loadButton_.onClick = [this] { chooseWav(); };
+        loadTrack1Button_.onClick = [this] {
+            chooseWav(tracks::AudioTrackSlot::first);
+        };
+        loadTrack2Button_.onClick = [this] {
+            chooseWav(tracks::AudioTrackSlot::second);
+        };
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
-        addAndMakeVisible(loadButton_);
+        addAndMakeVisible(loadTrack1Button_);
+        addAndMakeVisible(loadTrack2Button_);
         addAndMakeVisible(playButton_);
         addAndMakeVisible(stopButton_);
     }
@@ -72,7 +78,9 @@ public:
         transportLabel_.setBounds(bounds.removeFromTop(32));
         bounds.removeFromTop(12);
         auto buttons = bounds.removeFromTop(32);
-        loadButton_.setBounds(buttons.removeFromLeft(120));
+        loadTrack1Button_.setBounds(buttons.removeFromLeft(150));
+        buttons.removeFromLeft(8);
+        loadTrack2Button_.setBounds(buttons.removeFromLeft(150));
         buttons.removeFromLeft(8);
         playButton_.setBounds(buttons.removeFromLeft(80));
         buttons.removeFromLeft(8);
@@ -82,12 +90,12 @@ public:
     }
 
 private:
-    void chooseWav() {
+    void chooseWav(tracks::AudioTrackSlot track) {
         fileChooser_ = std::make_unique<juce::FileChooser>(
             "Select a WAV file", juce::File{}, "*.wav");
         constexpr auto flags = juce::FileBrowserComponent::openMode |
                                juce::FileBrowserComponent::canSelectFiles;
-        fileChooser_->launchAsync(flags, [this](const juce::FileChooser& chooser) {
+        fileChooser_->launchAsync(flags, [this, track](const juce::FileChooser& chooser) {
             const auto file = chooser.getResult();
             if (file.existsAsFile()) {
                 const auto fullPath = file.getFullPathName();
@@ -96,7 +104,7 @@ private:
 #else
                 const std::filesystem::path nativePath{fullPath.toStdString()};
 #endif
-                dispatch(commands::LoadAudioFile{nativePath});
+                dispatch(commands::LoadAudioFile{nativePath, track});
             }
             fileChooser_.reset();
         });
@@ -115,7 +123,8 @@ private:
     juce::Label statusLabel_;
     juce::Label transportLabel_;
     juce::Label resultLabel_;
-    juce::TextButton loadButton_{"Load WAV"};
+    juce::TextButton loadTrack1Button_{"Load Track 1 WAV"};
+    juce::TextButton loadTrack2Button_{"Load Track 2 WAV"};
     juce::TextButton playButton_{"Play"};
     juce::TextButton stopButton_{"Stop"};
     std::unique_ptr<juce::FileChooser> fileChooser_;

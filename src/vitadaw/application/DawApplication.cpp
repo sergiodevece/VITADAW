@@ -1,8 +1,11 @@
 #include "vitadaw/application/DawApplication.h"
 
-#include <type_traits>
+#include <exception>
 #include <iomanip>
+#include <new>
+#include <optional>
 #include <sstream>
+#include <type_traits>
 #include <utility>
 
 namespace vitadaw::application {
@@ -16,41 +19,87 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
         [this](const auto& value) -> commands::CommandResult {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, commands::AddAudioTrack>) {
-                if (value.name.empty()) {
-                    return {commands::CommandStatus::rejected, "Track name cannot be empty"};
-                }
-                project_.addAudioTrack(value.name);
+                static_cast<void>(value);
+                return {commands::CommandStatus::rejected,
+                        "This increment has exactly two fixed audio tracks"};
             } else if constexpr (std::is_same_v<T, commands::LoadAudioFile>) {
-                const auto loadResult =
-                    audioEngine_.loadWav(value.file, project_.sampleRate());
-                if (!loadResult.success) {
-                    return {commands::CommandStatus::rejected, loadResult.errorMessage};
+                audio::AudioFilePreparationResult preparation;
+                try {
+                    preparation = audioEngine_.prepareWav(
+                        value.file, value.track, project_.sampleRate());
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to prepare WAV"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Unexpected error while preparing WAV"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Unknown error while preparing WAV"};
+                }
+                if (!preparation.success()) {
+                    return {commands::CommandStatus::rejected,
+                            std::move(preparation.errorMessage)};
                 }
 
-                project_.setSingleAudioClip(
-                    value.file,
-                    loadResult.metadata.sourceFrameCount,
-                    loadResult.metadata.sourceSampleRate);
-                const auto duration = timeline::sourceFramesToProjectFrames(
-                    loadResult.metadata.sourceFrameCount,
-                    loadResult.metadata.sourceSampleRate,
-                    project_.sampleRate());
-                transport_.setDuration(duration);
+                std::optional<project::ProjectState::PreparedAudioClipUpdate>
+                    projectUpdate;
+                std::string successMessage;
+                try {
+                    const auto metadata = preparation.prepared->metadata;
+                    projectUpdate.emplace(project_.prepareAudioClipUpdate(
+                        value.track, value.file, metadata.sourceFrameCount,
+                        metadata.sourceSampleRate));
+
+                    std::ostringstream message;
+                    message << "Loaded track " << (tracks::toIndex(value.track) + 1)
+                            << ": " << value.file.filename().string() << " | "
+                            << std::fixed << std::setprecision(0)
+                            << metadata.sourceSampleRate.hertz() << " Hz | "
+                            << metadata.channelCount << " ch | "
+                            << std::setprecision(3) << metadata.duration.value
+                            << " s";
+                    successMessage = message.str();
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to prepare project state"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Project update could not be prepared"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Unknown error while preparing project state"};
+                }
+
+                struct CommitContext {
+                    DawApplication* application;
+                    project::ProjectState::PreparedAudioClipUpdate* update;
+                } commitContext{this, &*projectUpdate};
+                const audio::AudioFileCommitAction modelCommit{
+                    &commitContext,
+                    [](void* rawContext) noexcept {
+                        auto& context = *static_cast<CommitContext*>(rawContext);
+                        context.application->project_.commitAudioClipUpdate(
+                            *context.update);
+                        context.application->transport_.setDuration(
+                            context.application->project_.duration());
+                    }};
+
+                if (!audioEngine_.commitPreparedWav(
+                        std::move(preparation.prepared), modelCommit)) {
+                    return {commands::CommandStatus::rejected,
+                            "Prepared WAV could not be committed"};
+                }
+
                 pendingAudioCommandSequence_ =
                     audioEngine_.transportSnapshot().lastProcessedCommandSequence;
-                std::ostringstream message;
-                message << "Loaded WAV: " << value.file.filename().string() << " | "
-                        << std::fixed << std::setprecision(0)
-                        << loadResult.metadata.sourceSampleRate.hertz() << " Hz | "
-                        << loadResult.metadata.channelCount << " ch | "
-                        << std::setprecision(3) << loadResult.metadata.duration.value
-                        << " s";
-                return {commands::CommandStatus::accepted, message.str()};
+                return {commands::CommandStatus::accepted,
+                        std::move(successMessage)};
             } else if constexpr (std::is_same_v<T, commands::Play>) {
                 const auto request = audioEngine_.tryRequestPlay();
                 if (!request.accepted) {
                     return {commands::CommandStatus::rejected,
-                            "Play requires a valid prepared WAV"};
+                            "Play requires at least one valid prepared WAV"};
                 }
                 pendingAudioCommandSequence_ = request.sequence;
                 transport_.markPlaying();

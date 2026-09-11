@@ -2,9 +2,11 @@
 
 #include "vitadaw/audio/RealtimeTransportExchange.h"
 #include "vitadaw/timeline/Time.h"
+#include "vitadaw/tracks/AudioTrack.h"
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace vitadaw::audio {
@@ -18,23 +20,52 @@ struct AudioFileMetadata {
     bool operator==(const AudioFileMetadata&) const = default;
 };
 
-struct AudioFileLoadResult {
-    bool success{};
+class PreparedAudioFile {
+public:
+    explicit PreparedAudioFile(AudioFileMetadata preparedMetadata) noexcept
+        : metadata(preparedMetadata) {}
+    virtual ~PreparedAudioFile() = default;
+
     AudioFileMetadata metadata;
+};
+
+using PreparedAudioFilePtr = std::unique_ptr<PreparedAudioFile>;
+
+struct AudioFilePreparationResult {
+    PreparedAudioFilePtr prepared;
     std::string errorMessage;
+
+    [[nodiscard]] bool success() const noexcept { return prepared != nullptr; }
+};
+
+// Allocation-free, noexcept half of a prepared load commit. The application
+// builds every potentially-throwing ProjectState value before supplying it.
+struct AudioFileCommitAction {
+    void* context{};
+    void (*function)(void*) noexcept {};
+
+    [[nodiscard]] bool isValid() const noexcept {
+        return context != nullptr && function != nullptr;
+    }
+    void execute() const noexcept { function(context); }
 };
 
 // Called from the application thread. Realtime control methods must enqueue
-// bounded, non-blocking requests. loadWav performs file I/O explicitly outside
-// the realtime thread.
+// bounded, non-blocking requests. prepareWav performs file I/O explicitly
+// outside the realtime thread. commitPreparedWav publishes the engine resource
+// and invokes the already-prepared model commit while render is quiescent.
 class IAudioEngineControl {
 public:
     virtual ~IAudioEngineControl() = default;
     // File I/O and decoding are allowed here because this method is never called
     // by the realtime thread.
-    [[nodiscard]] virtual AudioFileLoadResult loadWav(
+    [[nodiscard]] virtual AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file,
+        tracks::AudioTrackSlot track,
         timeline::SampleRate projectSampleRate) = 0;
+    [[nodiscard]] virtual bool commitPreparedWav(
+        PreparedAudioFilePtr prepared,
+        AudioFileCommitAction modelCommit) noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestStop() noexcept = 0;
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;

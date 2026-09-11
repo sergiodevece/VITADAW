@@ -2,8 +2,10 @@
 #include "vitadaw/transport/TransportState.h"
 
 #include <cstdlib>
+#include <atomic>
 #include <iostream>
 #include <string_view>
+#include <thread>
 
 namespace {
 void check(bool condition, std::string_view message) {
@@ -42,6 +44,29 @@ int main() {
     state.stopAndRewind();
     check(state.playback == transport::PlaybackState::stopped && state.position.value == 0,
           "explicit Stop should rewind to zero");
+
+    audio::RealtimeTransportExchange concurrentExchange;
+    std::atomic<bool> publishingDone{};
+    std::thread writer([&] {
+        for (std::int64_t generation = 1; generation <= 200000; ++generation) {
+            concurrentExchange.publish(
+                {(generation & 1) != 0, {generation}, {generation * 3},
+                 static_cast<audio::AudioCommandSequence>(generation)});
+        }
+        publishingDone.store(true, std::memory_order_release);
+    });
+    do {
+        const auto value = concurrentExchange.snapshot();
+        if (value.lastProcessedCommandSequence != 0) {
+            const auto generation = static_cast<std::int64_t>(
+                value.lastProcessedCommandSequence);
+            check(value.position.value == generation &&
+                      value.duration.value == generation * 3 &&
+                      value.playing == ((generation & 1) != 0),
+                  "concurrent snapshot fields must come from one publication");
+        }
+    } while (!publishingDone.load(std::memory_order_acquire));
+    writer.join();
     std::cout << "All transport-state tests passed\n";
     return EXIT_SUCCESS;
 }

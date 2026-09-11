@@ -17,7 +17,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.0.4";
+        return "0.0.8";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -79,6 +79,7 @@ private:
             return;
         }
 
+        audioDevice_->pollDeviceLifecycle();
         dawApplication_->synchroniseTransport();
         mainWindow_->setTransportState(dawApplication_->transport(),
                                        dawApplication_->project().sampleRate());

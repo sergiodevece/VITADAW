@@ -34,6 +34,16 @@ struct ProjectFramePosition {
     bool operator==(const ProjectFramePosition&) const = default;
 };
 
+struct PreciseProjectFramePosition {
+    double value{};
+    bool operator==(const PreciseProjectFramePosition&) const = default;
+};
+
+struct ProjectFrameDuration {
+    double value{};
+    bool operator==(const ProjectFrameDuration&) const = default;
+};
+
 struct DeviceFrameCount {
     std::uint64_t value{};
     bool operator==(const DeviceFrameCount&) const = default;
@@ -45,7 +55,7 @@ public:
     explicit constexpr SampleRate(double hertz) noexcept : hertz_(hertz) {}
 
     [[nodiscard]] constexpr double hertz() const noexcept { return hertz_; }
-    [[nodiscard]] constexpr bool isValid() const noexcept { return hertz_ > 0.0; }
+    [[nodiscard]] bool isValid() const noexcept;
 
     bool operator==(const SampleRate&) const = default;
 
@@ -68,10 +78,20 @@ private:
     SourceFrameCount frames,
     SampleRate sourceSampleRate,
     SampleRate projectSampleRate) noexcept;
+// Converts an exclusive resource end. Unlike position conversion, duration is
+// rounded up so every valid source frame is covered by the project timeline.
+[[nodiscard]] ProjectFrameCount sourceFramesToProjectDuration(
+    SourceFrameCount frames,
+    SampleRate sourceSampleRate,
+    SampleRate projectSampleRate) noexcept;
 [[nodiscard]] ProjectFramePosition sourcePositionToProjectPosition(
     SourceFramePosition position,
     SampleRate sourceSampleRate,
     SampleRate projectSampleRate) noexcept;
+[[nodiscard]] SourceFramePosition projectPositionToSourcePosition(
+    PreciseProjectFramePosition position,
+    SampleRate projectSampleRate,
+    SampleRate sourceSampleRate) noexcept;
 [[nodiscard]] SourceFramePosition advanceSourcePosition(
     SourceFramePosition position,
     DeviceFrameCount deviceFrames,
@@ -80,6 +100,10 @@ private:
 [[nodiscard]] SourceFrameDuration sourceFramesForDeviceFrames(
     DeviceFrameCount deviceFrames,
     SampleRate sourceSampleRate,
+    SampleRate deviceSampleRate) noexcept;
+[[nodiscard]] ProjectFrameDuration projectFramesForDeviceFrames(
+    DeviceFrameCount deviceFrames,
+    SampleRate projectSampleRate,
     SampleRate deviceSampleRate) noexcept;
 
 } // namespace vitadaw::timeline

@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string_view>
 
 namespace {
@@ -51,6 +52,10 @@ int main() {
     model.markActive({"", 0.0, 0, 0, 0});
     check(model.state().status == AudioDeviceStatus::error,
           "invalid active configuration should be rejected coherently");
+    model.markActive({"Infinite rate", std::numeric_limits<double>::infinity(),
+                      256, 0, 2});
+    check(model.state().status == AudioDeviceStatus::error,
+          "non-finite device sample rates should be rejected");
 
     std::cout << "All audio-device state tests passed\n";
     return EXIT_SUCCESS;
