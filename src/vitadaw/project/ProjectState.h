@@ -30,11 +30,14 @@ public:
     [[nodiscard]] routing::BusId addBus(std::string name);
     [[nodiscard]] bool setTrackOutputDestination(
         tracks::TrackId track,
-        routing::TrackOutputDestination destination) noexcept;
+        routing::OutputDestination destination) noexcept;
     [[nodiscard]] const routing::AudioBus* findBus(
         routing::BusId bus) const noexcept;
     [[nodiscard]] bool setBusMix(routing::BusId bus,
                                  mixer::BusMixState state) noexcept;
+    [[nodiscard]] bool setBusOutputDestination(
+        routing::BusId bus,
+        routing::OutputDestination destination) noexcept;
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
     [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;

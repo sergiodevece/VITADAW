@@ -49,7 +49,7 @@ routing::BusId ProjectState::addBus(std::string name) {
 
 bool ProjectState::setTrackOutputDestination(
     tracks::TrackId track,
-    routing::TrackOutputDestination destination) noexcept {
+    routing::OutputDestination destination) noexcept {
     return findTrack(track) != nullptr &&
            routing_.setTrackDestination(track, destination);
 }
@@ -62,6 +62,11 @@ const routing::AudioBus* ProjectState::findBus(
 bool ProjectState::setBusMix(routing::BusId bus,
                              mixer::BusMixState state) noexcept {
     return routing_.setBusMix(bus, state);
+}
+
+bool ProjectState::setBusOutputDestination(
+    routing::BusId bus, routing::OutputDestination destination) noexcept {
+    return routing_.setBusDestination(bus, destination);
 }
 
 const tracks::AudioTrack* ProjectState::findTrack(

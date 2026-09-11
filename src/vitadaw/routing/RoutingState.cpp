@@ -37,7 +37,7 @@ void RoutingState::addTrack(tracks::TrackId track) {
     if (!track.isValid() || findTrackRoute(track) != nullptr) {
         throw std::invalid_argument{"Invalid or duplicate routing track identity"};
     }
-    trackRoutes_.push_back({track, TrackOutputDestination::master()});
+    trackRoutes_.push_back({track, OutputDestination::master()});
 }
 
 BusId RoutingState::addBus(std::string name) {
@@ -46,7 +46,7 @@ BusId RoutingState::addBus(std::string name) {
         throw std::overflow_error{"Bus identity space exhausted"};
     }
     const auto id = nextBusId_;
-    buses_.push_back({id, std::move(name), {}});
+    buses_.push_back({id, std::move(name), {}, OutputDestination::master()});
     ++nextBusId_.value;
     return id;
 }
@@ -66,8 +66,25 @@ bool RoutingState::setBusMix(BusId bus,
     return true;
 }
 
+bool RoutingState::setBusDestination(
+    BusId bus, OutputDestination destination) noexcept {
+    if (!destination.isValid() ||
+        (destination.kind == DestinationKind::bus &&
+         !containsBus(destination.bus))) {
+        return false;
+    }
+    const auto found = std::find_if(
+        buses_.begin(), buses_.end(),
+        [bus](const auto& candidate) { return candidate.id == bus; });
+    if (found == buses_.end()) {
+        return false;
+    }
+    found->outputDestination = destination;
+    return true;
+}
+
 bool RoutingState::setTrackDestination(
-    tracks::TrackId track, TrackOutputDestination destination) noexcept {
+    tracks::TrackId track, OutputDestination destination) noexcept {
     if (!destination.isValid() ||
         (destination.kind == DestinationKind::bus &&
          !containsBus(destination.bus))) {

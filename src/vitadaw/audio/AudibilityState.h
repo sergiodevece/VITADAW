@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -14,6 +15,11 @@ inline constexpr std::size_t audibilityMasterDestination =
     std::numeric_limits<std::size_t>::max();
 
 struct AudibilityTrackInput {
+    std::size_t destinationBusIndex{audibilityMasterDestination};
+    bool solo{};
+};
+
+struct AudibilityBusInput {
     std::size_t destinationBusIndex{audibilityMasterDestination};
     bool solo{};
 };
@@ -56,46 +62,95 @@ struct PreparedAudibilityState {
 
 [[nodiscard]] inline PreparedAudibilityState resolveAudibility(
     std::span<const AudibilityTrackInput> tracks,
-    std::span<const bool> busSolos) noexcept {
+    std::span<const AudibilityBusInput> buses) noexcept {
     PreparedAudibilityState result;
     bool hasSolo{};
     for (const auto& track : tracks) {
         hasSolo = hasSolo || track.solo;
     }
-    for (const auto solo : busSolos) {
-        hasSolo = hasSolo || solo;
+    for (const auto& bus : buses) {
+        hasSolo = hasSolo || bus.solo;
     }
     if (!hasSolo) {
         for (std::size_t index = 0; index < tracks.size(); ++index) {
             result.setTrack(index);
         }
-        for (std::size_t index = 0; index < busSolos.size(); ++index) {
+        for (std::size_t index = 0; index < buses.size(); ++index) {
             result.setBus(index);
         }
         return result;
     }
-    for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        if (!tracks[trackIndex].solo) {
-            continue;
+    // U contains buses whose complete upstream content is selected by Bus Solo.
+    std::array<bool, audibilityBusCapacity> upstreamSelected{};
+    for (std::size_t index = 0; index < buses.size(); ++index) {
+        upstreamSelected[index] = buses[index].solo;
+    }
+    for (std::size_t pass = 0; pass < buses.size(); ++pass) {
+        bool changed{};
+        for (std::size_t index = 0; index < buses.size(); ++index) {
+            const auto destination = buses[index].destinationBusIndex;
+            if (!upstreamSelected[index] &&
+                destination != audibilityMasterDestination &&
+                destination < buses.size() && upstreamSelected[destination]) {
+                upstreamSelected[index] = true;
+                changed = true;
+            }
         }
-        result.setTrack(trackIndex);
-        if (tracks[trackIndex].destinationBusIndex !=
-            audibilityMasterDestination) {
-            result.setBus(tracks[trackIndex].destinationBusIndex);
+        if (!changed) {
+            break;
         }
     }
-    for (std::size_t busIndex = 0; busIndex < busSolos.size(); ++busIndex) {
-        if (!busSolos[busIndex]) {
-            continue;
-        }
-        result.setBus(busIndex);
-        for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-            if (tracks[trackIndex].destinationBusIndex == busIndex) {
-                result.setTrack(trackIndex);
+
+    // A contains selected buses plus downstream nodes needed only as transport.
+    std::array<bool, audibilityBusCapacity> transport = upstreamSelected;
+    for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
+        const auto destination = tracks[trackIndex].destinationBusIndex;
+        if (tracks[trackIndex].solo ||
+            (destination != audibilityMasterDestination &&
+             destination < buses.size() && upstreamSelected[destination])) {
+            result.setTrack(trackIndex);
+            if (destination != audibilityMasterDestination &&
+                destination < buses.size()) {
+                transport[destination] = true;
             }
         }
     }
+    // Deliberately do not expand upstream again after opening downstream nodes.
+    for (std::size_t pass = 0; pass < buses.size(); ++pass) {
+        bool changed{};
+        for (std::size_t index = 0; index < buses.size(); ++index) {
+            if (!transport[index]) {
+                continue;
+            }
+            const auto destination = buses[index].destinationBusIndex;
+            if (destination != audibilityMasterDestination &&
+                destination < buses.size() && !transport[destination]) {
+                transport[destination] = true;
+                changed = true;
+            }
+        }
+        if (!changed) {
+            break;
+        }
+    }
+    for (std::size_t index = 0; index < buses.size(); ++index) {
+        if (transport[index]) {
+            result.setBus(index);
+        }
+    }
     return result;
+}
+
+// Compatibility overload for the pre-DAG flat bus model.
+[[nodiscard]] inline PreparedAudibilityState resolveAudibility(
+    std::span<const AudibilityTrackInput> tracks,
+    std::span<const bool> busSolos) noexcept {
+    std::array<AudibilityBusInput, audibilityBusCapacity> buses{};
+    const auto count = std::min(busSolos.size(), buses.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        buses[index].solo = busSolos[index];
+    }
+    return resolveAudibility(tracks, std::span<const AudibilityBusInput>{buses.data(), count});
 }
 
 } // namespace vitadaw::audio

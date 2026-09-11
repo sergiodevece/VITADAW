@@ -1,6 +1,7 @@
 #include "vitadaw/application/DawApplication.h"
 
 #include <exception>
+#include <algorithm>
 #include <array>
 #include <iomanip>
 #include <new>
@@ -240,20 +241,30 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 return {commands::CommandStatus::accepted,
                         "Bus mixer state updated"};
             } else if constexpr (
-                std::is_same_v<T, commands::SetTrackOutputDestination>) {
+                std::is_same_v<T, commands::SetTrackOutputDestination> ||
+                std::is_same_v<T, commands::SetBusOutputDestination>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
                     return {commands::CommandStatus::rejected,
                             "Routing cannot change during playback"};
                 }
                 try {
                     auto candidate = project_;
-                    if (!candidate.setTrackOutputDestination(
-                            value.track, value.destination)) {
-                        return {commands::CommandStatus::rejected,
-                                "Invalid track output destination"};
+                    if constexpr (std::is_same_v<
+                                      T, commands::SetTrackOutputDestination>) {
+                        if (!candidate.setTrackOutputDestination(
+                                value.track, value.destination)) {
+                            return {commands::CommandStatus::rejected,
+                                    "Invalid track output destination"};
+                        }
+                    } else {
+                        if (!candidate.setBusOutputDestination(
+                                value.bus, value.destination)) {
+                            return {commands::CommandStatus::rejected,
+                                    "Invalid bus output destination"};
+                        }
                     }
                     return commitStructuralProject(
-                        std::move(candidate), "Track output routing updated");
+                        std::move(candidate), "Output routing updated");
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
                             "Not enough memory to prepare routing"};
@@ -276,7 +287,8 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
     result.projectSampleRate = project.sampleRate();
     result.buses.reserve(project.routing().buses().size());
     for (const auto& bus : project.routing().buses()) {
-        result.buses.push_back({bus.id, mixer::prepare(bus.mix)});
+        result.buses.push_back(
+            {bus.id, mixer::prepare(bus.mix), bus.outputDestination});
     }
     result.masterMix = mixer::prepare(project.masterMix());
     result.tracks.reserve(project.tracks().size());
@@ -344,30 +356,59 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
         return busMix != nullptr && bus.id == overriddenBus ? *busMix
                                                             : bus.mix;
     };
-    std::array<audio::AudibilityTrackInput, audio::audibilityTrackCapacity>
-        resolvedTracks{};
-    std::array<bool, audio::audibilityBusCapacity> busSolos{};
-    for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        resolvedTracks[trackIndex].solo =
-            effectiveTrackMix(tracks[trackIndex]).solo;
-        const auto* route = project.routing().findTrackRoute(
-            tracks[trackIndex].id);
-        if (route != nullptr &&
-            route->destination.kind == routing::DestinationKind::bus) {
-            for (std::size_t busIndex = 0; busIndex < buses.size(); ++busIndex) {
-                if (buses[busIndex].id == route->destination.bus) {
-                    resolvedTracks[trackIndex].destinationBusIndex = busIndex;
-                    break;
-                }
+    std::array<const tracks::AudioTrack*, audio::audibilityTrackCapacity>
+        orderedTracks{};
+    std::array<const routing::AudioBus*, audio::audibilityBusCapacity>
+        orderedBuses{};
+    for (std::size_t index = 0; index < tracks.size(); ++index) {
+        orderedTracks[index] = &tracks[index];
+    }
+    for (std::size_t index = 0; index < buses.size(); ++index) {
+        orderedBuses[index] = &buses[index];
+    }
+    std::sort(orderedTracks.begin(), orderedTracks.begin() + tracks.size(),
+              [](const auto* left, const auto* right) {
+                  return left->id < right->id;
+              });
+    std::sort(orderedBuses.begin(), orderedBuses.begin() + buses.size(),
+              [](const auto* left, const auto* right) {
+                  return left->id < right->id;
+              });
+    const auto busIndex = [&](routing::BusId id) noexcept {
+        for (std::size_t index = 0; index < buses.size(); ++index) {
+            if (orderedBuses[index]->id == id) {
+                return index;
             }
         }
+        return audio::audibilityMasterDestination;
+    };
+    std::array<audio::AudibilityTrackInput, audio::audibilityTrackCapacity>
+        resolvedTracks{};
+    std::array<audio::AudibilityBusInput, audio::audibilityBusCapacity>
+        resolvedBuses{};
+    for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
+        const auto& track = *orderedTracks[trackIndex];
+        resolvedTracks[trackIndex].solo =
+            effectiveTrackMix(track).solo;
+        const auto* route = project.routing().findTrackRoute(
+            track.id);
+        if (route != nullptr &&
+            route->destination.kind == routing::DestinationKind::bus) {
+            resolvedTracks[trackIndex].destinationBusIndex =
+                busIndex(route->destination.bus);
+        }
     }
-    for (std::size_t busIndex = 0; busIndex < buses.size(); ++busIndex) {
-        busSolos[busIndex] = effectiveBusMix(buses[busIndex]).solo;
+    for (std::size_t index = 0; index < buses.size(); ++index) {
+        const auto& bus = *orderedBuses[index];
+        resolvedBuses[index].solo = effectiveBusMix(bus).solo;
+        if (bus.outputDestination.kind == routing::DestinationKind::bus) {
+            resolvedBuses[index].destinationBusIndex =
+                busIndex(bus.outputDestination.bus);
+        }
     }
     return audio::resolveAudibility(
         {resolvedTracks.data(), tracks.size()},
-        {busSolos.data(), buses.size()});
+        {resolvedBuses.data(), buses.size()});
 }
 
 void DawApplication::synchroniseTransport() noexcept {

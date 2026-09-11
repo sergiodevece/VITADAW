@@ -128,6 +128,28 @@ public:
             controls->balance.setValue(
                 bus.mix.balance.value,
                 juce::NotificationType::dontSendNotification);
+            controls->output.addItem("Master", 1);
+            for (const auto& destinationBus : project.routing().buses()) {
+                if (destinationBus.id != bus.id) {
+                    controls->destinationBuses.push_back(destinationBus.id);
+                    controls->output.addItem(
+                        juce::String(destinationBus.name),
+                        static_cast<int>(controls->destinationBuses.size() + 1));
+                }
+            }
+            auto selectedOutput = 1;
+            if (bus.outputDestination.kind == routing::DestinationKind::bus) {
+                const auto found = std::find(
+                    controls->destinationBuses.begin(),
+                    controls->destinationBuses.end(),
+                    bus.outputDestination.bus);
+                if (found != controls->destinationBuses.end()) {
+                    selectedOutput = static_cast<int>(
+                        found - controls->destinationBuses.begin() + 2);
+                }
+            }
+            controls->output.setSelectedId(
+                selectedOutput, juce::NotificationType::dontSendNotification);
             controls->gain.onValueChange = [this, raw = controls.get()] {
                 dispatch(commands::SetBusGain{
                     raw->bus,
@@ -146,11 +168,22 @@ public:
                 dispatch(commands::SetBusSolo{raw->bus,
                                               raw->solo.getToggleState()});
             };
+            controls->output.onChange = [this, raw = controls.get()] {
+                const auto selectedId = raw->output.getSelectedId();
+                const auto destination = selectedId <= 1
+                    ? routing::OutputDestination::master()
+                    : routing::OutputDestination::toBus(
+                          raw->destinationBuses[
+                              static_cast<std::size_t>(selectedId - 2)]);
+                dispatch(commands::SetBusOutputDestination{raw->bus,
+                                                           destination});
+            };
             addAndMakeVisible(controls->name);
             addAndMakeVisible(controls->gain);
             addAndMakeVisible(controls->balance);
             addAndMakeVisible(controls->mute);
             addAndMakeVisible(controls->solo);
+            addAndMakeVisible(controls->output);
             addAndMakeVisible(controls->meter);
             busControls_.push_back(std::move(controls));
         }
@@ -272,6 +305,7 @@ public:
             controls->name.setBounds(row.removeFromLeft(80));
             controls->gain.setBounds(row.removeFromLeft(180));
             controls->balance.setBounds(row.removeFromLeft(150));
+            controls->output.setBounds(row.removeFromLeft(110));
             controls->mute.setBounds(row.removeFromLeft(64));
             controls->solo.setBounds(row.removeFromLeft(64));
             controls->meter.setBounds(row);
@@ -312,6 +346,8 @@ private:
                              juce::Slider::TextBoxRight};
         juce::ToggleButton mute{"Mute"};
         juce::ToggleButton solo{"Solo"};
+        juce::ComboBox output;
+        std::vector<routing::BusId> destinationBuses;
         juce::Label meter;
     };
 

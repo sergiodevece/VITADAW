@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.2.1 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.2.2 LANGUAGES C CXX)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -128,6 +128,12 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_bus_mixer_controls_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_bus_mixer_controls_tests
         COMMAND vitadaw_bus_mixer_controls_tests)
+
+    add_executable(vitadaw_bus_to_bus_routing_tests
+        tests/BusToBusRoutingTests.cpp)
+    target_link_libraries(vitadaw_bus_to_bus_routing_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_bus_to_bus_routing_tests
+        COMMAND vitadaw_bus_to_bus_routing_tests)
 
     add_executable(vitadaw_realtime_audio_engine_tests tests/RealtimeAudioEngineTests.cpp)
     target_link_libraries(vitadaw_realtime_audio_engine_tests PRIVATE vitadaw_core)

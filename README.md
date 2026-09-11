@@ -1,4 +1,4 @@
-# VitaDAW 0.2.1 — Bus Mixer Controls
+# VitaDAW 0.2.2 — Bus-to-Bus Routing DAG
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -6,7 +6,9 @@ el dispositivo de audio y carga y reproduce una colección variable de pistas WA
 sincronizadas. El incremento 0.2.0 sustituye la suma directa al master por un
 plan portable preparado con buses estéreo, destinos de pista y metering de bus.
 El incremento 0.2.1 convierte esos buses en canales funcionales con gain,
-balance, mute, solo y smoothing sample-accurate.
+balance, mute, solo y smoothing sample-accurate. VitaDAW 0.2.2 permite que la
+salida principal de un bus alimente otro bus mediante un DAG validado y ordenado
+completamente fuera del hilo de audio.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -136,11 +138,10 @@ telemetría latest-value: no se conserva cada bloque y una lectura concurrente
 fallida devuelve un snapshot vacío coherente. RMS, decay y peak hold quedan para
 una versión futura.
 
-`RoutingState` es la única fuente editable de las conexiones. Cada pista tiene
-exactamente un destino principal: Master o un `BusId` estable y monotónico. Los
-buses son nodos estéreo de acumulación independientes de WAV, clips y sample
-rates fuente; en 0.2.0 aplican procesamiento identidad y desembocan siempre en
-Master. Master es único y conserva su gain, smoothing y meter.
+`RoutingState` es la única fuente editable de las conexiones. `OutputDestination`
+representa Master o un `BusId` estable y monotónico. Cada pista y cada bus tienen
+exactamente un destino principal. Los buses son nodos estéreo de acumulación
+independientes de WAV, clips y sample rates fuente; Master es el terminal único.
 
 Los cambios estructurales pasan por comandos y solo se aceptan con el transporte
 parado. `ProjectState` y `RoutingState` producen una especificación candidata;
@@ -150,9 +151,9 @@ El commit retira el callback, intercambia modelo, plan, buffers y recursos como
 una transacción, y vuelve a registrar el consumidor. Un fallo conserva el
 proyecto anterior completo.
 
-El plan fija el orden Tracks → Buses → Master. Cada pista se renderiza una sola
-vez por subbloque y distribuye su señal a un único destino. Cada bus se procesa
-después de recibir todas sus pistas y se mide antes de sumarse al master. Una
+El plan fija el orden Tracks → buses en orden topológico → Master. Cada pista se
+renderiza una sola vez por subbloque. Cada bus se procesa una sola vez después
+de recibir todas sus entradas, se mide y entrega su salida a otro bus o Master. Una
 capacidad interna preparada de 512 frames divide callbacks mayores sin perder
 continuidad de reloj, smoothing ni máximos de metering. Toda reserva, resolución
 de IDs y construcción topológica ocurre fuera de RT.
@@ -176,11 +177,11 @@ Master, de modo que un bus muteado o excluido por Solo marca cero.
 
 Solo se resuelve separando selección y camino audible. Sin solos quedan abiertas
 todas las pistas y buses. Un Track Solo abre esa pista y el bus que necesita;
-un Bus Solo abre el bus y todas las pistas que lo alimentan. Varios solos forman
-la unión de esas selecciones, incluidas pistas directas a Master. Mute prevalece
-en el propio nodo. La aplicación publica el resultado como máscaras densas junto
-al cambio de parámetro, evitando búsquedas de IDs o interpretación del grafo en
-el callback.
+un Bus Solo selecciona todo el contenido upstream que alcanza ese bus. En ambos
+casos se abre después el camino downstream necesario hasta Master sin seleccionar
+ramas hermanas. Varios solos forman la unión de las selecciones. Mute prevalece
+localmente. La aplicación publica las máscaras densas junto al parámetro, sin
+búsquedas de IDs ni interpretación del grafo en el callback.
 
 La carga tiene dos fases. `prepareWav` realiza y captura fuera de RT cualquier
 operación que puede fallar; `ProjectState` prepara también el nuevo clip y el
@@ -224,6 +225,8 @@ La arquitectura y las reglas de tiempo real se describen en
   Track→Bus/Master y ejecución mediante un plan RT preparado.
 - **0.2.1 — Bus Mixer Controls:** gain, balance, mute y solo de bus con
   smoothing y resolución portable de caminos audibles.
+- **0.2.2 — Bus-to-Bus Routing DAG:** salida principal Bus→Bus/Master,
+  validación de ciclos, orden topológico y Solo resuelto a través del grafo.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -236,4 +239,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.1.1.md`](docs/validation-0.1.1.md) y
 [`docs/validation-0.1.2.md`](docs/validation-0.1.2.md) y
 [`docs/validation-0.2.0.md`](docs/validation-0.2.0.md) y
-[`docs/validation-0.2.1.md`](docs/validation-0.2.1.md).
+[`docs/validation-0.2.1.md`](docs/validation-0.2.1.md) y
+[`docs/validation-0.2.2.md`](docs/validation-0.2.2.md).

@@ -517,7 +517,60 @@ estructurales: no detienen Play, no reconstruyen el plan, no retiran el callback
 y no decodifican WAV. Una cola llena rechaza tanto la publicación como el cambio
 del modelo.
 
-## Evolución hasta 0.2.1
+## Bus-to-Bus Routing DAG 0.2.2
+
+`RoutingState` sigue siendo la única fuente editable. El tipo portable
+`OutputDestination` representa Master o un `BusId`; cada pista y cada `AudioBus`
+tiene exactamente una salida principal y Master no tiene destino. Los buses
+nuevos se dirigen a Master por defecto. `SetBusOutputDestination` es un comando
+estructural y se rechaza mientras el transporte está reproduciendo.
+
+El compilador portable ordena pistas y buses densos por sus identidades públicas,
+valida todos los destinos y recorre todos los buses mediante DFS de tres colores.
+Una arista hacia un nodo gris rechaza el candidato y genera un diagnóstico con
+la cadena de `BusId`, incluidos ciclos formados únicamente por buses vacíos. A
+continuación, Kahn produce un orden topológico estable: entre buses disponibles
+se escoge el menor `BusId`. Los pasos de pista preceden a los buses y Master
+aparece exactamente una vez al final.
+
+`PreparedBusNode` conserva por separado `BusId`, índice denso, `bufferIndex`,
+estado DSP y destino denso. El orden topológico contiene índices de nodo, no
+identidades ni posiciones editables. El runtime mantiene un acumulador estéreo
+preasignado por bus, el acumulador Master y la tabla temporal. Smoothers y meters
+RT permanecen en las tablas preasignadas del motor, indexados por la misma
+correspondencia densa de `BusId`.
+
+En cada subbloque se limpian todos los acumuladores; las pistas se renderizan una
+vez y suman en su destino; después cada bus lee su entrada completa, aplica
+gain/balance/mute/Solo, actualiza su meter y suma una vez en su destino. Ningún
+nodo resuelve topología ni avanza `RealtimeProjectClock`. Un bus smoother avanza
+una vez por frame con independencia del fan-in o de la profundidad.
+
+Solo se prepara fuera de RT en dos fases. `U` contiene el contenido completo
+seleccionado upstream por Bus Solo. Las pistas seleccionadas son las que tienen
+Solo o alcanzan un bus de `U`. `A` añade los buses downstream que solo son
+necesarios para transportar esa selección a Master. No se vuelve a expandir
+upstream desde `A`, evitando abrir ramas hermanas. RT recibe exclusivamente las
+máscaras densas finales; Mute sigue siendo una decisión local y prevalece sin
+buscar rutas alternativas.
+
+La preparación incluye topología, audibilidad y todos los buffers antes del
+commit existente. El adaptador retira el callback, publica conjuntamente modelo,
+plan, runtime y owners mediante operaciones `noexcept`, y vuelve a registrar el
+consumidor. Un fallo de referencia, ciclo, capacidad, memoria o preparación deja
+intacto el proyecto anterior. El test de lifetime extiende esta garantía a una
+cadena de buses preparada.
+
+### Límites conscientes de 0.2.2
+
+- Una pista o bus tiene una sola salida principal.
+- No existen sends, inserts, plugins, PDC, feedback ni routing durante Play.
+- El grafo y el audio son estéreo; no hay multicanal, PFL, AFL ni solo-safe.
+- Se reserva un buffer completo por bus; no existe reutilización de scratch.
+- La suma no incluye limiter ni clamp y puede superar `[-1, 1]`.
+- El orden y DSP son escalares; no se introduce procesamiento paralelo.
+
+## Evolución hasta 0.2.2
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -549,6 +602,8 @@ del modelo.
     buses, buffers y orden preparados fuera de RT.
 14. **Completado en 0.2.1:** procesar gain, balance, mute y solo de buses con
     smoothing y resolución explícita de caminos audibles.
+15. **Completado en 0.2.2:** admitir Bus→Bus como DAG validado, preparar un
+    orden topológico determinista y resolver Solo a través de rutas encadenadas.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

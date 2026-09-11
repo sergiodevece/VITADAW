@@ -18,14 +18,14 @@ struct BusId {
 
 enum class DestinationKind : std::uint8_t { master, bus };
 
-struct TrackOutputDestination {
+struct OutputDestination {
     DestinationKind kind{DestinationKind::master};
     BusId bus;
 
-    [[nodiscard]] static constexpr TrackOutputDestination master() noexcept {
+    [[nodiscard]] static constexpr OutputDestination master() noexcept {
         return {};
     }
-    [[nodiscard]] static constexpr TrackOutputDestination toBus(BusId id) noexcept {
+    [[nodiscard]] static constexpr OutputDestination toBus(BusId id) noexcept {
         return {DestinationKind::bus, id};
     }
     [[nodiscard]] constexpr bool isValid() const noexcept {
@@ -33,18 +33,23 @@ struct TrackOutputDestination {
                    ? !bus.isValid()
                    : kind == DestinationKind::bus && bus.isValid();
     }
-    bool operator==(const TrackOutputDestination&) const = default;
+    bool operator==(const OutputDestination&) const = default;
 };
+
+// Compatibility name for code which still describes the source node. The
+// destination itself is now common to tracks and buses.
+using TrackOutputDestination = OutputDestination;
 
 struct AudioBus {
     BusId id;
     std::string name;
     mixer::BusMixState mix;
+    OutputDestination outputDestination{OutputDestination::master()};
 };
 
 struct TrackRoute {
     tracks::TrackId track;
-    TrackOutputDestination destination;
+    OutputDestination destination;
 };
 
 class RoutingState {
@@ -58,9 +63,11 @@ public:
     void addTrack(tracks::TrackId track);
     [[nodiscard]] BusId addBus(std::string name);
     [[nodiscard]] bool setTrackDestination(
-        tracks::TrackId track, TrackOutputDestination destination) noexcept;
+        tracks::TrackId track, OutputDestination destination) noexcept;
     [[nodiscard]] bool setBusMix(BusId bus,
                                  mixer::BusMixState state) noexcept;
+    [[nodiscard]] bool setBusDestination(
+        BusId bus, OutputDestination destination) noexcept;
 
 private:
     std::vector<AudioBus> buses_;

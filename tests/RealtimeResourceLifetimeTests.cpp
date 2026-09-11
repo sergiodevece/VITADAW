@@ -189,14 +189,18 @@ int main() {
     const std::array routedSources{view(*routedResource)};
     audio::ProcessingPlanSpecification routedSpecification;
     routedSpecification.projectSampleRate = timeline::SampleRate{100.0};
-    routedSpecification.buses.push_back({{1}, {}});
+    routedSpecification.buses.push_back(
+        {{2}, {}, routing::OutputDestination::master()});
+    routedSpecification.buses.push_back(
+        {{1}, {}, routing::OutputDestination::toBus({2})});
     routedSpecification.tracks.push_back(
         {{1}, {}, routing::TrackOutputDestination::toBus({1})});
     auto routedPreparation = audio::prepareProcessingPlan(
         routedSpecification, routedSources, 4);
     check(routedPreparation.success() &&
-              routedPreparation.prepared->runtime.buses.size() == 1,
-          "lifetime test must prepare plan and bus buffers together");
+              routedPreparation.prepared->runtime.buses.size() == 2 &&
+              routedPreparation.prepared->plan.buses[0].destinationBusIndex == 1,
+          "lifetime test must prepare a routed chain and its bus buffers together");
     auto routedOwner = std::make_unique<PreparedPlanOwner>(
         std::move(routedResource), std::move(routedPreparation.prepared),
         planProbe);

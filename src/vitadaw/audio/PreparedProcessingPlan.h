@@ -27,12 +27,13 @@ static_assert(maximumPreparedBuses == audibilityBusCapacity);
 struct ProcessingPlanTrackSpecification {
     tracks::TrackId id;
     mixer::PreparedTrackMixState mix;
-    routing::TrackOutputDestination destination;
+    routing::OutputDestination destination;
 };
 
 struct ProcessingPlanBusSpecification {
     routing::BusId id;
     mixer::PreparedBusMixState mix;
+    routing::OutputDestination destination{routing::OutputDestination::master()};
 };
 
 struct ProcessingPlanSpecification {
@@ -51,6 +52,7 @@ struct PreparedBusNode {
     routing::BusId id;
     std::size_t bufferIndex{};
     mixer::PreparedBusMixState mix;
+    std::size_t destinationBusIndex{masterDestinationIndex};
 };
 
 enum class ProcessingStepKind : std::uint8_t { track, bus, master };

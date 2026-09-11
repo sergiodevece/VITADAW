@@ -311,6 +311,11 @@ int main() {
               app.project().routing().buses()[1].id == routing::BusId{2},
           "stereo bus identities should be stable and monotonic");
     const auto busA = app.project().routing().buses()[0].id;
+    const auto busB = app.project().routing().buses()[1].id;
+    check(dispatcher.dispatch(commands::SetBusOutputDestination{
+              {999}, routing::OutputDestination::master()}).status ==
+              commands::CommandStatus::rejected,
+          "an unknown source BusId must be rejected before preparation");
     const auto loadsBeforeRouting = audio.loadRequests;
     check(dispatcher.dispatch(commands::SetTrackOutputDestination{
               first, routing::TrackOutputDestination::toBus(busA)}).status ==
@@ -325,6 +330,30 @@ int main() {
               app.project().routing().findTrackRoute(first)->destination ==
                   routing::TrackOutputDestination::toBus(busA),
           "an unknown bus must preserve the previous model and plan");
+    check(dispatcher.dispatch(commands::SetBusOutputDestination{
+              busA, routing::OutputDestination::toBus(busB)}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().findBus(busA)->outputDestination ==
+                  routing::OutputDestination::toBus(busB),
+          "a stopped project must commit Bus-to-Bus routing structurally");
+    const auto specificationBeforeCycle = audio.liveSpecification;
+    const auto cycle = dispatcher.dispatch(commands::SetBusOutputDestination{
+        busB, routing::OutputDestination::toBus(busA)});
+    check(cycle.status == commands::CommandStatus::rejected &&
+              cycle.message.find("Bus 1") != std::string::npos &&
+              app.project().findBus(busB)->outputDestination ==
+                  routing::OutputDestination::master() &&
+              audio.liveSpecification.buses.size() ==
+                  specificationBeforeCycle.buses.size() &&
+              audio.liveSpecification.buses[0].destination ==
+                  specificationBeforeCycle.buses[0].destination &&
+              audio.liveSpecification.buses[1].destination ==
+                  specificationBeforeCycle.buses[1].destination,
+          "a cycle must preserve both editable routing and the published plan");
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              third, routing::OutputDestination::toBus(busB)}).status ==
+              commands::CommandStatus::accepted,
+          "a sibling source should route directly to the downstream bus");
 
     const auto structuralBeforeBusMix = audio.structuralPrepareRequests;
     check(dispatcher.dispatch(commands::SetBusGain{
@@ -343,7 +372,9 @@ int main() {
                   mixer::BusMixState{{-6.0F}, {0.25F}, true, true} &&
               audio.lastAudibility.trackIsAudible(0) &&
               audio.lastAudibility.busIsAudible(0) &&
-              !audio.lastAudibility.trackIsAudible(1),
+              audio.lastAudibility.busIsAudible(1) &&
+              !audio.lastAudibility.trackIsAudible(1) &&
+              !audio.lastAudibility.trackIsAudible(2),
           "bus parameters must update model, RT state and resolved solo without rebuilding");
     check(dispatcher.dispatch(commands::SetBusGain{
               busA, mixer::GainDb{
@@ -468,6 +499,12 @@ int main() {
               app.project().routing().findTrackRoute(first)->destination ==
                   routing::TrackOutputDestination::toBus(busA),
           "routing changes during playback must be rejected before preparation");
+    check(dispatcher.dispatch(commands::SetBusOutputDestination{
+              busA, routing::OutputDestination::master()}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findBus(busA)->outputDestination ==
+                  routing::OutputDestination::toBus(busB),
+          "Bus output changes must also be rejected while playing");
     audio.publishProgress(96000, true);
     app.synchroniseTransport();
     check(app.transport().playback == transport::PlaybackState::playing,

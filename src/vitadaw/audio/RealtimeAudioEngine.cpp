@@ -343,8 +343,16 @@ void RealtimeAudioEngine::processSubBlock(
                     busPeaks_[step.index].left, std::abs(contribution.left));
                 busPeaks_[step.index].right = std::max(
                     busPeaks_[step.index].right, std::abs(contribution.right));
-                masterLeft[frame] += contribution.left;
-                masterRight[frame] += contribution.right;
+                const auto destination = buses_[step.index].destinationBusIndex;
+                if (destination == masterDestinationIndex) {
+                    masterLeft[frame] += contribution.left;
+                    masterRight[frame] += contribution.right;
+                } else {
+                    auto& destinationBuffer = runtime_->buses[
+                        buses_[destination].bufferIndex];
+                    destinationBuffer.left[frame] += contribution.left;
+                    destinationBuffer.right[frame] += contribution.right;
+                }
             }
         } else {
             for (std::size_t frame = 0; frame < validFrames; ++frame) {

@@ -19,7 +19,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.2.1";
+        return "0.2.2";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -64,6 +64,10 @@ public:
                 commands::SetTrackOutputDestination{
                     tracks[2].id,
                     routing::TrackOutputDestination::toBus(buses[1].id)}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::SetBusOutputDestination{
+                    buses[0].id,
+                    routing::OutputDestination::toBus(buses[1].id)}));
         }
         mainWindow_ = std::make_unique<MainWindow>(
             audioDevice_->state(), *commandDispatcher_,

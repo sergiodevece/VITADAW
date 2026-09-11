@@ -35,14 +35,19 @@ struct SetBusMute { routing::BusId bus; bool muted{}; };
 struct SetBusSolo { routing::BusId bus; bool solo{}; };
 struct SetTrackOutputDestination {
     tracks::TrackId track;
-    routing::TrackOutputDestination destination;
+    routing::OutputDestination destination;
+};
+struct SetBusOutputDestination {
+    routing::BusId bus;
+    routing::OutputDestination destination;
 };
 
 using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
                              SetTrackGain, SetTrackPan, SetTrackMute,
                              SetTrackSolo, SetMasterGain,
                              SetBusGain, SetBusPan, SetBusMute, SetBusSolo,
-                             SetTrackOutputDestination>;
+                             SetTrackOutputDestination,
+                             SetBusOutputDestination>;
 
 enum class CommandStatus {
     accepted,
