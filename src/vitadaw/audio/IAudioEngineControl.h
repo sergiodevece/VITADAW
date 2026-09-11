@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/audio/RealtimeTransportExchange.h"
+#include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/mixer/Metering.h"
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/tracks/AudioTrack.h"
@@ -39,6 +40,21 @@ struct AudioFilePreparationResult {
     [[nodiscard]] bool success() const noexcept { return prepared != nullptr; }
 };
 
+class PreparedProcessingPlanChange {
+public:
+    virtual ~PreparedProcessingPlanChange() = default;
+};
+
+using PreparedProcessingPlanChangePtr =
+    std::unique_ptr<PreparedProcessingPlanChange>;
+
+struct StructuralPlanPreparationResult {
+    PreparedProcessingPlanChangePtr prepared;
+    std::string errorMessage;
+
+    [[nodiscard]] bool success() const noexcept { return prepared != nullptr; }
+};
+
 // Allocation-free, noexcept half of a prepared load commit. The application
 // builds every potentially-throwing ProjectState value before supplying it.
 struct AudioFileCommitAction {
@@ -67,6 +83,11 @@ public:
         mixer::PreparedTrackMixState trackMix) = 0;
     [[nodiscard]] virtual bool commitPreparedWav(
         PreparedAudioFilePtr prepared,
+        AudioFileCommitAction modelCommit) noexcept = 0;
+    [[nodiscard]] virtual StructuralPlanPreparationResult prepareProcessingPlan(
+        const ProcessingPlanSpecification& specification) = 0;
+    [[nodiscard]] virtual bool commitPreparedProcessingPlan(
+        PreparedProcessingPlanChangePtr prepared,
         AudioFileCommitAction modelCommit) noexcept = 0;
     [[nodiscard]] virtual bool tryUpdateTrackMix(
         tracks::TrackId track,

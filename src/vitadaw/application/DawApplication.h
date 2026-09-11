@@ -20,6 +20,11 @@ public:
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
 
 private:
+    [[nodiscard]] audio::ProcessingPlanSpecification makePlanSpecification(
+        const project::ProjectState& project) const;
+    [[nodiscard]] commands::CommandResult commitStructuralProject(
+        project::ProjectState candidate, std::string successMessage);
+
     audio::IAudioEngineControl& audioEngine_;
     project::ProjectState project_;
     transport::TransportState transport_;

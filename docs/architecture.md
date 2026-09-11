@@ -393,7 +393,80 @@ publicados y el candidato, limitando también el pico durante una sustitución.
   arquitectura hasta decenas de pistas, pero no constituye una garantía de
   rendimiento profesional.
 
-## Evolución hasta 0.1.2
+## Routing Foundation 0.2.0
+
+`ProjectState` posee un `RoutingState` portable. Este conserva buses con `BusId`
+monotónico de 64 bits y una única ruta por `TrackId`; una ruta termina en Master
+o en un bus existente. La relación solo vive en `RoutingState`. Un bus no es una
+pista vacía: no contiene WAV, clip, reloj ni sample rate fuente.
+
+La frontera estructural es:
+
+```text
+ProjectState + RoutingState
+    -> ProcessingPlanSpecification
+    -> prepareProcessingPlan (portable, application thread)
+    -> PreparedProcessingPlan + ProcessingPlanRuntime
+    -> quiescent transactional commit
+    -> RealtimeAudioEngine
+```
+
+El plan inmutable conserva tracks y buses resueltos a índices densos, duración,
+orden de pasos, capacidad del subbloque y presupuesto de memoria. El runtime
+separado posee buffers estéreo por bus, buffer master y una tabla temporal. Los
+recursos WAV, el plan y el runtime comparten el owner publicado por el adaptador;
+el motor solo recibe vistas prestadas mientras el callback puede ejecutarse.
+
+El orden preparado de 0.2.0 contiene todos los pasos de pista, después todos los
+buses y finalmente Master. Es el punto de extensión para una futura ordenación
+topológica. Como Bus→Bus no existe todavía, un ciclo no puede representarse:
+Master es terminal y cada bus tiene salida fija a Master. Destinos inexistentes,
+IDs inválidos o duplicados, fuentes desconocidas, formatos inválidos, límites y
+presupuesto insuficiente se rechazan antes del commit.
+
+El ejecutor divide cualquier callback en subbloques de hasta 512 frames. Para
+cada subbloque escribe una tabla preasignada de posiciones obtenidas del único
+`RealtimeProjectClock`. Después cada pista se renderiza una vez, avanza sus
+smoothers una vez por frame y acumula en su bus o en Master. Los buses se miden y
+se acumulan a Master; por último se aplica el gain master y se escribe output.
+Ningún nodo posee o avanza un reloj global independiente.
+
+```text
+TrackRenderer -> gain/pan smoothing -> mute/solo -> track meter
+    -> main destination
+        -> optional stereo bus accumulation -> identity -> bus meter
+        -> master accumulation -> master smoothing -> master meter -> output
+```
+
+Los buffers se reservan al preparar el plan. El presupuesto inicial es 16 MiB y
+los límites son 256 pistas, 64 buses y estéreo fijo. El callback solo limpia y
+reutiliza memoria existente. Los peaks de todos los subbloques se combinan para
+publicar un único snapshot del callback, identificado por `TrackId` y `BusId`.
+
+`AddAudioTrack`, `AddBus` y `SetTrackOutputDestination` son cambios
+estructurales. `DawApplication` copia el modelo, aplica el cambio al candidato y
+solicita preparación antes de mutar el proyecto vigente. Solo se admiten con el
+transporte parado. El adaptador conserva los owners de WAV existentes sin
+decodificarlos otra vez, retira el callback, intercambia el conjunto preparado,
+ejecuta el swap `noexcept` del modelo y reconecta. Preparación o commit fallidos
+no publican ninguna parte del candidato.
+
+La carga WAV usa el mismo compilador, pero no define la topología: el routing
+puede prepararse con cero recursos y mantener buses vacíos. JUCE continúa
+limitado a dispositivo, decodificación, ownership y barrera del callback; el
+modelo, compilador, plan y ejecutor son core-only.
+
+### Límites conscientes de 0.2.0
+
+- Cada pista tiene un solo destino principal.
+- Todos los buses son estéreo, procesan a unity y terminan en Master.
+- No existen Bus→Bus, sends, inserts, plugins, PDC ni feedback.
+- Los cambios de routing durante Play se rechazan.
+- Solo y Mute pertenecen exclusivamente a pistas; los buses transportan la
+  contribución resultante.
+- Se usa un buffer completo por bus; no hay reutilización avanzada de scratch.
+
+## Evolución hasta 0.2.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -421,6 +494,8 @@ publicados y el candidato, limitando también el pico durante una sustitución.
     Core portable y una vía ligera, acotada y RT-safe de parámetros.
 12. **Completado en 0.1.2:** añadir smoothing temporalmente estable y peak
     metering portable con intercambio RT hacia aplicación.
+13. **Completado en 0.2.0:** compilar routing editable a un plan portable con
+    buses, buffers y orden preparados fuera de RT.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

@@ -34,6 +34,16 @@ public:
         ResourceCounters& counters;
     };
 
+    class PreparedPlan final
+        : public vitadaw::audio::PreparedProcessingPlanChange {
+    public:
+        explicit PreparedPlan(
+            vitadaw::audio::ProcessingPlanSpecification candidate)
+            : specification(std::move(candidate)) {}
+
+        vitadaw::audio::ProcessingPlanSpecification specification;
+    };
+
     struct LiveTrack {
         vitadaw::tracks::TrackId id;
         vitadaw::audio::AudioFileMetadata metadata;
@@ -63,12 +73,54 @@ public:
                                                resourceCounters), {}};
     }
 
+    vitadaw::audio::StructuralPlanPreparationResult prepareProcessingPlan(
+        const vitadaw::audio::ProcessingPlanSpecification& specification) override {
+        ++structuralPrepareRequests;
+        if (rejectNextStructuralPreparation) {
+            rejectNextStructuralPreparation = false;
+            return {nullptr, "Injected routing preparation failure"};
+        }
+        const auto validation = vitadaw::audio::prepareProcessingPlan(
+            specification, {});
+        if (!validation.success()) {
+            return {nullptr, validation.errorMessage};
+        }
+        return {std::make_unique<PreparedPlan>(specification), {}};
+    }
+
+    bool commitPreparedProcessingPlan(
+        vitadaw::audio::PreparedProcessingPlanChangePtr prepared,
+        vitadaw::audio::AudioFileCommitAction modelCommit) noexcept override {
+        auto* candidate = dynamic_cast<PreparedPlan*>(prepared.get());
+        if (candidate == nullptr || !modelCommit.isValid() ||
+            rejectNextStructuralCommit) {
+            rejectNextStructuralCommit = false;
+            return false;
+        }
+        ++structuralCommitRequests;
+        liveSpecification = std::move(candidate->specification);
+        snapshot.playing = false;
+        snapshot.position = {0};
+        modelCommit.execute();
+        return true;
+    }
+
     bool tryUpdateTrackMix(
         vitadaw::tracks::TrackId track,
         vitadaw::mixer::PreparedTrackMixState mix,
         bool anySolo) noexcept override {
         ++trackMixRequests;
-        return acceptMixerRequests && loaded(track) != nullptr && mix.isValid();
+        const auto planTrack = std::find_if(
+            liveSpecification.tracks.begin(), liveSpecification.tracks.end(),
+            [track](const auto& candidate) { return candidate.id == track; });
+        if (!acceptMixerRequests || planTrack == liveSpecification.tracks.end() ||
+            !mix.isValid()) {
+            return false;
+        }
+        planTrack->mix = mix;
+        liveSpecification.anySolo = anySolo;
+        lastGlobalSolo = anySolo;
+        return true;
     }
 
     bool tryUpdateGlobalSolo(bool anySolo) noexcept override {
@@ -179,6 +231,11 @@ public:
     int masterMixRequests{};
     int globalSoloRequests{};
     bool lastGlobalSolo{};
+    int structuralPrepareRequests{};
+    int structuralCommitRequests{};
+    bool rejectNextStructuralPreparation{};
+    bool rejectNextStructuralCommit{};
+    vitadaw::audio::ProcessingPlanSpecification liveSpecification;
     ResourceCounters resourceCounters;
 
 private:
@@ -235,13 +292,37 @@ int main() {
     const tracks::TrackId third{3};
     const tracks::TrackId fourth{4};
 
+    check(dispatcher.dispatch(commands::AddBus{"Bus A"}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::AddBus{"Bus B"}).status ==
+                  commands::CommandStatus::accepted &&
+              app.project().routing().buses().size() == 2 &&
+              app.project().routing().buses()[0].id == routing::BusId{1} &&
+              app.project().routing().buses()[1].id == routing::BusId{2},
+          "stereo bus identities should be stable and monotonic");
+    const auto busA = app.project().routing().buses()[0].id;
+    const auto loadsBeforeRouting = audio.loadRequests;
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              first, routing::TrackOutputDestination::toBus(busA)}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().routing().findTrackRoute(first)->destination ==
+                  routing::TrackOutputDestination::toBus(busA) &&
+              audio.loadRequests == loadsBeforeRouting,
+          "routing should rebuild a WAV-independent prepared plan");
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              first, routing::TrackOutputDestination::toBus({999})}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().routing().findTrackRoute(first)->destination ==
+                  routing::TrackOutputDestination::toBus(busA),
+          "an unknown bus must preserve the previous model and plan");
+
     check(dispatcher.dispatch(commands::SetTrackGain{
               emptyBetween, mixer::GainDb{-6.0F}}).status ==
               commands::CommandStatus::accepted &&
               app.project().findTrack(emptyBetween)->mix.gain ==
                   mixer::GainDb{-6.0F} &&
-              audio.trackMixRequests == 0 && audio.globalSoloRequests == 1,
-          "an empty track should retain mixer state without an RT resource");
+              audio.trackMixRequests == 1 && audio.globalSoloRequests == 0,
+          "an empty track should update its prepared mixer state without a WAV");
     check(dispatcher.dispatch(commands::SetTrackPan{
               emptyBetween,
               mixer::Pan{std::numeric_limits<float>::quiet_NaN()}}).status ==
@@ -285,7 +366,7 @@ int main() {
                   commands::CommandStatus::accepted &&
               dispatcher.dispatch(commands::SetTrackSolo{first, true}).status ==
                   commands::CommandStatus::accepted &&
-              audio.trackMixRequests == 3 &&
+              audio.trackMixRequests == 4 &&
               app.project().findTrack(first)->mix ==
                   mixer::TrackMixState{{}, {-0.5F}, true, true},
           "loaded track commands must update RT before committing the model");
@@ -322,6 +403,14 @@ int main() {
     check(dispatcher.dispatch(commands::Play{}).status ==
               commands::CommandStatus::accepted,
           "a variable project with prepared tracks should play");
+    const auto preparationsWhilePlaying = audio.structuralPrepareRequests;
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              first, routing::TrackOutputDestination::master()}).status ==
+              commands::CommandStatus::rejected &&
+              audio.structuralPrepareRequests == preparationsWhilePlaying &&
+              app.project().routing().findTrackRoute(first)->destination ==
+                  routing::TrackOutputDestination::toBus(busA),
+          "routing changes during playback must be rejected before preparation");
     audio.publishProgress(96000, true);
     app.synchroniseTransport();
     check(app.transport().playback == transport::PlaybackState::playing,
@@ -331,6 +420,28 @@ int main() {
               commands::CommandStatus::accepted &&
               app.transport().position.value == 0,
           "Stop should rewind the master clock");
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              first, routing::TrackOutputDestination::master()}).status ==
+              commands::CommandStatus::accepted,
+          "a stopped project should accept a routing change");
+    audio.rejectNextStructuralPreparation = true;
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              first, routing::TrackOutputDestination::toBus(busA)}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().routing().findTrackRoute(first)->destination ==
+                  routing::TrackOutputDestination::master() &&
+              audio.liveSpecification.tracks[0].destination ==
+                  routing::TrackOutputDestination::master(),
+          "failed routing preparation must preserve model and published plan");
+    audio.rejectNextStructuralCommit = true;
+    check(dispatcher.dispatch(commands::SetTrackOutputDestination{
+              first, routing::TrackOutputDestination::toBus(busA)}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().routing().findTrackRoute(first)->destination ==
+                  routing::TrackOutputDestination::master() &&
+              audio.liveSpecification.tracks[0].destination ==
+                  routing::TrackOutputDestination::master(),
+          "failed routing commit must preserve model and published plan");
     check(dispatcher.dispatch(commands::Play{}).status ==
               commands::CommandStatus::accepted,
           "Play should restart after Stop");

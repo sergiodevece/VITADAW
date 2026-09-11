@@ -20,15 +20,35 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, commands::AddAudioTrack>) {
                 try {
-                    const auto id = project_.addAudioTrack(value.name);
-                    return {commands::CommandStatus::accepted,
-                            "Added audio track " + std::to_string(id.value)};
+                    auto candidate = project_;
+                    const auto id = candidate.addAudioTrack(value.name);
+                    return commitStructuralProject(
+                        std::move(candidate),
+                        "Added audio track " + std::to_string(id.value));
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
                             "Not enough memory to add audio track"};
                 } catch (const std::exception&) {
                     return {commands::CommandStatus::rejected,
                             "Audio track could not be added"};
+                }
+            } else if constexpr (std::is_same_v<T, commands::AddBus>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing cannot change during playback"};
+                }
+                try {
+                    auto candidate = project_;
+                    const auto id = candidate.addBus(value.name);
+                    return commitStructuralProject(
+                        std::move(candidate),
+                        "Added stereo bus " + std::to_string(id.value));
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to add bus"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Stereo bus could not be added"};
                 }
             } else if constexpr (std::is_same_v<T, commands::LoadAudioFile>) {
                 const auto* destination = project_.findTrack(value.track);
@@ -161,10 +181,8 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                                    ? updated.solo
                                    : candidate.mix.solo);
                 }
-                const auto published = track->hasAudio()
-                    ? audioEngine_.tryUpdateTrackMix(
-                          value.track, mixer::prepare(updated), anySolo)
-                    : audioEngine_.tryUpdateGlobalSolo(anySolo);
+                const auto published = audioEngine_.tryUpdateTrackMix(
+                    value.track, mixer::prepare(updated), anySolo);
                 if (!published) {
                     return {commands::CommandStatus::rejected,
                             "Mixer parameter queue is full"};
@@ -185,10 +203,89 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 static_cast<void>(project_.setMasterMix(updated));
                 return {commands::CommandStatus::accepted,
                         "Master mixer state updated"};
+            } else if constexpr (
+                std::is_same_v<T, commands::SetTrackOutputDestination>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing cannot change during playback"};
+                }
+                try {
+                    auto candidate = project_;
+                    if (!candidate.setTrackOutputDestination(
+                            value.track, value.destination)) {
+                        return {commands::CommandStatus::rejected,
+                                "Invalid track output destination"};
+                    }
+                    return commitStructuralProject(
+                        std::move(candidate), "Track output routing updated");
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to prepare routing"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing update could not be prepared"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Unknown error while preparing routing"};
+                }
             }
             return {commands::CommandStatus::accepted, {}};
         },
         command);
+}
+
+audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
+    const project::ProjectState& project) const {
+    audio::ProcessingPlanSpecification result;
+    result.projectSampleRate = project.sampleRate();
+    result.buses = project.routing().buses();
+    result.masterMix = mixer::prepare(project.masterMix());
+    result.tracks.reserve(project.tracks().size());
+    for (const auto& track : project.tracks()) {
+        const auto* route = project.routing().findTrackRoute(track.id);
+        if (route == nullptr) {
+            throw std::logic_error{"Audio track has no output routing"};
+        }
+        result.tracks.push_back(
+            {track.id, mixer::prepare(track.mix), route->destination});
+        result.anySolo = result.anySolo || track.mix.solo;
+    }
+    return result;
+}
+
+commands::CommandResult DawApplication::commitStructuralProject(
+    project::ProjectState candidate, std::string successMessage) {
+    if (transport_.playback == transport::PlaybackState::playing) {
+        return {commands::CommandStatus::rejected,
+                "Routing cannot change during playback"};
+    }
+    auto preparation = audioEngine_.prepareProcessingPlan(
+        makePlanSpecification(candidate));
+    if (!preparation.success()) {
+        return {commands::CommandStatus::rejected,
+                std::move(preparation.errorMessage)};
+    }
+    struct CommitContext {
+        DawApplication* application;
+        project::ProjectState* candidate;
+    } context{this, &candidate};
+    const audio::AudioFileCommitAction commit{
+        &context,
+        [](void* raw) noexcept {
+            auto& value = *static_cast<CommitContext*>(raw);
+            value.application->project_.swap(*value.candidate);
+            value.application->transport_.stopAndRewind();
+            value.application->transport_.setDuration(
+                value.application->project_.duration());
+        }};
+    if (!audioEngine_.commitPreparedProcessingPlan(
+            std::move(preparation.prepared), commit)) {
+        return {commands::CommandStatus::rejected,
+                "Prepared routing could not be committed"};
+    }
+    pendingAudioCommandSequence_ =
+        audioEngine_.transportSnapshot().lastProcessedCommandSequence;
+    return {commands::CommandStatus::accepted, std::move(successMessage)};
 }
 
 void DawApplication::synchroniseTransport() noexcept {

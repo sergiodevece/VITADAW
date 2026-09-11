@@ -4,6 +4,7 @@
 #include "vitadaw/audio/IRealtimeAudioProcessor.h"
 #include "vitadaw/audio/DeviceProcessingState.h"
 #include "vitadaw/audio/PreparedProject.h"
+#include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/audio/MixerSmoother.h"
 #include "vitadaw/audio/RealtimeMeterExchange.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
@@ -27,9 +28,12 @@ class RealtimeAudioEngine final {
 public:
     static constexpr std::size_t commandCapacity = 8;
     static constexpr std::size_t parameterCommandCapacity = 64;
-    static constexpr std::size_t maximumTrackCount = 256;
+    static constexpr std::size_t maximumTrackCount = maximumPreparedTracks;
+    static constexpr std::size_t maximumBusCount = maximumPreparedBuses;
 
     void configure(PreparedProjectView project) noexcept;
+    void configure(const PreparedProcessingPlan& plan,
+                   ProcessingPlanRuntime& runtime) noexcept;
     // Lifecycle transitions may race with the application command producer.
     // Transitions away from operational are invoked only while render is
     // quiescent (JUCE serialises them against its callback).
@@ -65,7 +69,7 @@ private:
         std::uint64_t generation{};
     };
     struct TrackMixCommand {
-        tracks::TrackId track;
+        std::size_t trackIndex{};
         mixer::PreparedTrackMixState mix;
         bool anySolo{};
     };
@@ -86,11 +90,25 @@ private:
     void publishMeters() noexcept;
     void clearMeters() noexcept;
     void advanceSmoothers(std::size_t frameCount) noexcept;
+    void processSubBlock(AudioBlockView output, std::size_t outputOffset,
+                         std::size_t frameCount,
+                         timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept;
     void transitionAwayFromOperational(DeviceProcessingState state) noexcept;
     void resolveCommandsThrough(AudioCommandSequence sequence) noexcept;
     [[nodiscard]] bool hasPreparedAudio() const noexcept;
 
-    PreparedProjectView project_;
+    timeline::SampleRate projectSampleRate_;
+    timeline::ProjectFrameCount projectDuration_;
+    std::span<const PreparedTrackRoute> tracks_;
+    std::span<const PreparedBusNode> buses_;
+    std::span<const ProcessingStep> order_;
+    std::size_t blockCapacity_{defaultProcessingBlockCapacity};
+    ProcessingPlanRuntime* runtime_{};
+    std::array<PreparedTrackRoute, maximumTrackCount> legacyTracks_{};
+    std::array<ProcessingStep, maximumTrackCount + 1> legacyOrder_{};
+    std::array<float, defaultProcessingBlockCapacity> legacyMasterLeft_{};
+    std::array<float, defaultProcessingBlockCapacity> legacyMasterRight_{};
+    std::array<double, defaultProcessingBlockCapacity> legacyPositions_{};
     RealtimeProjectClock clock_;
     RealtimeTransportExchange transportExchange_;
     std::array<QueuedCommand, commandCapacity> commands_{};
@@ -107,6 +125,8 @@ private:
     std::atomic<std::size_t> parameterReadIndex_{};
     std::array<tracks::TrackId, maximumTrackCount> meterTrackIds_{};
     std::array<mixer::StereoPeak, maximumTrackCount> trackPeaks_{};
+    std::array<routing::BusId, maximumBusCount> meterBusIds_{};
+    std::array<mixer::StereoPeak, maximumBusCount> busPeaks_{};
     mixer::StereoPeak masterPeak_;
     RealtimeMeterExchange meterExchange_;
 };

@@ -3,6 +3,7 @@
 #include "vitadaw/audio/AudioDeviceState.h"
 #include "vitadaw/commands/CommandDispatcher.h"
 #include "vitadaw/mixer/Metering.h"
+#include "vitadaw/project/ProjectState.h"
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/transport/TransportState.h"
 
@@ -18,7 +19,7 @@ class MainWindow final : public juce::DocumentWindow {
 public:
     MainWindow(const audio::AudioDeviceState& initialAudioState,
                commands::ICommandDispatcher& commandDispatcher,
-               std::vector<tracks::TrackId> audioTracks);
+               const project::ProjectState& project);
     void closeButtonPressed() override;
     void setAudioDeviceState(const audio::AudioDeviceState& state);
     void setTransportState(const transport::TransportState& state,

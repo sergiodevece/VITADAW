@@ -22,6 +22,10 @@ const std::vector<tracks::AudioTrack>& ProjectState::tracks() const noexcept {
     return tracks_;
 }
 
+const routing::RoutingState& ProjectState::routing() const noexcept {
+    return routing_;
+}
+
 tracks::TrackId ProjectState::addAudioTrack(std::string name) {
     if (!nextTrackId_.isValid() ||
         nextTrackId_.value == std::numeric_limits<std::uint64_t>::max()) {
@@ -29,8 +33,25 @@ tracks::TrackId ProjectState::addAudioTrack(std::string name) {
     }
     const auto id = nextTrackId_;
     tracks_.push_back({id, std::move(name), std::nullopt, {}});
+    try {
+        routing_.addTrack(id);
+    } catch (...) {
+        tracks_.pop_back();
+        throw;
+    }
     ++nextTrackId_.value;
     return id;
+}
+
+routing::BusId ProjectState::addBus(std::string name) {
+    return routing_.addBus(std::move(name));
+}
+
+bool ProjectState::setTrackOutputDestination(
+    tracks::TrackId track,
+    routing::TrackOutputDestination destination) noexcept {
+    return findTrack(track) != nullptr &&
+           routing_.setTrackDestination(track, destination);
 }
 
 const tracks::AudioTrack* ProjectState::findTrack(
@@ -110,6 +131,16 @@ void ProjectState::commitAudioClipUpdate(
                   std::optional<clips::AudioClip>>);
     tracks_[update.trackIndex].clip.swap(update.replacement);
     nextClipId_ = update.nextClipId;
+}
+
+void ProjectState::swap(ProjectState& other) noexcept {
+    using std::swap;
+    swap(projectSampleRate_, other.projectSampleRate_);
+    tracks_.swap(other.tracks_);
+    swap(routing_, other.routing_);
+    swap(nextTrackId_, other.nextTrackId_);
+    swap(nextClipId_, other.nextClipId_);
+    swap(masterMix_, other.masterMix_);
 }
 
 } // namespace vitadaw::project

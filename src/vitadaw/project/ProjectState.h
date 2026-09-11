@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/tracks/AudioTrack.h"
+#include "vitadaw/routing/RoutingState.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -24,7 +25,12 @@ public:
 
     [[nodiscard]] timeline::SampleRate sampleRate() const noexcept;
     [[nodiscard]] const std::vector<tracks::AudioTrack>& tracks() const noexcept;
+    [[nodiscard]] const routing::RoutingState& routing() const noexcept;
     [[nodiscard]] tracks::TrackId addAudioTrack(std::string name);
+    [[nodiscard]] routing::BusId addBus(std::string name);
+    [[nodiscard]] bool setTrackOutputDestination(
+        tracks::TrackId track,
+        routing::TrackOutputDestination destination) noexcept;
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
     [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;
@@ -38,10 +44,12 @@ public:
         timeline::SourceFrameCount sourceFrameCount,
         timeline::SampleRate sourceSampleRate) const;
     void commitAudioClipUpdate(PreparedAudioClipUpdate& update) noexcept;
+    void swap(ProjectState& other) noexcept;
 
 private:
     timeline::SampleRate projectSampleRate_;
     std::vector<tracks::AudioTrack> tracks_;
+    routing::RoutingState routing_;
     tracks::TrackId nextTrackId_{1};
     clips::ClipId nextClipId_{1};
     mixer::MasterMixState masterMix_;

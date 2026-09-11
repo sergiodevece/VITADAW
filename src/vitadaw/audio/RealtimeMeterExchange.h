@@ -20,6 +20,14 @@ public:
     void publish(std::span<const tracks::TrackId> trackIds,
                  std::span<const mixer::StereoPeak> trackPeaks,
                  mixer::StereoPeak master) noexcept {
+        publish(trackIds, trackPeaks, {}, {}, master);
+    }
+
+    void publish(std::span<const tracks::TrackId> trackIds,
+                 std::span<const mixer::StereoPeak> trackPeaks,
+                 std::span<const routing::BusId> busIds,
+                 std::span<const mixer::StereoPeak> busPeaks,
+                 mixer::StereoPeak master) noexcept {
         const auto count = std::min(
             {trackIds.size(), trackPeaks.size(),
              mixer::maximumMeteredTracks});
@@ -30,6 +38,14 @@ public:
             tracks_[index].id.store(trackIds[index].value);
             tracks_[index].left.store(encode(trackPeaks[index].left));
             tracks_[index].right.store(encode(trackPeaks[index].right));
+        }
+        const auto busCount = std::min(
+            {busIds.size(), busPeaks.size(), mixer::maximumMeteredBuses});
+        busCount_.store(busCount);
+        for (std::size_t index = 0; index < busCount; ++index) {
+            buses_[index].id.store(busIds[index].value);
+            buses_[index].left.store(encode(busPeaks[index].left));
+            buses_[index].right.store(encode(busPeaks[index].right));
         }
         masterLeft_.store(encode(master.left));
         masterRight_.store(encode(master.right));
@@ -51,6 +67,15 @@ public:
                     decode(tracks_[index].left.load());
                 candidate.tracks[index].peak.right =
                     decode(tracks_[index].right.load());
+            }
+            candidate.busCount = std::min(
+                busCount_.load(), mixer::maximumMeteredBuses);
+            for (std::size_t index = 0; index < candidate.busCount; ++index) {
+                candidate.buses[index].bus = {buses_[index].id.load()};
+                candidate.buses[index].peak.left =
+                    decode(buses_[index].left.load());
+                candidate.buses[index].peak.right =
+                    decode(buses_[index].right.load());
             }
             candidate.master.left = decode(masterLeft_.load());
             candidate.master.right = decode(masterRight_.load());
@@ -83,6 +108,8 @@ private:
     std::atomic<std::uint64_t> revision_{};
     std::atomic<std::size_t> trackCount_{};
     std::array<AtomicTrackPeak, mixer::maximumMeteredTracks> tracks_{};
+    std::atomic<std::size_t> busCount_{};
+    std::array<AtomicTrackPeak, mixer::maximumMeteredBuses> buses_{};
     std::atomic<std::uint32_t> masterLeft_{};
     std::atomic<std::uint32_t> masterRight_{};
 };

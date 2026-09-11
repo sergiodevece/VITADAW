@@ -1,10 +1,10 @@
-# VitaDAW 0.1.2 — Smooth Mixer & Metering
+# VitaDAW 0.2.0 — Routing Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
 el dispositivo de audio y carga y reproduce una colección variable de pistas WAV
-sincronizadas. El incremento 0.1.2 añade smoothing sample-accurate y peak
-metering portable por pista y master al Mixer Core.
+sincronizadas. El incremento 0.2.0 sustituye la suma directa al master por un
+plan portable preparado con buses estéreo, destinos de pista y metering de bus.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -134,6 +134,27 @@ telemetría latest-value: no se conserva cada bloque y una lectura concurrente
 fallida devuelve un snapshot vacío coherente. RMS, decay y peak hold quedan para
 una versión futura.
 
+`RoutingState` es la única fuente editable de las conexiones. Cada pista tiene
+exactamente un destino principal: Master o un `BusId` estable y monotónico. Los
+buses son nodos estéreo de acumulación independientes de WAV, clips y sample
+rates fuente; en 0.2.0 aplican procesamiento identidad y desembocan siempre en
+Master. Master es único y conserva su gain, smoothing y meter.
+
+Los cambios estructurales pasan por comandos y solo se aceptan con el transporte
+parado. `ProjectState` y `RoutingState` producen una especificación candidata;
+el compilador portable valida identidades, destinos, límites y memoria, resuelve
+índices densos y crea `PreparedProcessingPlan` junto a `ProcessingPlanRuntime`.
+El commit retira el callback, intercambia modelo, plan, buffers y recursos como
+una transacción, y vuelve a registrar el consumidor. Un fallo conserva el
+proyecto anterior completo.
+
+El plan fija el orden Tracks → Buses → Master. Cada pista se renderiza una sola
+vez por subbloque y distribuye su señal a un único destino. Cada bus se procesa
+después de recibir todas sus pistas y se mide antes de sumarse al master. Una
+capacidad interna preparada de 512 frames divide callbacks mayores sin perder
+continuidad de reloj, smoothing ni máximos de metering. Toda reserva, resolución
+de IDs y construcción topológica ocurre fuera de RT.
+
 La ventana muestra también, de forma provisional, el estado, posición, duración
 y sample rate lógico del proyecto. Al llegar al final natural, el transporte
 queda en `Stopped` y conserva la posición en el final; `Stop` explícito continúa
@@ -183,6 +204,8 @@ La arquitectura y las reglas de tiempo real se describen en
   con actualizaciones ligeras de parámetros hacia RT.
 - **0.1.2 — Smooth Mixer & Metering:** rampas sample-accurate de gain/pan y
   peak metering portable por pista y master.
+- **0.2.0 — Routing Foundation:** `RoutingState`, buses estéreo, destinos
+  Track→Bus/Master y ejecución mediante un plan RT preparado.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -193,4 +216,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.0.9.md`](docs/validation-0.0.9.md) y
 [`docs/validation-0.1.0.md`](docs/validation-0.1.0.md) y
 [`docs/validation-0.1.1.md`](docs/validation-0.1.1.md) y
-[`docs/validation-0.1.2.md`](docs/validation-0.1.2.md).
+[`docs/validation-0.1.2.md`](docs/validation-0.1.2.md) y
+[`docs/validation-0.2.0.md`](docs/validation-0.2.0.md).

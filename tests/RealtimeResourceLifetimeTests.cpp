@@ -37,6 +37,27 @@ struct InstrumentedResource {
     bool published{};
 };
 
+struct PreparedPlanOwner {
+    PreparedPlanOwner(std::unique_ptr<InstrumentedResource> ownedResource,
+                      std::unique_ptr<vitadaw::audio::PreparedProcessingBundle>
+                          ownedProcessing,
+                      LifetimeProbe& lifetimeProbe)
+        : resource(std::move(ownedResource)),
+          processing(std::move(ownedProcessing)), probe(lifetimeProbe) {}
+
+    ~PreparedPlanOwner() {
+        if (probe.activeRealtimeUsers.load(std::memory_order_acquire) != 0) {
+            probe.destructionsWhileRealtimeActive.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        probe.destructions.fetch_add(1, std::memory_order_release);
+    }
+
+    std::unique_ptr<InstrumentedResource> resource;
+    std::unique_ptr<vitadaw::audio::PreparedProcessingBundle> processing;
+    LifetimeProbe& probe;
+};
+
 void check(bool condition, std::string_view message) {
     if (!condition) {
         std::cerr << "FAILED: " << message << '\n';
@@ -160,6 +181,59 @@ int main() {
               replacementProbe.destructionsWhileRealtimeActive.load(
                   std::memory_order_acquire) == 0,
           "close must release the last owner after RT becomes quiescent");
+
+    LifetimeProbe planProbe;
+    auto routedResource =
+        std::make_unique<InstrumentedResource>(0.6F, planProbe);
+    routedResource->published = true;
+    const std::array routedSources{view(*routedResource)};
+    audio::ProcessingPlanSpecification routedSpecification;
+    routedSpecification.projectSampleRate = timeline::SampleRate{100.0};
+    routedSpecification.buses.push_back({{1}, "Lifetime bus"});
+    routedSpecification.tracks.push_back(
+        {{1}, {}, routing::TrackOutputDestination::toBus({1})});
+    auto routedPreparation = audio::prepareProcessingPlan(
+        routedSpecification, routedSources, 4);
+    check(routedPreparation.success() &&
+              routedPreparation.prepared->runtime.buses.size() == 1,
+          "lifetime test must prepare plan and bus buffers together");
+    auto routedOwner = std::make_unique<PreparedPlanOwner>(
+        std::move(routedResource), std::move(routedPreparation.prepared),
+        planProbe);
+    engine.configure(routedOwner->processing->plan,
+                     routedOwner->processing->runtime);
+    makeOperational(engine);
+    check(engine.tryRequestPlay().accepted,
+          "routed lifetime project should play");
+
+    std::binary_semaphore routedCallbackEntered{0};
+    std::binary_semaphore finishRoutedCallback{0};
+    std::thread routedRealtimeUse([&] {
+        const std::lock_guard callbackLock{callbackSerialization};
+        planProbe.activeRealtimeUsers.fetch_add(1, std::memory_order_acq_rel);
+        routedCallbackEntered.release();
+        finishRoutedCallback.acquire();
+        std::array<float, 5> left{}, right{};
+        std::array<float*, 2> channels{left.data(), right.data()};
+        engine.processBlock({channels.data(), channels.size(), left.size()},
+                            timeline::SampleRate{100.0});
+        planProbe.activeRealtimeUsers.fetch_sub(1, std::memory_order_acq_rel);
+    });
+    routedCallbackEntered.acquire();
+    std::thread closeRoutedPlan([&] {
+        const std::lock_guard callbackLock{callbackSerialization};
+        engine.configure({timeline::SampleRate{100.0}, {}, {}, {}, false});
+        routedOwner.reset();
+    });
+    check(planProbe.destructions.load(std::memory_order_acquire) == 0,
+          "plan, bus buffers, and resource must remain alive during RT use");
+    finishRoutedCallback.release();
+    routedRealtimeUse.join();
+    closeRoutedPlan.join();
+    check(planProbe.destructions.load(std::memory_order_acquire) == 2 &&
+              planProbe.destructionsWhileRealtimeActive.load(
+                  std::memory_order_acquire) == 0,
+          "plan owner and routed resource must be destroyed outside RT");
 
     std::cout << "All realtime resource lifetime tests passed\n";
     return EXIT_SUCCESS;

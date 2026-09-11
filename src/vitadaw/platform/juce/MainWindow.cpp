@@ -1,11 +1,13 @@
 #include "vitadaw/platform/juce/MainWindow.h"
 
+#include <algorithm>
+
 namespace vitadaw::platform::juce_adapter {
 
 class AudioStatusComponent final : public juce::Component {
 public:
     AudioStatusComponent(commands::ICommandDispatcher& commandDispatcher,
-                         std::vector<tracks::TrackId> audioTracks)
+                         const project::ProjectState& project)
         : commandDispatcher_(commandDispatcher) {
         statusLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
         statusLabel_.setJustificationType(juce::Justification::centredLeft);
@@ -17,9 +19,9 @@ public:
         transportLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
         addAndMakeVisible(transportLabel_);
 
-        for (std::size_t index = 0; index < audioTracks.size(); ++index) {
+        for (std::size_t index = 0; index < project.tracks().size(); ++index) {
             auto controls = std::make_unique<TrackControls>();
-            controls->track = audioTracks[index];
+            controls->track = project.tracks()[index].id;
             controls->name.setText(
                 "Track " + juce::String(static_cast<int>(index + 1)),
                 juce::NotificationType::dontSendNotification);
@@ -37,6 +39,30 @@ public:
             controls->pan.setRange(mixer::Pan::left, mixer::Pan::right, 0.01);
             controls->pan.setValue(0.0,
                                    juce::NotificationType::dontSendNotification);
+            controls->output.addItem("Master", 1);
+            for (std::size_t busIndex = 0;
+                 busIndex < project.routing().buses().size(); ++busIndex) {
+                controls->output.addItem(
+                    juce::String(project.routing().buses()[busIndex].name),
+                    static_cast<int>(busIndex + 2));
+            }
+            const auto* route = project.routing().findTrackRoute(controls->track);
+            auto selected = 1;
+            if (route != nullptr &&
+                route->destination.kind == routing::DestinationKind::bus) {
+                const auto found = std::find_if(
+                    project.routing().buses().begin(),
+                    project.routing().buses().end(),
+                    [id = route->destination.bus](const auto& bus) {
+                        return bus.id == id;
+                    });
+                if (found != project.routing().buses().end()) {
+                    selected = static_cast<int>(
+                        found - project.routing().buses().begin() + 2);
+                }
+            }
+            controls->output.setSelectedId(
+                selected, juce::NotificationType::dontSendNotification);
             controls->gain.onValueChange = [this, raw = controls.get()] {
                 dispatch(commands::SetTrackGain{
                     raw->track,
@@ -55,19 +81,46 @@ public:
                 dispatch(commands::SetTrackSolo{raw->track,
                                                 raw->solo.getToggleState()});
             };
+            controls->output.onChange =
+                [this, raw = controls.get(),
+                 buses = project.routing().buses()] {
+                    const auto selectedId = raw->output.getSelectedId();
+                    const auto destination = selectedId <= 1
+                        ? routing::TrackOutputDestination::master()
+                        : routing::TrackOutputDestination::toBus(
+                              buses[static_cast<std::size_t>(selectedId - 2)].id);
+                    dispatch(commands::SetTrackOutputDestination{
+                        raw->track, destination});
+                };
             auto button = std::make_unique<juce::TextButton>(
                 "Load Audio " + juce::String(static_cast<int>(index + 1)));
-            const auto track = audioTracks[index];
+            const auto track = controls->track;
             button->onClick = [this, track] { chooseWav(track); };
             addAndMakeVisible(controls->name);
             addAndMakeVisible(controls->gain);
             addAndMakeVisible(controls->pan);
             addAndMakeVisible(controls->mute);
             addAndMakeVisible(controls->solo);
+            addAndMakeVisible(controls->output);
             addAndMakeVisible(controls->meter);
             addAndMakeVisible(*button);
             trackControls_.push_back(std::move(controls));
             loadButtons_.push_back(std::move(button));
+        }
+        for (const auto& bus : project.routing().buses()) {
+            auto controls = std::make_unique<BusControls>();
+            controls->bus = bus.id;
+            controls->name.setText(juce::String(bus.name),
+                                   juce::NotificationType::dontSendNotification);
+            controls->name.setColour(juce::Label::textColourId,
+                                     juce::Colours::white);
+            controls->meter.setText("L 0.000  R 0.000",
+                                    juce::NotificationType::dontSendNotification);
+            controls->meter.setColour(juce::Label::textColourId,
+                                      juce::Colours::lightgreen);
+            addAndMakeVisible(controls->name);
+            addAndMakeVisible(controls->meter);
+            busControls_.push_back(std::move(controls));
         }
         masterGain_.setRange(mixer::GainDb::silence,
                              mixer::GainDb::maximum, 0.1);
@@ -140,6 +193,19 @@ public:
                     "  R " + juce::String(peak.right, 3),
                 juce::NotificationType::dontSendNotification);
         }
+        for (auto& controls : busControls_) {
+            mixer::StereoPeak peak;
+            for (std::size_t index = 0; index < meters.busCount; ++index) {
+                if (meters.buses[index].bus == controls->bus) {
+                    peak = meters.buses[index].peak;
+                    break;
+                }
+            }
+            controls->meter.setText(
+                "L " + juce::String(peak.left, 3) +
+                    "  R " + juce::String(peak.right, 3),
+                juce::NotificationType::dontSendNotification);
+        }
         masterMeter_.setText(
             "Master L " + juce::String(meters.master.left, 3) +
                 "  R " + juce::String(meters.master.right, 3),
@@ -164,9 +230,15 @@ public:
             row.removeFromLeft(8);
             controls.gain.setBounds(row.removeFromLeft(180));
             controls.pan.setBounds(row.removeFromLeft(150));
+            controls.output.setBounds(row.removeFromLeft(110));
             controls.mute.setBounds(row.removeFromLeft(64));
             controls.solo.setBounds(row.removeFromLeft(64));
             controls.meter.setBounds(row);
+        }
+        for (auto& controls : busControls_) {
+            auto row = bounds.removeFromTop(30);
+            controls->name.setBounds(row.removeFromLeft(176));
+            controls->meter.setBounds(row.removeFromLeft(240));
         }
         bounds.removeFromTop(8);
         auto masterRow = bounds.removeFromTop(36);
@@ -191,6 +263,13 @@ private:
                          juce::Slider::TextBoxRight};
         juce::ToggleButton mute{"Mute"};
         juce::ToggleButton solo{"Solo"};
+        juce::ComboBox output;
+        juce::Label meter;
+    };
+
+    struct BusControls {
+        routing::BusId bus;
+        juce::Label name;
         juce::Label meter;
     };
 
@@ -229,6 +308,7 @@ private:
     juce::Label resultLabel_;
     std::vector<std::unique_ptr<juce::TextButton>> loadButtons_;
     std::vector<std::unique_ptr<TrackControls>> trackControls_;
+    std::vector<std::unique_ptr<BusControls>> busControls_;
     juce::Slider masterGain_{juce::Slider::LinearHorizontal,
                              juce::Slider::TextBoxRight};
     juce::Label masterMeter_;
@@ -239,16 +319,15 @@ private:
 
 MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
                        commands::ICommandDispatcher& commandDispatcher,
-                       std::vector<tracks::TrackId> audioTracks)
+                       const project::ProjectState& project)
     : DocumentWindow("VitaDAW",
                      juce::Colours::darkgrey,
                      DocumentWindow::allButtons) {
     setUsingNativeTitleBar(true);
-    content_ = new AudioStatusComponent(commandDispatcher,
-                                        std::move(audioTracks));
+    content_ = new AudioStatusComponent(commandDispatcher, project);
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
-    centreWithSize(900, 620);
+    centreWithSize(1040, 700);
     setResizable(true, false);
     setVisible(true);
 }

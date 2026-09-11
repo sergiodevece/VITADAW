@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/tracks/AudioTrack.h"
+#include "vitadaw/routing/RoutingState.h"
 
 #include <filesystem>
 #include <string>
@@ -9,6 +10,10 @@
 namespace vitadaw::commands {
 
 struct AddAudioTrack {
+    std::string name;
+};
+
+struct AddBus {
     std::string name;
 };
 
@@ -24,10 +29,15 @@ struct SetTrackPan { tracks::TrackId track; mixer::Pan pan; };
 struct SetTrackMute { tracks::TrackId track; bool muted{}; };
 struct SetTrackSolo { tracks::TrackId track; bool solo{}; };
 struct SetMasterGain { mixer::GainDb gain; };
+struct SetTrackOutputDestination {
+    tracks::TrackId track;
+    routing::TrackOutputDestination destination;
+};
 
-using Command = std::variant<AddAudioTrack, LoadAudioFile, Play, Stop,
+using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
                              SetTrackGain, SetTrackPan, SetTrackMute,
-                             SetTrackSolo, SetMasterGain>;
+                             SetTrackSolo, SetMasterGain,
+                             SetTrackOutputDestination>;
 
 enum class CommandStatus {
     accepted,

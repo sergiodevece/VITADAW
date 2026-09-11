@@ -19,7 +19,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.1.2";
+        return "0.2.0";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -45,13 +45,29 @@ public:
             static_cast<void>(commandDispatcher_->dispatch(
                 commands::AddAudioTrack{"Audio " + std::to_string(index)}));
         }
-        std::vector<tracks::TrackId> audioTracks;
-        audioTracks.reserve(dawApplication_->project().tracks().size());
-        for (const auto& track : dawApplication_->project().tracks()) {
-            audioTracks.push_back(track.id);
+        static_cast<void>(commandDispatcher_->dispatch(
+            commands::AddBus{"Bus A"}));
+        static_cast<void>(commandDispatcher_->dispatch(
+            commands::AddBus{"Bus B"}));
+        const auto& tracks = dawApplication_->project().tracks();
+        const auto& buses = dawApplication_->project().routing().buses();
+        if (tracks.size() >= 3 && buses.size() >= 2) {
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::SetTrackOutputDestination{
+                    tracks[0].id,
+                    routing::TrackOutputDestination::toBus(buses[0].id)}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::SetTrackOutputDestination{
+                    tracks[1].id,
+                    routing::TrackOutputDestination::toBus(buses[0].id)}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::SetTrackOutputDestination{
+                    tracks[2].id,
+                    routing::TrackOutputDestination::toBus(buses[1].id)}));
         }
         mainWindow_ = std::make_unique<MainWindow>(
-            audioDevice_->state(), *commandDispatcher_, std::move(audioTracks));
+            audioDevice_->state(), *commandDispatcher_,
+            dawApplication_->project());
         mainWindow_->setTransportState(dawApplication_->transport(),
                                        dawApplication_->project().sampleRate());
         mainWindow_->setMeterState(dawApplication_->meterSnapshot());

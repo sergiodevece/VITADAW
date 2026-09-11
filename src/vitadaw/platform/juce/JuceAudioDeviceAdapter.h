@@ -39,6 +39,11 @@ public:
     [[nodiscard]] bool commitPreparedWav(
         audio::PreparedAudioFilePtr prepared,
         audio::AudioFileCommitAction modelCommit) noexcept override;
+    [[nodiscard]] audio::StructuralPlanPreparationResult prepareProcessingPlan(
+        const audio::ProcessingPlanSpecification& specification) override;
+    [[nodiscard]] bool commitPreparedProcessingPlan(
+        audio::PreparedProcessingPlanChangePtr prepared,
+        audio::AudioFileCommitAction modelCommit) noexcept override;
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track,
         mixer::PreparedTrackMixState mix,
@@ -64,6 +69,7 @@ private:
     struct PreparedAudio;
     struct PreparedProject;
     struct PreparedJuceAudioFile;
+    struct PreparedJuceProcessingPlan;
 
     void closeDevice(bool publishClosedState) noexcept;
     void refreshState();
@@ -71,6 +77,13 @@ private:
     void detachAudioCallback() noexcept;
     void attachAudioCallback();
     void configureRealtimeEngine() noexcept;
+    [[nodiscard]] bool prepareProjectPlan(
+        PreparedProject& candidate,
+        const audio::ProcessingPlanSpecification& specification,
+        std::string& errorMessage);
+    [[nodiscard]] bool commitPreparedProject(
+        std::unique_ptr<PreparedProject>& candidate,
+        audio::AudioFileCommitAction modelCommit) noexcept;
     [[nodiscard]] std::size_t preparedBytes() const noexcept;
 
     juce::AudioDeviceManager deviceManager_;

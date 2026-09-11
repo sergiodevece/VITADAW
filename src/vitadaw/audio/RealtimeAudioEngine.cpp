@@ -10,21 +10,63 @@ namespace vitadaw::audio {
 
 void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     deviceUnavailable();
-    project_ = project;
-    trackMixCount_ = std::min(project_.tracks.size(), maximumTrackCount);
+    projectSampleRate_ = project.projectSampleRate;
+    projectDuration_ = project.duration;
+    trackMixCount_ = std::min(project.tracks.size(), maximumTrackCount);
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
-        trackMix_[index].reset(project_.tracks[index].mix.isValid()
-                                   ? project_.tracks[index].mix
+        legacyTracks_[index] = {project.tracks[index], masterDestinationIndex};
+        legacyOrder_[index] = {ProcessingStepKind::track, index};
+        trackMix_[index].reset(project.tracks[index].mix.isValid()
+                                   ? project.tracks[index].mix
                                    : mixer::PreparedTrackMixState{});
-        meterTrackIds_[index] = project_.tracks[index].id;
+        meterTrackIds_[index] = project.tracks[index].id;
     }
-    masterMix_.reset(project_.masterMix.isValid()
-                         ? project_.masterMix
+    legacyOrder_[trackMixCount_] = {ProcessingStepKind::master, 0};
+    tracks_ = {legacyTracks_.data(), trackMixCount_};
+    buses_ = {};
+    order_ = {legacyOrder_.data(), trackMixCount_ + 1};
+    runtime_ = nullptr;
+    blockCapacity_ = defaultProcessingBlockCapacity;
+    masterMix_.reset(project.masterMix.isValid()
+                         ? project.masterMix
                          : mixer::PreparedMasterMixState{});
-    anySolo_ = project_.anySolo;
+    anySolo_ = project.anySolo;
     parameterReadIndex_.store(0, std::memory_order_relaxed);
     parameterWriteIndex_.store(0, std::memory_order_relaxed);
-    clock_.prepare(project_.duration);
+    clock_.prepare(project.duration);
+    clearMeters();
+    publishMeters();
+    publishTransport();
+}
+
+void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
+                                    ProcessingPlanRuntime& runtime) noexcept {
+    deviceUnavailable();
+    projectSampleRate_ = plan.projectSampleRate;
+    projectDuration_ = plan.duration;
+    tracks_ = plan.tracks;
+    buses_ = plan.buses;
+    order_ = plan.order;
+    runtime_ = &runtime;
+    blockCapacity_ = plan.blockCapacity;
+    trackMixCount_ = std::min(tracks_.size(), maximumTrackCount);
+    for (std::size_t index = 0; index < trackMixCount_; ++index) {
+        trackMix_[index].reset(tracks_[index].source.mix.isValid()
+                                   ? tracks_[index].source.mix
+                                   : mixer::PreparedTrackMixState{});
+        meterTrackIds_[index] = tracks_[index].source.id;
+    }
+    for (std::size_t index = 0;
+         index < std::min(buses_.size(), maximumBusCount); ++index) {
+        meterBusIds_[index] = buses_[index].id;
+    }
+    masterMix_.reset(plan.masterMix.isValid()
+                         ? plan.masterMix
+                         : mixer::PreparedMasterMixState{});
+    anySolo_ = plan.anySolo;
+    parameterReadIndex_.store(0, std::memory_order_relaxed);
+    parameterWriteIndex_.store(0, std::memory_order_relaxed);
+    clock_.prepare(plan.duration);
     clearMeters();
     publishMeters();
     publishTransport();
@@ -83,10 +125,16 @@ bool RealtimeAudioEngine::tryUpdateTrackMix(
     tracks::TrackId track, mixer::PreparedTrackMixState mix,
     bool anySolo) noexcept {
     const auto exists = std::any_of(
-        project_.tracks.begin(), project_.tracks.begin() + trackMixCount_,
-        [track](const auto& candidate) { return candidate.id == track; });
-    return track.isValid() && exists && mix.isValid() &&
-           enqueueParameter(TrackMixCommand{track, mix, anySolo});
+        tracks_.begin(), tracks_.begin() + trackMixCount_,
+        [track](const auto& candidate) { return candidate.source.id == track; });
+    if (!track.isValid() || !exists || !mix.isValid()) {
+        return false;
+    }
+    const auto found = std::find_if(
+        tracks_.begin(), tracks_.begin() + trackMixCount_,
+        [track](const auto& candidate) { return candidate.source.id == track; });
+    return enqueueParameter(TrackMixCommand{
+        static_cast<std::size_t>(found - tracks_.begin()), mix, anySolo});
 }
 
 bool RealtimeAudioEngine::tryUpdateGlobalSolo(bool anySolo) noexcept {
@@ -124,7 +172,7 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
     consumeParameterCommands(deviceSampleRate);
     clearMeters();
     if (deviceState() != DeviceProcessingState::operational ||
-        !project_.projectSampleRate.isValid() ||
+        !projectSampleRate_.isValid() || blockCapacity_ == 0 ||
         !deviceSampleRate.isValid()) {
         publishMeters();
         publishTransport();
@@ -139,38 +187,14 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
     }
 
     const auto projectFramesPerDeviceFrame = timeline::projectFramesForDeviceFrames(
-        {1}, project_.projectSampleRate, deviceSampleRate);
-    for (std::size_t frame = 0; frame < output.frameCount; ++frame) {
+        {1}, projectSampleRate_, deviceSampleRate);
+    for (std::size_t offset = 0; offset < output.frameCount;
+         offset += blockCapacity_) {
+        const auto count = std::min(blockCapacity_, output.frameCount - offset);
+        processSubBlock(output, offset, count, projectFramesPerDeviceFrame);
         if (!clock_.isPlaying()) {
             break;
         }
-        StereoSample mixed;
-        for (std::size_t index = 0; index < trackMixCount_; ++index) {
-            const auto& track = project_.tracks[index];
-            const auto rendered = renderTrackAtProjectPosition(
-                track, clock_.position(), project_.projectSampleRate);
-            const auto currentMix = trackMix_[index].next();
-            const auto contribution = applyTrackMix(
-                rendered, track.channelCount, currentMix, anySolo_);
-            trackPeaks_[index].left = std::max(
-                trackPeaks_[index].left, std::abs(contribution.left));
-            trackPeaks_[index].right = std::max(
-                trackPeaks_[index].right, std::abs(contribution.right));
-            accumulateTrackContribution(
-                mixed, contribution);
-        }
-        applyMasterGain(mixed, masterMix_.next());
-        masterPeak_.left = std::max(masterPeak_.left, std::abs(mixed.left));
-        masterPeak_.right = std::max(masterPeak_.right, std::abs(mixed.right));
-        if (output.channels != nullptr && output.channelCount > 0 &&
-            output.channels[0] != nullptr) {
-            output.channels[0][frame] = mixed.left;
-        }
-        if (output.channels != nullptr && output.channelCount > 1 &&
-            output.channels[1] != nullptr) {
-            output.channels[1][frame] = mixed.right;
-        }
-        clock_.advance(projectFramesPerDeviceFrame);
     }
     publishMeters();
     publishTransport();
@@ -197,13 +221,10 @@ void RealtimeAudioEngine::consumeParameterCommands(
             [this, deviceSampleRate](const auto& value) noexcept {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, TrackMixCommand>) {
-                    for (std::size_t index = 0; index < trackMixCount_; ++index) {
-                        if (project_.tracks[index].id == value.track) {
-                            trackMix_[index].setTarget(value.mix,
-                                                       deviceSampleRate);
-                            anySolo_ = value.anySolo;
-                            break;
-                        }
+                    if (value.trackIndex < trackMixCount_) {
+                        trackMix_[value.trackIndex].setTarget(value.mix,
+                                                              deviceSampleRate);
+                        anySolo_ = value.anySolo;
                     }
                 } else if constexpr (std::is_same_v<T, MasterMixCommand>) {
                     masterMix_.setTarget(value.mix, deviceSampleRate);
@@ -221,12 +242,97 @@ void RealtimeAudioEngine::clearMeters() noexcept {
     std::fill(trackPeaks_.begin(), trackPeaks_.begin() + trackMixCount_,
               mixer::StereoPeak{});
     masterPeak_ = {};
+    std::fill(busPeaks_.begin(),
+              busPeaks_.begin() + std::min(buses_.size(), maximumBusCount),
+              mixer::StereoPeak{});
 }
 
 void RealtimeAudioEngine::publishMeters() noexcept {
     meterExchange_.publish(
         {meterTrackIds_.data(), trackMixCount_},
-        {trackPeaks_.data(), trackMixCount_}, masterPeak_);
+        {trackPeaks_.data(), trackMixCount_},
+        {meterBusIds_.data(), std::min(buses_.size(), maximumBusCount)},
+        {busPeaks_.data(), std::min(buses_.size(), maximumBusCount)},
+        masterPeak_);
+}
+
+void RealtimeAudioEngine::processSubBlock(
+    AudioBlockView output, std::size_t outputOffset, std::size_t frameCount,
+    timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept {
+    auto* masterLeft = runtime_ != nullptr ? runtime_->master.left.data()
+                                           : legacyMasterLeft_.data();
+    auto* masterRight = runtime_ != nullptr ? runtime_->master.right.data()
+                                            : legacyMasterRight_.data();
+    auto* positions = runtime_ != nullptr ? runtime_->projectPositions.data()
+                                          : legacyPositions_.data();
+    std::fill_n(masterLeft, frameCount, 0.0F);
+    std::fill_n(masterRight, frameCount, 0.0F);
+    if (runtime_ != nullptr) {
+        for (std::size_t index = 0; index < buses_.size(); ++index) {
+            std::fill_n(runtime_->buses[index].left.data(), frameCount, 0.0F);
+            std::fill_n(runtime_->buses[index].right.data(), frameCount, 0.0F);
+        }
+    }
+
+    std::size_t validFrames{};
+    while (validFrames < frameCount && clock_.isPlaying()) {
+        positions[validFrames] = clock_.position().value;
+        ++validFrames;
+        clock_.advance(projectFramesPerDeviceFrame);
+    }
+
+    for (const auto& step : order_) {
+        if (step.kind == ProcessingStepKind::track) {
+            const auto& route = tracks_[step.index];
+            for (std::size_t frame = 0; frame < validFrames; ++frame) {
+                const auto rendered = renderTrackAtProjectPosition(
+                    route.source, {positions[frame]}, projectSampleRate_);
+                const auto contribution = applyTrackMix(
+                    rendered, route.source.channelCount,
+                    trackMix_[step.index].next(), anySolo_);
+                trackPeaks_[step.index].left = std::max(
+                    trackPeaks_[step.index].left, std::abs(contribution.left));
+                trackPeaks_[step.index].right = std::max(
+                    trackPeaks_[step.index].right, std::abs(contribution.right));
+                if (route.destinationBusIndex == masterDestinationIndex) {
+                    masterLeft[frame] += contribution.left;
+                    masterRight[frame] += contribution.right;
+                } else {
+                    auto& destination = runtime_->buses[route.destinationBusIndex];
+                    destination.left[frame] += contribution.left;
+                    destination.right[frame] += contribution.right;
+                }
+            }
+        } else if (step.kind == ProcessingStepKind::bus) {
+            const auto bufferIndex = buses_[step.index].bufferIndex;
+            const auto& bus = runtime_->buses[bufferIndex];
+            for (std::size_t frame = 0; frame < validFrames; ++frame) {
+                busPeaks_[step.index].left = std::max(
+                    busPeaks_[step.index].left, std::abs(bus.left[frame]));
+                busPeaks_[step.index].right = std::max(
+                    busPeaks_[step.index].right, std::abs(bus.right[frame]));
+                masterLeft[frame] += bus.left[frame];
+                masterRight[frame] += bus.right[frame];
+            }
+        } else {
+            for (std::size_t frame = 0; frame < validFrames; ++frame) {
+                StereoSample mixed{masterLeft[frame], masterRight[frame]};
+                applyMasterGain(mixed, masterMix_.next());
+                masterPeak_.left = std::max(masterPeak_.left,
+                                            std::abs(mixed.left));
+                masterPeak_.right = std::max(masterPeak_.right,
+                                             std::abs(mixed.right));
+                if (output.channels != nullptr && output.channelCount > 0 &&
+                    output.channels[0] != nullptr) {
+                    output.channels[0][outputOffset + frame] = mixed.left;
+                }
+                if (output.channels != nullptr && output.channelCount > 1 &&
+                    output.channels[1] != nullptr) {
+                    output.channels[1][outputOffset + frame] = mixed.right;
+                }
+            }
+        }
+    }
 }
 
 void RealtimeAudioEngine::advanceSmoothers(std::size_t frameCount) noexcept {
@@ -303,9 +409,10 @@ void RealtimeAudioEngine::resolveCommandsThrough(
 }
 
 bool RealtimeAudioEngine::hasPreparedAudio() const noexcept {
-    return std::any_of(project_.tracks.begin(),
-                       project_.tracks.begin() + trackMixCount_,
-                       [](const auto& track) { return track.isAvailable(); });
+    return std::any_of(tracks_.begin(), tracks_.begin() + trackMixCount_,
+                       [](const auto& track) {
+                           return track.source.isAvailable();
+                       });
 }
 
 } // namespace vitadaw::audio
