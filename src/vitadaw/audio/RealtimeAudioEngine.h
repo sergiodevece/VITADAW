@@ -4,6 +4,8 @@
 #include "vitadaw/audio/IRealtimeAudioProcessor.h"
 #include "vitadaw/audio/DeviceProcessingState.h"
 #include "vitadaw/audio/PreparedProject.h"
+#include "vitadaw/audio/MixerSmoother.h"
+#include "vitadaw/audio/RealtimeMeterExchange.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
 #include "vitadaw/audio/RealtimeTransportExchange.h"
 
@@ -47,6 +49,7 @@ public:
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept;
     [[nodiscard]] RealtimeTransportSnapshot transportSnapshot() const noexcept;
+    [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
 
     void processBlock(AudioBlockView output,
                       timeline::SampleRate deviceSampleRate) noexcept;
@@ -76,9 +79,13 @@ private:
 
     [[nodiscard]] AudioControlRequestResult enqueue(CommandType type) noexcept;
     void consumeCommands() noexcept;
-    void consumeParameterCommands() noexcept;
+    void consumeParameterCommands(
+        timeline::SampleRate deviceSampleRate) noexcept;
     [[nodiscard]] bool enqueueParameter(ParameterCommand command) noexcept;
     void publishTransport() noexcept;
+    void publishMeters() noexcept;
+    void clearMeters() noexcept;
+    void advanceSmoothers(std::size_t frameCount) noexcept;
     void transitionAwayFromOperational(DeviceProcessingState state) noexcept;
     void resolveCommandsThrough(AudioCommandSequence sequence) noexcept;
     [[nodiscard]] bool hasPreparedAudio() const noexcept;
@@ -91,13 +98,17 @@ private:
     std::atomic<std::size_t> commandReadIndex_{};
     CommandLifecycleGate lifecycleGate_;
     std::atomic<AudioCommandSequence> lastResolvedCommandSequence_{};
-    std::array<mixer::PreparedTrackMixState, maximumTrackCount> trackMix_{};
+    std::array<TrackMixSmoother, maximumTrackCount> trackMix_{};
     std::size_t trackMixCount_{};
-    mixer::PreparedMasterMixState masterMix_;
+    MasterMixSmoother masterMix_;
     bool anySolo_{};
     std::array<ParameterCommand, parameterCommandCapacity> parameterCommands_{};
     std::atomic<std::size_t> parameterWriteIndex_{};
     std::atomic<std::size_t> parameterReadIndex_{};
+    std::array<tracks::TrackId, maximumTrackCount> meterTrackIds_{};
+    std::array<mixer::StereoPeak, maximumTrackCount> trackPeaks_{};
+    mixer::StereoPeak masterPeak_;
+    RealtimeMeterExchange meterExchange_;
 };
 
 } // namespace vitadaw::audio

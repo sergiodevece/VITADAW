@@ -25,6 +25,10 @@ public:
                 juce::NotificationType::dontSendNotification);
             controls->name.setColour(juce::Label::textColourId,
                                      juce::Colours::white);
+            controls->meter.setColour(juce::Label::textColourId,
+                                      juce::Colours::lightgreen);
+            controls->meter.setText("L 0.000  R 0.000",
+                                    juce::NotificationType::dontSendNotification);
             controls->gain.setRange(mixer::GainDb::silence,
                                     mixer::GainDb::maximum, 0.1);
             controls->gain.setValue(0.0,
@@ -60,6 +64,7 @@ public:
             addAndMakeVisible(controls->pan);
             addAndMakeVisible(controls->mute);
             addAndMakeVisible(controls->solo);
+            addAndMakeVisible(controls->meter);
             addAndMakeVisible(*button);
             trackControls_.push_back(std::move(controls));
             loadButtons_.push_back(std::move(button));
@@ -73,6 +78,11 @@ public:
                 mixer::GainDb{static_cast<float>(masterGain_.getValue())}});
         };
         addAndMakeVisible(masterGain_);
+        masterMeter_.setColour(juce::Label::textColourId,
+                               juce::Colours::lightgreen);
+        masterMeter_.setText("Master L 0.000  R 0.000",
+                             juce::NotificationType::dontSendNotification);
+        addAndMakeVisible(masterMeter_);
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
         addAndMakeVisible(playButton_);
@@ -116,6 +126,26 @@ public:
         statusLabel_.setText(text, juce::NotificationType::dontSendNotification);
     }
 
+    void setMeterState(const mixer::MeterSnapshot& meters) {
+        for (auto& controls : trackControls_) {
+            mixer::StereoPeak peak;
+            for (std::size_t index = 0; index < meters.trackCount; ++index) {
+                if (meters.tracks[index].track == controls->track) {
+                    peak = meters.tracks[index].peak;
+                    break;
+                }
+            }
+            controls->meter.setText(
+                "L " + juce::String(peak.left, 3) +
+                    "  R " + juce::String(peak.right, 3),
+                juce::NotificationType::dontSendNotification);
+        }
+        masterMeter_.setText(
+            "Master L " + juce::String(meters.master.left, 3) +
+                "  R " + juce::String(meters.master.right, 3),
+            juce::NotificationType::dontSendNotification);
+    }
+
     void paint(juce::Graphics& graphics) override {
         graphics.fillAll(juce::Colours::darkgrey);
     }
@@ -136,9 +166,12 @@ public:
             controls.pan.setBounds(row.removeFromLeft(150));
             controls.mute.setBounds(row.removeFromLeft(64));
             controls.solo.setBounds(row.removeFromLeft(64));
+            controls.meter.setBounds(row);
         }
         bounds.removeFromTop(8);
-        masterGain_.setBounds(bounds.removeFromTop(36).removeFromLeft(240));
+        auto masterRow = bounds.removeFromTop(36);
+        masterGain_.setBounds(masterRow.removeFromLeft(240));
+        masterMeter_.setBounds(masterRow.removeFromLeft(260));
         bounds.removeFromTop(8);
         auto transportButtons = bounds.removeFromTop(32);
         playButton_.setBounds(transportButtons.removeFromLeft(80));
@@ -158,6 +191,7 @@ private:
                          juce::Slider::TextBoxRight};
         juce::ToggleButton mute{"Mute"};
         juce::ToggleButton solo{"Solo"};
+        juce::Label meter;
     };
 
     void chooseWav(tracks::TrackId track) {
@@ -197,6 +231,7 @@ private:
     std::vector<std::unique_ptr<TrackControls>> trackControls_;
     juce::Slider masterGain_{juce::Slider::LinearHorizontal,
                              juce::Slider::TextBoxRight};
+    juce::Label masterMeter_;
     juce::TextButton playButton_{"Play"};
     juce::TextButton stopButton_{"Stop"};
     std::unique_ptr<juce::FileChooser> fileChooser_;
@@ -229,6 +264,10 @@ void MainWindow::setAudioDeviceState(const audio::AudioDeviceState& state) {
 void MainWindow::setTransportState(const transport::TransportState& state,
                                    timeline::SampleRate projectSampleRate) {
     content_->setTransportState(state, projectSampleRate);
+}
+
+void MainWindow::setMeterState(const mixer::MeterSnapshot& meters) {
+    content_->setMeterState(meters);
 }
 
 } // namespace vitadaw::platform::juce_adapter

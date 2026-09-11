@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.1.1 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.1.2 LANGUAGES C CXX)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -108,6 +108,12 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_mixer_core_tests tests/MixerCoreTests.cpp)
     target_link_libraries(vitadaw_mixer_core_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_mixer_core_tests COMMAND vitadaw_mixer_core_tests)
+
+    add_executable(vitadaw_smoothing_metering_tests
+        tests/SmoothingMeteringTests.cpp)
+    target_link_libraries(vitadaw_smoothing_metering_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_smoothing_metering_tests
+        COMMAND vitadaw_smoothing_metering_tests)
 
     add_executable(vitadaw_realtime_audio_engine_tests tests/RealtimeAudioEngineTests.cpp)
     target_link_libraries(vitadaw_realtime_audio_engine_tests PRIVATE vitadaw_core)

@@ -17,6 +17,7 @@ public:
 
     [[nodiscard]] const project::ProjectState& project() const noexcept;
     [[nodiscard]] const transport::TransportState& transport() const noexcept;
+    [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
 
 private:
     audio::IAudioEngineControl& audioEngine_;

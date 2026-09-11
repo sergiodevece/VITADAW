@@ -2,6 +2,7 @@
 
 #include "vitadaw/audio/AudioDeviceState.h"
 #include "vitadaw/commands/CommandDispatcher.h"
+#include "vitadaw/mixer/Metering.h"
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/transport/TransportState.h"
 
@@ -22,6 +23,7 @@ public:
     void setAudioDeviceState(const audio::AudioDeviceState& state);
     void setTransportState(const transport::TransportState& state,
                            timeline::SampleRate projectSampleRate);
+    void setMeterState(const mixer::MeterSnapshot& meters);
 
 private:
     AudioStatusComponent* content_{};

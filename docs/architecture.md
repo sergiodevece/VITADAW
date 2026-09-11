@@ -260,8 +260,10 @@ master project clock
     -> track linear gain
     -> mono equal-power pan / stereo equal-power balance
     -> mute and global solo eligibility
+    -> track peak meter
     -> StereoAccumulator
     -> master linear gain
+    -> master peak meter
     -> stereo output
 ```
 
@@ -297,11 +299,50 @@ en solo silencia correctamente las pistas cargadas que no estén en solo, sin
 crear un recurso RT ficticio.
 
 La suma interna usa `float` y puede superar `[-1, 1]`. No se aplica clamp ni
-limitador; el recorte depende del backend/hardware final. No hay smoothing en
-este incremento: cambios abruptos de gain o pan son coherentes al límite de
-bloque, pero pueden causar discontinuidades audibles. Smoothing, buses, sends,
-inserts, plugins, automatización, grabación y routing configurable quedan fuera
-de 0.1.1.
+limitador; el recorte depende del backend/hardware final.
+
+## Smooth Mixer y metering 0.1.2
+
+`TrackMixSmoother` contiene cinco rampas lineales preasignadas: gain lineal y
+los cuatro coeficientes de pan preparados para mono y estéreo. `MasterMixSmoother`
+contiene la rampa de gain master. Cada nuevo target calcula `round(0.005 ×
+device sample rate)` pasos y cada frame procesado avanza exactamente uno. Con
+ello la transición dura 5 ms tanto con bloques de 64 como de 1024 frames y se
+adapta a 44,1, 48 o 96 kHz. Si el transporte está parado pero el callback sigue
+operativo, las rampas continúan avanzando sobre el tiempo de dispositivo aunque
+la salida permanezca en silencio.
+
+Gain se suaviza en amplitud lineal, no en dB. Esto evita conversiones por muestra,
+alcanza cero de forma exacta y genera una trayectoria lineal de amplitud, no una
+velocidad perceptual constante. Pan suaviza los coeficientes seno/coseno
+precalculados fuera de RT: no hay trigonometría por muestra. Los extremos y el
+target estable cumplen exactamente la ley equal-power; durante la rampa la
+interpolación continua de coeficientes puede apartarse ligeramente de potencia
+constante. Un target nuevo conserva el valor instantáneo de cada rampa como
+origen y recalcula solo su incremento y pasos restantes, sin volver a un valor
+anterior. Mute y solo se aplican discretamente al límite de bloque.
+
+El punto de medición por pista es la contribución que sale de
+`TrackMixerProcessing`, después de gain, pan y elegibilidad mute/solo, justo
+antes de `StereoAccumulator`. El master se mide después de la suma y del gain
+master, justo antes de copiar a output. La semántica 0.1.2 es peak absoluto
+instantáneo por bloque, separado por canal y sin clamp. Una pista no audible por
+mute/solo publica cero. No se calculan RMS, decay ni peak hold.
+
+`RealtimeMeterExchange` asocia cada medición con `TrackId` y usa únicamente
+`atomic<uint32_t>`, `atomic<uint64_t>` y `atomic<size_t>` garantizados lock-free.
+Los floats se publican como sus bits de 32 bits. Un único escritor RT rodea cada
+snapshot con una revisión impar/par y todas las operaciones usan el orden total
+`seq_cst`; el lector acepta solo revisiones iguales y pares. Hace un máximo de
+tres intentos y, si coincide continuamente con el escritor, devuelve un snapshot
+vacío coherente. Metering es telemetría latest-value: perder una lectura o un
+bloque no modifica audio ni comandos. La UI consulta mediante `DawApplication`,
+nunca directamente al motor, y actualiza labels numéricos a 30 Hz.
+
+El callback limpia acumuladores preasignados, consume parámetros, avanza
+rampas, calcula máximos absolutos y publica atomics. No reserva, bloquea, crea ni
+destruye recursos. Buses, sends, inserts, plugins, automatización, RMS, decay,
+grabación y routing configurable quedan fuera de 0.1.2.
 
 Una carga válida se construye y decodifica por completo antes de desconectar
 brevemente el callback. `DawApplication` prepara antes el `AudioClip`, su
@@ -352,7 +393,7 @@ publicados y el candidato, limitando también el pico durante una sustitución.
   arquitectura hasta decenas de pistas, pero no constituye una garantía de
   rendimiento profesional.
 
-## Evolución hasta 0.1.1
+## Evolución hasta 0.1.2
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -378,6 +419,8 @@ publicados y el candidato, limitando también el pico durante una sustitución.
     acumulación desde un único reloj.
 11. **Completado en 0.1.1:** sustituir la atenuación provisional por el Mixer
     Core portable y una vía ligera, acotada y RT-safe de parámetros.
+12. **Completado en 0.1.2:** añadir smoothing temporalmente estable y peak
+    metering portable con intercambio RT hacia aplicación.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

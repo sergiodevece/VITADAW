@@ -1,10 +1,10 @@
-# VitaDAW 0.1.1 — Mixer Core
+# VitaDAW 0.1.2 — Smooth Mixer & Metering
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
 el dispositivo de audio y carga y reproduce una colección variable de pistas WAV
-sincronizadas. El incremento 0.1.1 incorpora el primer mixer portable: gain,
-pan, mute y solo por pista, gain master y procesamiento estéreo final.
+sincronizadas. El incremento 0.1.2 añade smoothing sample-accurate y peak
+metering portable por pista y master al Mixer Core.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -113,11 +113,26 @@ No existe ya atenuación fija por pista, clamp ni limiter: `float` puede superar
 
 Los valores dB y coeficientes trigonométricos de pan se convierten fuera del
 callback. Un ring SPSC acotado de 64 entradas (63 pendientes utilizables)
-publica estados DSP completos y el
-motor los aplica al inicio de bloque sobre almacenamiento preasignado. El estado
-global de solo incluye también pistas vacías. Una cola
-llena rechaza el comando explícitamente y el modelo no cambia. No hay smoothing
-en 0.1.1, por lo que cambios abruptos pueden producir zipper noise.
+publica estados DSP completos y el motor los aplica al inicio de bloque sobre
+almacenamiento preasignado. El estado global de solo incluye también pistas
+vacías. Una cola llena rechaza el comando explícitamente y el modelo no cambia.
+
+Gain y coeficientes de pan por pista, y gain master, usan rampas lineales de
+5 ms avanzadas por frame de dispositivo. Su duración no depende del tamaño del
+bloque y un nuevo target parte del valor instantáneo. Mute y solo continúan
+siendo discretos. El smoothing de gain ocurre en amplitud lineal: es económico,
+alcanza silencio exactamente y no representa una velocidad perceptual constante
+en dB. El paneo interpola los coeficientes equal-power ya preparados, evitando
+trigonometría por muestra; los endpoints cumplen exactamente la pan law, aunque
+el trayecto transitorio no conserva potencia exacta.
+
+El motor calcula peak absoluto por bloque para cada pista después de gain, pan y
+mute/solo, y para master después del gain master. No hace clamp, por lo que el
+meter puede indicar valores superiores a 1. Los snapshots RT se publican en
+atomics lock-free y la UI realiza lecturas acotadas sin bloquear el audio. Son
+telemetría latest-value: no se conserva cada bloque y una lectura concurrente
+fallida devuelve un snapshot vacío coherente. RMS, decay y peak hold quedan para
+una versión futura.
 
 La ventana muestra también, de forma provisional, el estado, posición, duración
 y sample rate lógico del proyecto. Al llegar al final natural, el transporte
@@ -166,6 +181,8 @@ La arquitectura y las reglas de tiempo real se describen en
   proyecto preparado RT, render por pista y acumulación general.
 - **0.1.1 — Mixer Core:** gain, pan equal-power, mute/solo global y gain master
   con actualizaciones ligeras de parámetros hacia RT.
+- **0.1.2 — Smooth Mixer & Metering:** rampas sample-accurate de gain/pan y
+  peak metering portable por pista y master.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -175,4 +192,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.0.8.md`](docs/validation-0.0.8.md) y
 [`docs/validation-0.0.9.md`](docs/validation-0.0.9.md) y
 [`docs/validation-0.1.0.md`](docs/validation-0.1.0.md) y
-[`docs/validation-0.1.1.md`](docs/validation-0.1.1.md).
+[`docs/validation-0.1.1.md`](docs/validation-0.1.1.md) y
+[`docs/validation-0.1.2.md`](docs/validation-0.1.2.md).

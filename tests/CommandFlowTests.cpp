@@ -148,6 +148,10 @@ public:
         return snapshot;
     }
 
+    vitadaw::mixer::MeterSnapshot meterSnapshot() const noexcept override {
+        return {};
+    }
+
     void publishProgress(std::int64_t frame, bool playing) noexcept {
         snapshot.position = {frame};
         snapshot.playing = playing;

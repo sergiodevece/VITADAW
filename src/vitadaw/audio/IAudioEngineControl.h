@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/audio/RealtimeTransportExchange.h"
+#include "vitadaw/mixer/Metering.h"
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/tracks/AudioTrack.h"
 
@@ -77,6 +78,7 @@ public:
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestStop() noexcept = 0;
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;
+    [[nodiscard]] virtual mixer::MeterSnapshot meterSnapshot() const noexcept = 0;
 };
 
 } // namespace vitadaw::audio

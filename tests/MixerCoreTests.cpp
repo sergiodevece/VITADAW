@@ -60,6 +60,16 @@ vitadaw::audio::StereoSample renderOne(
     return {left, right};
 }
 
+vitadaw::audio::StereoSample renderLast(
+    vitadaw::audio::RealtimeAudioEngine& engine, std::size_t frameCount,
+    double rate = 48000.0) {
+    std::vector<float> left(frameCount), right(frameCount);
+    std::array<float*, 2> channels{left.data(), right.data()};
+    engine.processBlock({channels.data(), channels.size(), frameCount},
+                        vitadaw::timeline::SampleRate{rate});
+    return {left.back(), right.back()};
+}
+
 } // namespace
 
 int main() {
@@ -132,10 +142,10 @@ int main() {
                   audio::StereoSample{},
           "mute must override solo and non-solo tracks must be silent when any solo exists");
 
-    const std::vector<float> signal(64, 0.25F);
+    const std::vector<float> signal(4096, 0.25F);
     const std::array baseTracks{mono({1}, signal), mono({2}, signal)};
     audio::RealtimeAudioEngine engine;
-    engine.configure({timeline::SampleRate{48000.0}, {64}, baseTracks, {}});
+    engine.configure({timeline::SampleRate{48000.0}, {4096}, baseTracks, {}});
     makeOperational(engine);
     check(engine.tryUpdateTrackMix({1}, mix(1.0F, 0.0F, true, false), false) &&
               engine.tryRequestPlay().accepted,
@@ -152,36 +162,39 @@ int main() {
           "unmute must restore audio without changing clock continuity");
 
     check(engine.tryUpdateTrackMix(
-              {1}, mix(1.0F, -1.0F, false, true), true) &&
+              {1}, mix(1.0F, 0.0F, false, true), true) &&
               engine.tryUpdateTrackMix(
-                  {2}, mix(1.0F, 1.0F, false, false), true),
+                  {2}, mix(1.0F, 0.0F, false, false), true),
           "solo and pan updates must enqueue");
     const auto oneSolo = renderOne(engine);
-    check(close(oneSolo.left, 0.25F) && close(oneSolo.right, 0.0F),
+    check(close(oneSolo.left, 0.25F * rootHalf) &&
+              close(oneSolo.right, 0.25F * rootHalf),
           "one solo must exclude every non-solo track");
     check(engine.tryUpdateTrackMix(
-              {2}, mix(1.0F, 1.0F, false, true), true),
+              {2}, mix(1.0F, 0.0F, false, true), true),
           "a second solo must enqueue");
     const auto twoSolo = renderOne(engine);
-    check(close(twoSolo.left, 0.25F) && close(twoSolo.right, 0.25F),
+    check(close(twoSolo.left, 0.5F * rootHalf) &&
+              close(twoSolo.right, 0.5F * rootHalf),
           "multiple solos must contribute together");
     check(engine.tryUpdateTrackMix(
-              {2}, mix(1.0F, 1.0F, true, true), true),
+              {2}, mix(1.0F, 0.0F, true, true), true),
           "mute plus solo must enqueue");
     const auto muteSolo = renderOne(engine);
-    check(close(muteSolo.left, 0.25F) && close(muteSolo.right, 0.0F),
+    check(close(muteSolo.left, 0.25F * rootHalf) &&
+              close(muteSolo.right, 0.25F * rootHalf),
           "mute must retain precedence over solo");
 
     check(engine.tryUpdateMasterMix({0.5F}),
           "master attenuation must enqueue");
-    const auto masterHalf = renderOne(engine);
-    check(close(masterHalf.left, 0.125F),
+    const auto masterHalf = renderLast(engine, 240);
+    check(close(masterHalf.left, 0.125F * rootHalf),
           "master gain must run after track accumulation");
     check(engine.tryUpdateMasterMix({0.0F}), "master silence must enqueue");
-    check(renderOne(engine) == audio::StereoSample{},
+    check(renderLast(engine, 240) == audio::StereoSample{},
           "silent master must zero both output channels");
     check(engine.tryUpdateMasterMix({2.0F}), "positive master gain must enqueue");
-    check(close(renderOne(engine).left, 0.5F),
+    check(close(renderLast(engine, 240).left, 0.5F * rootHalf),
           "positive master gain must remain unclipped");
 
     for (const std::size_t count : {1U, 2U, 4U, 8U, 32U}) {

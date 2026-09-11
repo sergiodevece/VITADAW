@@ -49,6 +49,7 @@ public:
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestStop() noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
+    [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
 
 private:
     void audioDeviceIOCallbackWithContext(

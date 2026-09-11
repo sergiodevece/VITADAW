@@ -324,6 +324,9 @@ audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestStop() noexce
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
     return realtimeEngine_.transportSnapshot();
 }
+mixer::MeterSnapshot JuceAudioDeviceAdapter::meterSnapshot() const noexcept {
+    return realtimeEngine_.meterSnapshot();
+}
 
 void JuceAudioDeviceAdapter::audioDeviceIOCallbackWithContext(
     const float* const*, int, float* const* output, int channels, int frames,

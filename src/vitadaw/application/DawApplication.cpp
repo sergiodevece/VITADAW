@@ -208,4 +208,8 @@ const transport::TransportState& DawApplication::transport() const noexcept {
     return transport_;
 }
 
+mixer::MeterSnapshot DawApplication::meterSnapshot() const noexcept {
+    return audioEngine_.meterSnapshot();
+}
+
 } // namespace vitadaw::application

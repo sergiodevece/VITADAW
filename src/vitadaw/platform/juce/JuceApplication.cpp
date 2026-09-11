@@ -19,7 +19,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.1.1";
+        return "0.1.2";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -54,6 +54,7 @@ public:
             audioDevice_->state(), *commandDispatcher_, std::move(audioTracks));
         mainWindow_->setTransportState(dawApplication_->transport(),
                                        dawApplication_->project().sampleRate());
+        mainWindow_->setMeterState(dawApplication_->meterSnapshot());
         audioDevice_->setStateChangedCallback(
             [this](const audio::AudioDeviceState& state) {
                 if (mainWindow_ != nullptr) {
@@ -94,6 +95,7 @@ private:
         dawApplication_->synchroniseTransport();
         mainWindow_->setTransportState(dawApplication_->transport(),
                                        dawApplication_->project().sampleRate());
+        mainWindow_->setMeterState(dawApplication_->meterSnapshot());
     }
 
     std::unique_ptr<JuceAudioDeviceAdapter> audioDevice_;
