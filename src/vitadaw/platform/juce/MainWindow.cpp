@@ -18,13 +18,61 @@ public:
         addAndMakeVisible(transportLabel_);
 
         for (std::size_t index = 0; index < audioTracks.size(); ++index) {
+            auto controls = std::make_unique<TrackControls>();
+            controls->track = audioTracks[index];
+            controls->name.setText(
+                "Track " + juce::String(static_cast<int>(index + 1)),
+                juce::NotificationType::dontSendNotification);
+            controls->name.setColour(juce::Label::textColourId,
+                                     juce::Colours::white);
+            controls->gain.setRange(mixer::GainDb::silence,
+                                    mixer::GainDb::maximum, 0.1);
+            controls->gain.setValue(0.0,
+                                    juce::NotificationType::dontSendNotification);
+            controls->gain.setTextValueSuffix(" dB");
+            controls->pan.setRange(mixer::Pan::left, mixer::Pan::right, 0.01);
+            controls->pan.setValue(0.0,
+                                   juce::NotificationType::dontSendNotification);
+            controls->gain.onValueChange = [this, raw = controls.get()] {
+                dispatch(commands::SetTrackGain{
+                    raw->track,
+                    mixer::GainDb{static_cast<float>(raw->gain.getValue())}});
+            };
+            controls->pan.onValueChange = [this, raw = controls.get()] {
+                dispatch(commands::SetTrackPan{
+                    raw->track,
+                    mixer::Pan{static_cast<float>(raw->pan.getValue())}});
+            };
+            controls->mute.onClick = [this, raw = controls.get()] {
+                dispatch(commands::SetTrackMute{raw->track,
+                                                raw->mute.getToggleState()});
+            };
+            controls->solo.onClick = [this, raw = controls.get()] {
+                dispatch(commands::SetTrackSolo{raw->track,
+                                                raw->solo.getToggleState()});
+            };
             auto button = std::make_unique<juce::TextButton>(
                 "Load Audio " + juce::String(static_cast<int>(index + 1)));
             const auto track = audioTracks[index];
             button->onClick = [this, track] { chooseWav(track); };
+            addAndMakeVisible(controls->name);
+            addAndMakeVisible(controls->gain);
+            addAndMakeVisible(controls->pan);
+            addAndMakeVisible(controls->mute);
+            addAndMakeVisible(controls->solo);
             addAndMakeVisible(*button);
+            trackControls_.push_back(std::move(controls));
             loadButtons_.push_back(std::move(button));
         }
+        masterGain_.setRange(mixer::GainDb::silence,
+                             mixer::GainDb::maximum, 0.1);
+        masterGain_.setValue(0.0, juce::NotificationType::dontSendNotification);
+        masterGain_.setTextValueSuffix(" dB master");
+        masterGain_.onValueChange = [this] {
+            dispatch(commands::SetMasterGain{
+                mixer::GainDb{static_cast<float>(masterGain_.getValue())}});
+        };
+        addAndMakeVisible(masterGain_);
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
         addAndMakeVisible(playButton_);
@@ -78,11 +126,19 @@ public:
         bounds.removeFromTop(12);
         transportLabel_.setBounds(bounds.removeFromTop(32));
         bounds.removeFromTop(12);
-        auto loadButtons = bounds.removeFromTop(32);
-        for (auto& button : loadButtons_) {
-            button->setBounds(loadButtons.removeFromLeft(136));
-            loadButtons.removeFromLeft(8);
+        for (std::size_t index = 0; index < loadButtons_.size(); ++index) {
+            auto row = bounds.removeFromTop(42);
+            auto& controls = *trackControls_[index];
+            controls.name.setBounds(row.removeFromLeft(64));
+            loadButtons_[index]->setBounds(row.removeFromLeft(112));
+            row.removeFromLeft(8);
+            controls.gain.setBounds(row.removeFromLeft(180));
+            controls.pan.setBounds(row.removeFromLeft(150));
+            controls.mute.setBounds(row.removeFromLeft(64));
+            controls.solo.setBounds(row.removeFromLeft(64));
         }
+        bounds.removeFromTop(8);
+        masterGain_.setBounds(bounds.removeFromTop(36).removeFromLeft(240));
         bounds.removeFromTop(8);
         auto transportButtons = bounds.removeFromTop(32);
         playButton_.setBounds(transportButtons.removeFromLeft(80));
@@ -93,6 +149,17 @@ public:
     }
 
 private:
+    struct TrackControls {
+        tracks::TrackId track;
+        juce::Label name;
+        juce::Slider gain{juce::Slider::LinearHorizontal,
+                          juce::Slider::TextBoxRight};
+        juce::Slider pan{juce::Slider::LinearHorizontal,
+                         juce::Slider::TextBoxRight};
+        juce::ToggleButton mute{"Mute"};
+        juce::ToggleButton solo{"Solo"};
+    };
+
     void chooseWav(tracks::TrackId track) {
         fileChooser_ = std::make_unique<juce::FileChooser>(
             "Select a WAV file", juce::File{}, "*.wav");
@@ -127,6 +194,9 @@ private:
     juce::Label transportLabel_;
     juce::Label resultLabel_;
     std::vector<std::unique_ptr<juce::TextButton>> loadButtons_;
+    std::vector<std::unique_ptr<TrackControls>> trackControls_;
+    juce::Slider masterGain_{juce::Slider::LinearHorizontal,
+                             juce::Slider::TextBoxRight};
     juce::TextButton playButton_{"Play"};
     juce::TextButton stopButton_{"Stop"};
     std::unique_ptr<juce::FileChooser> fileChooser_;
@@ -143,7 +213,7 @@ MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
                                         std::move(audioTracks));
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
-    centreWithSize(800, 500);
+    centreWithSize(900, 620);
     setResizable(true, false);
     setVisible(true);
 }

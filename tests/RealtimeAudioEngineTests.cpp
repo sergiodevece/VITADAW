@@ -68,7 +68,7 @@ void testShortResource(std::size_t sourceFrames, double sourceRate,
     render(engine, left, right, projectRate);
     for (std::size_t frame = 0; frame < outputFrames; ++frame) {
         const auto expected = frame < static_cast<std::size_t>(duration.value)
-                                  ? 0.125F
+                                  ? 0.70710678F
                                   : 0.0F;
         check(std::abs(left[frame] - expected) < 1.0e-6F,
               "short resource should render only through its exclusive end");
@@ -102,7 +102,9 @@ int main() {
     check(engine.tryRequestPlay().accepted, "one prepared track should play");
     std::vector<float> left(5, -1.0F), right(5, -1.0F);
     render(engine, left, right, 3.0);
-    check(left[0] == 0.125F && left[1] == 0.125F && left[2] == 0.125F &&
+    check(std::abs(left[0] - 0.70710678F) < 1.0e-6F &&
+              std::abs(left[1] - 0.70710678F) < 1.0e-6F &&
+              std::abs(left[2] - 0.70710678F) < 1.0e-6F &&
               left[3] == 0.0F && left[4] == 0.0F,
           "natural end inside a block should leave the remaining output silent");
     auto ended = engine.transportSnapshot();
@@ -113,11 +115,13 @@ int main() {
           "Play after natural end should be accepted");
     std::vector<float> variableA(1), variableB(1);
     render(engine, variableA, variableB, 4.0);
-    check(variableA[0] == 0.125F && engine.transportSnapshot().position.value == 1,
+    check(std::abs(variableA[0] - 0.70710678F) < 1.0e-6F &&
+              engine.transportSnapshot().position.value == 1,
           "first variable block should render from zero");
     std::vector<float> variableC(2), variableD(2);
     render(engine, variableC, variableD, 4.0);
-    check(variableC[0] == 0.125F && variableC[1] == 0.125F &&
+    check(std::abs(variableC[0] - 0.70710678F) < 1.0e-6F &&
+              std::abs(variableC[1] - 0.70710678F) < 1.0e-6F &&
               engine.transportSnapshot().position.value == 3,
           "variable block sizes should share one continuous clock");
     check(engine.tryRequestStop().accepted, "Stop should enqueue");
@@ -134,8 +138,8 @@ int main() {
     check(engine.tryRequestPlay().accepted, "two tracks should play");
     std::vector<float> mixedLeft(4), mixedRight(4);
     render(engine, mixedLeft, mixedRight, 4.0);
-    check(std::abs(mixedLeft[0] - 0.1875F) < 1.0e-6F &&
-              std::abs(mixedLeft[3] - 0.1875F) < 1.0e-6F,
+    check(std::abs(mixedLeft[0] - 1.06066017F) < 1.0e-6F &&
+              std::abs(mixedLeft[3] - 1.06066017F) < 1.0e-6F,
           "same production processBlock should mix two rates offline");
 
     const std::vector<float> longSignal(100, 0.2F);
@@ -239,7 +243,7 @@ int main() {
     check(engine.tryRequestPlay().accepted, "replacement resource should play");
     std::vector<float> replacementOut(1), replacementRight(1);
     render(engine, replacementOut, replacementRight, 4.0);
-    check(std::abs(replacementOut[0] - 0.025F) < 1.0e-6F,
+    check(std::abs(replacementOut[0] - 0.14142136F) < 1.0e-6F,
           "repeated quiescent resource replacement should publish the new view");
 
     // Producer/lifecycle race: either Play is rejected during the transition,

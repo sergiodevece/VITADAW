@@ -11,6 +11,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
+#include <variant>
 
 namespace vitadaw::audio {
 
@@ -22,6 +24,8 @@ namespace vitadaw::audio {
 class RealtimeAudioEngine final {
 public:
     static constexpr std::size_t commandCapacity = 8;
+    static constexpr std::size_t parameterCommandCapacity = 64;
+    static constexpr std::size_t maximumTrackCount = 256;
 
     void configure(PreparedProjectView project) noexcept;
     // Lifecycle transitions may race with the application command producer.
@@ -36,6 +40,12 @@ public:
 
     [[nodiscard]] AudioControlRequestResult tryRequestPlay() noexcept;
     [[nodiscard]] AudioControlRequestResult tryRequestStop() noexcept;
+    [[nodiscard]] bool tryUpdateTrackMix(
+        tracks::TrackId track, mixer::PreparedTrackMixState mix,
+        bool anySolo) noexcept;
+    [[nodiscard]] bool tryUpdateGlobalSolo(bool anySolo) noexcept;
+    [[nodiscard]] bool tryUpdateMasterMix(
+        mixer::PreparedMasterMixState mix) noexcept;
     [[nodiscard]] RealtimeTransportSnapshot transportSnapshot() const noexcept;
 
     void processBlock(AudioBlockView output,
@@ -51,9 +61,23 @@ private:
         AudioCommandSequence sequence{};
         std::uint64_t generation{};
     };
+    struct TrackMixCommand {
+        tracks::TrackId track;
+        mixer::PreparedTrackMixState mix;
+        bool anySolo{};
+    };
+    struct MasterMixCommand {
+        mixer::PreparedMasterMixState mix;
+    };
+    struct GlobalSoloCommand { bool anySolo{}; };
+    using ParameterCommand = std::variant<TrackMixCommand, MasterMixCommand,
+                                          GlobalSoloCommand>;
+    static_assert(std::is_trivially_copyable_v<ParameterCommand>);
 
     [[nodiscard]] AudioControlRequestResult enqueue(CommandType type) noexcept;
     void consumeCommands() noexcept;
+    void consumeParameterCommands() noexcept;
+    [[nodiscard]] bool enqueueParameter(ParameterCommand command) noexcept;
     void publishTransport() noexcept;
     void transitionAwayFromOperational(DeviceProcessingState state) noexcept;
     void resolveCommandsThrough(AudioCommandSequence sequence) noexcept;
@@ -67,6 +91,13 @@ private:
     std::atomic<std::size_t> commandReadIndex_{};
     CommandLifecycleGate lifecycleGate_;
     std::atomic<AudioCommandSequence> lastResolvedCommandSequence_{};
+    std::array<mixer::PreparedTrackMixState, maximumTrackCount> trackMix_{};
+    std::size_t trackMixCount_{};
+    mixer::PreparedMasterMixState masterMix_;
+    bool anySolo_{};
+    std::array<ParameterCommand, parameterCommandCapacity> parameterCommands_{};
+    std::atomic<std::size_t> parameterWriteIndex_{};
+    std::atomic<std::size_t> parameterReadIndex_{};
 };
 
 } // namespace vitadaw::audio

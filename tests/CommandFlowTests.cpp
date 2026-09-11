@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -45,7 +46,8 @@ public:
     vitadaw::audio::AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file,
         vitadaw::tracks::TrackId track,
-        vitadaw::timeline::SampleRate projectSampleRate) override {
+        vitadaw::timeline::SampleRate projectSampleRate,
+        vitadaw::mixer::PreparedTrackMixState trackMix) override {
         ++loadRequests;
         if (throwNextPreparation) {
             throwNextPreparation = false;
@@ -59,6 +61,26 @@ public:
         return {std::make_unique<PreparedFile>(metadata, file, track,
                                                projectSampleRate,
                                                resourceCounters), {}};
+    }
+
+    bool tryUpdateTrackMix(
+        vitadaw::tracks::TrackId track,
+        vitadaw::mixer::PreparedTrackMixState mix,
+        bool anySolo) noexcept override {
+        ++trackMixRequests;
+        return acceptMixerRequests && loaded(track) != nullptr && mix.isValid();
+    }
+
+    bool tryUpdateGlobalSolo(bool anySolo) noexcept override {
+        ++globalSoloRequests;
+        lastGlobalSolo = anySolo;
+        return acceptMixerRequests;
+    }
+
+    bool tryUpdateMasterMix(
+        vitadaw::mixer::PreparedMasterMixState mix) noexcept override {
+        ++masterMixRequests;
+        return acceptMixerRequests && mix.isValid();
     }
 
     bool commitPreparedWav(
@@ -148,6 +170,11 @@ public:
     bool acceptRequests{true};
     bool rejectNextLoad{};
     bool throwNextPreparation{};
+    bool acceptMixerRequests{true};
+    int trackMixRequests{};
+    int masterMixRequests{};
+    int globalSoloRequests{};
+    bool lastGlobalSolo{};
     ResourceCounters resourceCounters;
 
 private:
@@ -204,6 +231,20 @@ int main() {
     const tracks::TrackId third{3};
     const tracks::TrackId fourth{4};
 
+    check(dispatcher.dispatch(commands::SetTrackGain{
+              emptyBetween, mixer::GainDb{-6.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().findTrack(emptyBetween)->mix.gain ==
+                  mixer::GainDb{-6.0F} &&
+              audio.trackMixRequests == 0 && audio.globalSoloRequests == 1,
+          "an empty track should retain mixer state without an RT resource");
+    check(dispatcher.dispatch(commands::SetTrackPan{
+              emptyBetween,
+              mixer::Pan{std::numeric_limits<float>::quiet_NaN()}}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findTrack(emptyBetween)->mix.pan == mixer::Pan{},
+          "invalid portable mixer values must not mutate project state");
+
     const auto invalid = dispatcher.dispatch(
         commands::LoadAudioFile{"invalid.wav", tracks::TrackId{999}});
     check(invalid.status == commands::CommandStatus::rejected &&
@@ -232,6 +273,34 @@ int main() {
               commands::CommandStatus::accepted &&
               app.project().duration().value == 192000,
           "global duration should be the maximum active track end");
+
+    check(dispatcher.dispatch(commands::SetTrackPan{
+              first, mixer::Pan{-0.5F}}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetTrackMute{first, true}).status ==
+                  commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetTrackSolo{first, true}).status ==
+                  commands::CommandStatus::accepted &&
+              audio.trackMixRequests == 3 &&
+              app.project().findTrack(first)->mix ==
+                  mixer::TrackMixState{{}, {-0.5F}, true, true},
+          "loaded track commands must update RT before committing the model");
+    check(dispatcher.dispatch(commands::SetTrackSolo{emptyBetween, true}).status ==
+              commands::CommandStatus::accepted && audio.lastGlobalSolo,
+          "solo on an empty track must still update global RT solo eligibility");
+    check(dispatcher.dispatch(commands::SetMasterGain{
+              mixer::GainDb{-3.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              audio.masterMixRequests == 1 &&
+              app.project().masterMix().gain == mixer::GainDb{-3.0F},
+          "master gain command must flow through the audio engine and model");
+    audio.acceptMixerRequests = false;
+    check(dispatcher.dispatch(commands::SetTrackGain{
+              first, mixer::GainDb{-12.0F}}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findTrack(first)->mix.gain == mixer::GainDb{},
+          "a rejected RT parameter update must preserve project mixer state");
+    audio.acceptMixerRequests = true;
 
     audio.rejectNextLoad = true;
     check(dispatcher.dispatch(commands::LoadAudioFile{"broken.wav", third}).status ==

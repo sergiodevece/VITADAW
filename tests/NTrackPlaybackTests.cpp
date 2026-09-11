@@ -1,5 +1,6 @@
 #include "vitadaw/audio/RealtimeAudioEngine.h"
 #include "vitadaw/audio/StereoAccumulator.h"
+#include "vitadaw/audio/TrackMixerProcessing.h"
 
 #include <algorithm>
 #include <array>
@@ -41,10 +42,16 @@ vitadaw::audio::StereoSample renderProjectSample(
     vitadaw::timeline::PreciseProjectFramePosition position,
     vitadaw::timeline::SampleRate projectRate) {
     vitadaw::audio::StereoSample result;
+    const auto anySolo = std::any_of(tracks.begin(), tracks.end(),
+                                     [](const auto& track) {
+                                         return track.mix.solo;
+                                     });
     for (const auto& track : tracks) {
         vitadaw::audio::accumulateTrackContribution(
-            result, vitadaw::audio::renderTrackAtProjectPosition(
-                        track, position, projectRate));
+            result, vitadaw::audio::applyTrackMix(
+                        vitadaw::audio::renderTrackAtProjectPosition(
+                            track, position, projectRate),
+                        track.channelCount, track.mix, anySolo));
     }
     return result;
 }
@@ -82,18 +89,18 @@ int main() {
     const std::vector<audio::PreparedTrackView> oneTrack{
         monoView({1}, one, projectRate, projectRate)};
     check(std::abs(renderProjectSample(oneTrack, {3.0}, projectRate).left -
-                   0.125F) < 1.0e-6F &&
+                   0.70710678F) < 1.0e-6F &&
               std::abs(processFirstSample(oneTrack, projectRate, {8}) -
-                       0.125F) < 1.0e-6F,
-          "one track should use the fixed provisional gain");
+                       0.70710678F) < 1.0e-6F,
+          "one unity mono track should use the equal-power centre law");
 
     const std::vector<audio::PreparedTrackView> twoTracks{
         monoView({1}, one, projectRate, projectRate),
         monoView({2}, half, projectRate, projectRate)};
     check(std::abs(renderProjectSample(twoTracks, {3.0}, projectRate).left -
-                   0.1875F) < 1.0e-6F &&
+                   1.06066017F) < 1.0e-6F &&
               std::abs(processFirstSample(twoTracks, projectRate, {8}) -
-                       0.1875F) < 1.0e-6F,
+                       1.06066017F) < 1.0e-6F,
           "two tracks should accumulate independent contributions");
 
     std::vector<std::vector<float>> fourSignals(4, std::vector<float>(8, 0.5F));
@@ -103,9 +110,9 @@ int main() {
                                       projectRate, projectRate));
     }
     check(std::abs(renderProjectSample(fourTracks, {2.0}, projectRate).left -
-                   0.25F) < 1.0e-6F &&
+                   1.41421356F) < 1.0e-6F &&
               std::abs(processFirstSample(fourTracks, projectRate, {8}) -
-                       0.25F) < 1.0e-6F,
+                       1.41421356F) < 1.0e-6F,
           "four tracks should accumulate without a fixed topology");
 
     std::vector<std::vector<float>> eightSignals(8, std::vector<float>(8, 0.25F));
@@ -116,9 +123,9 @@ int main() {
         tracksWithEmptyGaps.push_back({});
     }
     check(std::abs(renderProjectSample(tracksWithEmptyGaps, {4.0}, projectRate).left -
-                   0.25F) < 1.0e-6F &&
+                   1.41421356F) < 1.0e-6F &&
               std::abs(processFirstSample(tracksWithEmptyGaps, projectRate, {8}) -
-                       0.25F) < 1.0e-6F,
+                       1.41421356F) < 1.0e-6F,
           "eight active tracks should ignore empty entries between them");
 
     std::vector<float> ramp441(44101);
@@ -134,7 +141,7 @@ int main() {
         monoView({48}, ramp480, projectRate, projectRate)};
     const auto halfSecond = renderProjectSample(
         mixedRates, {24000.0}, projectRate);
-    check(std::abs(halfSecond.left - 5756.25F) < 1.0e-3F,
+    check(std::abs(halfSecond.left - 32562.267F) < 1.0e-2F,
           "mixed sample rates should derive the same project instant");
 
     const std::vector<float> shortSignal(2, 1.0F);
@@ -146,14 +153,14 @@ int main() {
                  timeline::SampleRate{4.0})};
     check(std::abs(renderProjectSample(
                        unequalLengths, {2.0}, timeline::SampleRate{4.0}).left -
-                   0.05F) < 1.0e-6F,
+                   0.28284271F) < 1.0e-6F,
           "a finished short track should stop contributing");
 
     const auto shifted = monoView({99}, one, projectRate, projectRate, 10);
     check(renderProjectSample(std::span{&shifted, 1}, {9.0}, projectRate).left ==
               0.0F &&
               renderProjectSample(std::span{&shifted, 1}, {10.0}, projectRate).left ==
-                  0.125F,
+                  0.70710678F,
           "prepared tracks should support a future non-zero clip start");
 
     std::vector<std::vector<float>> scaleSignals(
@@ -175,7 +182,7 @@ int main() {
     std::array<float*, 2> channels{left.data(), right.data()};
     engine.processBlock({channels.data(), channels.size(), left.size()}, projectRate);
     check(std::all_of(left.begin(), left.end(), [](float sample) {
-              return std::abs(sample - 0.125F) < 1.0e-6F;
+              return std::abs(sample - 0.70710678F) < 1.0e-6F;
           }) &&
               !engine.transportSnapshot().playing &&
               engine.transportSnapshot().position.value == 16,

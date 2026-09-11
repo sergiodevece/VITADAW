@@ -19,8 +19,15 @@ struct LoadAudioFile {
 
 struct Play {};
 struct Stop {};
+struct SetTrackGain { tracks::TrackId track; mixer::GainDb gain; };
+struct SetTrackPan { tracks::TrackId track; mixer::Pan pan; };
+struct SetTrackMute { tracks::TrackId track; bool muted{}; };
+struct SetTrackSolo { tracks::TrackId track; bool solo{}; };
+struct SetMasterGain { mixer::GainDb gain; };
 
-using Command = std::variant<AddAudioTrack, LoadAudioFile, Play, Stop>;
+using Command = std::variant<AddAudioTrack, LoadAudioFile, Play, Stop,
+                             SetTrackGain, SetTrackPan, SetTrackMute,
+                             SetTrackSolo, SetMasterGain>;
 
 enum class CommandStatus {
     accepted,

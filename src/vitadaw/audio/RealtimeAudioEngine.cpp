@@ -1,13 +1,27 @@
 #include "vitadaw/audio/RealtimeAudioEngine.h"
 #include "vitadaw/audio/StereoAccumulator.h"
+#include "vitadaw/audio/TrackMixerProcessing.h"
 
 #include <algorithm>
+#include <type_traits>
 
 namespace vitadaw::audio {
 
 void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     deviceUnavailable();
     project_ = project;
+    trackMixCount_ = std::min(project_.tracks.size(), maximumTrackCount);
+    for (std::size_t index = 0; index < trackMixCount_; ++index) {
+        trackMix_[index] = project_.tracks[index].mix.isValid()
+                               ? project_.tracks[index].mix
+                               : mixer::PreparedTrackMixState{};
+    }
+    masterMix_ = project_.masterMix.isValid()
+                     ? project_.masterMix
+                     : mixer::PreparedMasterMixState{};
+    anySolo_ = project_.anySolo;
+    parameterReadIndex_.store(0, std::memory_order_relaxed);
+    parameterWriteIndex_.store(0, std::memory_order_relaxed);
     clock_.prepare(project_.duration);
     publishTransport();
 }
@@ -61,6 +75,25 @@ AudioControlRequestResult RealtimeAudioEngine::tryRequestStop() noexcept {
     return enqueue(CommandType::stop);
 }
 
+bool RealtimeAudioEngine::tryUpdateTrackMix(
+    tracks::TrackId track, mixer::PreparedTrackMixState mix,
+    bool anySolo) noexcept {
+    const auto exists = std::any_of(
+        project_.tracks.begin(), project_.tracks.begin() + trackMixCount_,
+        [track](const auto& candidate) { return candidate.id == track; });
+    return track.isValid() && exists && mix.isValid() &&
+           enqueueParameter(TrackMixCommand{track, mix, anySolo});
+}
+
+bool RealtimeAudioEngine::tryUpdateGlobalSolo(bool anySolo) noexcept {
+    return enqueueParameter(GlobalSoloCommand{anySolo});
+}
+
+bool RealtimeAudioEngine::tryUpdateMasterMix(
+    mixer::PreparedMasterMixState mix) noexcept {
+    return mix.isValid() && enqueueParameter(MasterMixCommand{mix});
+}
+
 RealtimeTransportSnapshot RealtimeAudioEngine::transportSnapshot() const noexcept {
     return transportExchange_.snapshot();
 }
@@ -80,6 +113,7 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
     }
 
     consumeCommands();
+    consumeParameterCommands();
     if (deviceState() != DeviceProcessingState::operational ||
         !clock_.isPlaying() || !project_.projectSampleRate.isValid() ||
         !deviceSampleRate.isValid()) {
@@ -94,12 +128,15 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
             break;
         }
         StereoSample mixed;
-        for (const auto& track : project_.tracks) {
+        for (std::size_t index = 0; index < trackMixCount_; ++index) {
+            const auto& track = project_.tracks[index];
+            const auto rendered = renderTrackAtProjectPosition(
+                track, clock_.position(), project_.projectSampleRate);
             accumulateTrackContribution(
-                mixed, renderTrackAtProjectPosition(
-                           track, clock_.position(),
-                           project_.projectSampleRate));
+                mixed, applyTrackMix(rendered, track.channelCount,
+                                     trackMix_[index], anySolo_));
         }
+        applyMasterGain(mixed, masterMix_);
         if (output.channels != nullptr && output.channelCount > 0 &&
             output.channels[0] != nullptr) {
             output.channels[0][frame] = mixed.left;
@@ -111,6 +148,45 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
         clock_.advance(projectFramesPerDeviceFrame);
     }
     publishTransport();
+}
+
+bool RealtimeAudioEngine::enqueueParameter(ParameterCommand command) noexcept {
+    const auto write = parameterWriteIndex_.load(std::memory_order_relaxed);
+    const auto nextWrite = (write + 1) % parameterCommandCapacity;
+    if (nextWrite == parameterReadIndex_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    parameterCommands_[write] = command;
+    parameterWriteIndex_.store(nextWrite, std::memory_order_release);
+    return true;
+}
+
+void RealtimeAudioEngine::consumeParameterCommands() noexcept {
+    auto read = parameterReadIndex_.load(std::memory_order_relaxed);
+    const auto write = parameterWriteIndex_.load(std::memory_order_acquire);
+    while (read != write) {
+        const auto command = parameterCommands_[read];
+        std::visit(
+            [this](const auto& value) noexcept {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, TrackMixCommand>) {
+                    for (std::size_t index = 0; index < trackMixCount_; ++index) {
+                        if (project_.tracks[index].id == value.track) {
+                            trackMix_[index] = value.mix;
+                            anySolo_ = value.anySolo;
+                            break;
+                        }
+                    }
+                } else if constexpr (std::is_same_v<T, MasterMixCommand>) {
+                    masterMix_ = value.mix;
+                } else {
+                    anySolo_ = value.anySolo;
+                }
+            },
+            command);
+        read = (read + 1) % parameterCommandCapacity;
+    }
+    parameterReadIndex_.store(read, std::memory_order_release);
 }
 
 AudioControlRequestResult RealtimeAudioEngine::enqueue(CommandType type) noexcept {
@@ -178,7 +254,8 @@ void RealtimeAudioEngine::resolveCommandsThrough(
 }
 
 bool RealtimeAudioEngine::hasPreparedAudio() const noexcept {
-    return std::any_of(project_.tracks.begin(), project_.tracks.end(),
+    return std::any_of(project_.tracks.begin(),
+                       project_.tracks.begin() + trackMixCount_,
                        [](const auto& track) { return track.isAvailable(); });
 }
 

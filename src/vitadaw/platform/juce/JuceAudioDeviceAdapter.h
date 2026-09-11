@@ -34,10 +34,18 @@ public:
 
     [[nodiscard]] audio::AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file, tracks::TrackId track,
-        timeline::SampleRate projectSampleRate) override;
+        timeline::SampleRate projectSampleRate,
+        mixer::PreparedTrackMixState trackMix) override;
     [[nodiscard]] bool commitPreparedWav(
         audio::PreparedAudioFilePtr prepared,
         audio::AudioFileCommitAction modelCommit) noexcept override;
+    [[nodiscard]] bool tryUpdateTrackMix(
+        tracks::TrackId track,
+        mixer::PreparedTrackMixState mix,
+        bool anySolo) noexcept override;
+    [[nodiscard]] bool tryUpdateGlobalSolo(bool anySolo) noexcept override;
+    [[nodiscard]] bool tryUpdateMasterMix(
+        mixer::PreparedMasterMixState mix) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestStop() noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
@@ -71,6 +79,8 @@ private:
     audio::RealtimeAudioEngine realtimeEngine_;
     timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;
+    mixer::PreparedMasterMixState masterMix_;
+    bool anySolo_{};
     std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
     std::atomic<bool> suppressLifecycleNotification_{};
     bool callbackRegistered_{};

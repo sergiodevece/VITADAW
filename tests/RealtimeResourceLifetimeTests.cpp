@@ -105,7 +105,7 @@ int main() {
     finishOldCallback.release();
     realtimeUse.join();
     replaceOnApplicationThread.join();
-    check(std::abs(oldLeft[0] - 0.1F) < 1.0e-6F &&
+    check(std::abs(oldLeft[0] - 0.56568542F) < 1.0e-6F &&
               oldProbe.destructions.load(std::memory_order_acquire) == 1 &&
               oldProbe.destructionsWhileRealtimeActive.load(
                   std::memory_order_acquire) == 0,
@@ -127,7 +127,7 @@ int main() {
         replacementLeft.data(), replacementRight.data()};
     engine.processBlock({replacementChannels.data(), replacementChannels.size(), 1},
                         timeline::SampleRate{100.0});
-    check(std::abs(replacementLeft[0] - 0.05F) < 1.0e-6F,
+    check(std::abs(replacementLeft[0] - 0.28284271F) < 1.0e-6F,
           "failed load must preserve the currently published resource");
 
     std::binary_semaphore closeCallbackEntered{0};

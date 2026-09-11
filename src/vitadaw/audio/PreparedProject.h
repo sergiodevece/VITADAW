@@ -2,6 +2,7 @@
 
 #include "vitadaw/timeline/Timeline.h"
 #include "vitadaw/tracks/AudioTrack.h"
+#include "vitadaw/mixer/MixerState.h"
 
 #include <array>
 #include <cstdint>
@@ -20,6 +21,7 @@ struct PreparedTrackView {
     timeline::ProjectFramePosition clipStart;
     timeline::ProjectFrameCount clipDuration;
     timeline::SourceFrameCount sourceOffset;
+    mixer::PreparedTrackMixState mix;
 
     [[nodiscard]] bool isAvailable() const noexcept {
         return id.isValid() && channelCount > 0 && channelCount <= channels.size() &&
@@ -34,6 +36,8 @@ struct PreparedProjectView {
     timeline::SampleRate projectSampleRate;
     timeline::ProjectFrameCount duration;
     std::span<const PreparedTrackView> tracks;
+    mixer::PreparedMasterMixState masterMix;
+    bool anySolo{};
 };
 
 } // namespace vitadaw::audio

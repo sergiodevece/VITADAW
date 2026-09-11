@@ -30,6 +30,7 @@ al motor.
 - `project`: estado editable y propiedad de pistas.
 - `commands`: mensajes de intención, resultados y despacho.
 - `audio`: contratos de control no-RT y procesamiento RT.
+- `mixer`: estado portable, unidades y preparación DSP de gain/pan.
 - `transport`: estado lógico de reproducción y posición.
 - `tracks`: colección variable de pistas, cada una con identidad estable y un
   único clip opcional en este incremento.
@@ -45,7 +46,7 @@ lee esas estructuras mutables. Cada WAV se decodifica completamente fuera de RT;
 el adaptador detiene el callback antes de publicar una topología preparada.
 
 `RealtimeAudioEngine` es la frontera real de procesamiento portable. Posee el
-reloj maestro, la cola SPSC, el render N-track, la acumulación estéreo y el
+reloj maestro, las colas SPSC, el render N-track, el mixer y la
 intercambio de transporte. Su `processBlock` recibe vistas de salida y el sample
 rate del dispositivo, y es exactamente el método invocado por JUCE y por los
 tests offline. El adaptador JUCE conserva dispositivo, filesystem, decodificación
@@ -238,10 +239,69 @@ pistas preparadas.
 
 `TrackRenderer` convierte la posición común y produce una contribución estéreo
 por pista mediante interpolación lineal. Una pista fuera de su rango devuelve
-silencio. `StereoAccumulator` suma cada contribución con ganancia provisional
-fija `0.125` (-18,06 dB). La ganancia no depende del número de pistas cargadas:
-reserva margen para ocho señales normalizadas, pero no sustituye el futuro gain
-staging y no aplica limitador ni clipping no lineal.
+silencio. Desde 0.1.1, `TrackMixerProcessing` aplica gain, pan y la decisión
+mute/solo; `StereoAccumulator` suma a unity y el gain master procesa el resultado
+estéreo. No hay atenuación fija, limiter ni clipping no lineal.
+
+## Mixer Core 0.1.1
+
+`AudioTrack` contiene un `TrackMixState` portable con gain en dB, pan normalizado,
+mute y solo. `ProjectState` posee además `MasterMixState`. Los gains válidos van
+de `-100 dB` —silencio práctico representado como coeficiente cero— a `+12 dB`;
+`0 dB` equivale a unity. Pan admite `-1` izquierda, `0` centro y `+1` derecha.
+Todos los valores numéricos no finitos o fuera de rango se rechazan antes de
+modificar el modelo.
+
+El flujo de señal por muestra es:
+
+```text
+master project clock
+    -> TrackRenderer
+    -> track linear gain
+    -> mono equal-power pan / stereo equal-power balance
+    -> mute and global solo eligibility
+    -> StereoAccumulator
+    -> master linear gain
+    -> stereo output
+```
+
+Para mono, el ángulo recorre `[0, pi/2]`: izquierda=`cos(angle)` y
+derecha=`sin(angle)`. El centro entrega `sqrt(1/2)` a cada canal (-3 dB) y
+conserva potencia. Para estéreo se usa balance: al centro ambos canales quedan a
+unity; hacia un extremo el canal opuesto sigue una curva seno/coseno hasta cero,
+sin alterar el canal del lado elegido. No se implementan width ni pan dual.
+
+La elegibilidad es global por bloque. Sin pistas en solo suena toda pista no
+muteada. Con uno o más solos solo suenan pistas cuyo solo está activo. Mute tiene
+precedencia incluso sobre solo. Estas decisiones no detienen render, reloj ni
+transporte: una pista inaudible sigue avanzando.
+
+Los comandos `SetTrackGain`, `SetTrackPan`, `SetTrackMute`, `SetTrackSolo` y
+`SetMasterGain` siguen `ICommandDispatcher -> DawApplication -> ProjectState /
+IAudioEngineControl`. `DawApplication` valida y prepara un estado DSP completo;
+la conversión dB-lineal y los coeficientes trigonométricos se calculan fuera de
+RT. El adaptador no decodifica ni reconstruye recursos para estos cambios.
+
+`RealtimeAudioEngine` dispone de un ring SPSC de parámetros con 64 entradas,
+63 pendientes utilizables por reservar una como discriminador lleno/vacío, y un
+array fijo para un máximo preparado de 256 pistas. El productor único escribe
+un estado completo y publica el índice con release; el callback adquiere el
+índice, consume FIFO al inicio de bloque y actualiza solo su almacenamiento
+preasignado. Una cola llena rechaza explícitamente el comando; entonces ni
+`PreparedProject` ni `ProjectState` cambian. Cada `PreparedTrackView` conserva
+también el estado vigente para que una posterior reconstrucción estructural lo
+publique sin volver a valores por defecto. La carga de un WAV para una pista
+vacía recibe su estado de mezcla actual desde el modelo. Cada cambio publica
+también `anySolo`, calculado sobre todas las pistas del proyecto: una pista vacía
+en solo silencia correctamente las pistas cargadas que no estén en solo, sin
+crear un recurso RT ficticio.
+
+La suma interna usa `float` y puede superar `[-1, 1]`. No se aplica clamp ni
+limitador; el recorte depende del backend/hardware final. No hay smoothing en
+este incremento: cambios abruptos de gain o pan son coherentes al límite de
+bloque, pero pueden causar discontinuidades audibles. Smoothing, buses, sends,
+inserts, plugins, automatización, grabación y routing configurable quedan fuera
+de 0.1.1.
 
 Una carga válida se construye y decodifica por completo antes de desconectar
 brevemente el callback. `DawApplication` prepara antes el `AudioClip`, su
@@ -292,7 +352,7 @@ publicados y el candidato, limitando también el pico durante una sustitución.
   arquitectura hasta decenas de pistas, pero no constituye una garantía de
   rendimiento profesional.
 
-## Evolución hasta 0.1.0
+## Evolución hasta 0.1.1
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -316,6 +376,8 @@ publicados y el candidato, limitando también el pico durante una sustitución.
 10. **Completado en 0.1.0:** sustituir la topología fija de dos pistas por una
     colección preparada N-track con identidad estable, render por pista y
     acumulación desde un único reloj.
+11. **Completado en 0.1.1:** sustituir la atenuación provisional por el Mixer
+    Core portable y una vía ligera, acotada y RT-safe de parámetros.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

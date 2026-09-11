@@ -31,10 +31,16 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Audio track could not be added"};
                 }
             } else if constexpr (std::is_same_v<T, commands::LoadAudioFile>) {
+                const auto* destination = project_.findTrack(value.track);
+                if (destination == nullptr) {
+                    return {commands::CommandStatus::rejected,
+                            "Audio track does not exist"};
+                }
                 audio::AudioFilePreparationResult preparation;
                 try {
                     preparation = audioEngine_.prepareWav(
-                        value.file, value.track, project_.sampleRate());
+                        value.file, value.track, project_.sampleRate(),
+                        mixer::prepare(destination->mix));
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
                             "Not enough memory to prepare WAV"};
@@ -120,6 +126,65 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 pendingAudioCommandSequence_ = request.sequence;
                 transport_.stopAndRewind();
                 return {commands::CommandStatus::accepted, "Stopped at start"};
+            } else if constexpr (
+                std::is_same_v<T, commands::SetTrackGain> ||
+                std::is_same_v<T, commands::SetTrackPan> ||
+                std::is_same_v<T, commands::SetTrackMute> ||
+                std::is_same_v<T, commands::SetTrackSolo>) {
+                const auto* track = project_.findTrack(value.track);
+                if (track == nullptr) {
+                    return {commands::CommandStatus::rejected,
+                            "Audio track does not exist"};
+                }
+                auto updated = track->mix;
+                if constexpr (std::is_same_v<T, commands::SetTrackGain>) {
+                    if (!value.gain.isValid()) {
+                        return {commands::CommandStatus::rejected,
+                                "Track gain must be finite and between -100 and +12 dB"};
+                    }
+                    updated.gain = value.gain;
+                } else if constexpr (std::is_same_v<T, commands::SetTrackPan>) {
+                    if (!value.pan.isValid()) {
+                        return {commands::CommandStatus::rejected,
+                                "Track pan must be finite and between -1 and +1"};
+                    }
+                    updated.pan = value.pan;
+                } else if constexpr (std::is_same_v<T, commands::SetTrackMute>) {
+                    updated.muted = value.muted;
+                } else {
+                    updated.solo = value.solo;
+                }
+                bool anySolo{};
+                for (const auto& candidate : project_.tracks()) {
+                    anySolo = anySolo ||
+                              (candidate.id == value.track
+                                   ? updated.solo
+                                   : candidate.mix.solo);
+                }
+                const auto published = track->hasAudio()
+                    ? audioEngine_.tryUpdateTrackMix(
+                          value.track, mixer::prepare(updated), anySolo)
+                    : audioEngine_.tryUpdateGlobalSolo(anySolo);
+                if (!published) {
+                    return {commands::CommandStatus::rejected,
+                            "Mixer parameter queue is full"};
+                }
+                static_cast<void>(project_.setTrackMix(value.track, updated));
+                return {commands::CommandStatus::accepted,
+                        "Track mixer state updated"};
+            } else if constexpr (std::is_same_v<T, commands::SetMasterGain>) {
+                if (!value.gain.isValid()) {
+                    return {commands::CommandStatus::rejected,
+                            "Master gain must be finite and between -100 and +12 dB"};
+                }
+                const mixer::MasterMixState updated{value.gain};
+                if (!audioEngine_.tryUpdateMasterMix(mixer::prepare(updated))) {
+                    return {commands::CommandStatus::rejected,
+                            "Mixer parameter queue is full"};
+                }
+                static_cast<void>(project_.setMasterMix(updated));
+                return {commands::CommandStatus::accepted,
+                        "Master mixer state updated"};
             }
             return {commands::CommandStatus::accepted, {}};
         },

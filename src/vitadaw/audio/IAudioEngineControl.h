@@ -62,10 +62,18 @@ public:
     [[nodiscard]] virtual AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file,
         tracks::TrackId track,
-        timeline::SampleRate projectSampleRate) = 0;
+        timeline::SampleRate projectSampleRate,
+        mixer::PreparedTrackMixState trackMix) = 0;
     [[nodiscard]] virtual bool commitPreparedWav(
         PreparedAudioFilePtr prepared,
         AudioFileCommitAction modelCommit) noexcept = 0;
+    [[nodiscard]] virtual bool tryUpdateTrackMix(
+        tracks::TrackId track,
+        mixer::PreparedTrackMixState mix,
+        bool anySolo) noexcept = 0;
+    [[nodiscard]] virtual bool tryUpdateGlobalSolo(bool anySolo) noexcept = 0;
+    [[nodiscard]] virtual bool tryUpdateMasterMix(
+        mixer::PreparedMasterMixState mix) noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestStop() noexcept = 0;
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;

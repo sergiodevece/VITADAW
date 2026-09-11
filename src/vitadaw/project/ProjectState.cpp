@@ -28,7 +28,7 @@ tracks::TrackId ProjectState::addAudioTrack(std::string name) {
         throw std::overflow_error{"Audio track identity space exhausted"};
     }
     const auto id = nextTrackId_;
-    tracks_.push_back({id, std::move(name), std::nullopt});
+    tracks_.push_back({id, std::move(name), std::nullopt, {}});
     ++nextTrackId_.value;
     return id;
 }
@@ -40,6 +40,34 @@ const tracks::AudioTrack* ProjectState::findTrack(
                                         return candidate.id == track;
                                     });
     return found == tracks_.end() ? nullptr : &*found;
+}
+
+const mixer::MasterMixState& ProjectState::masterMix() const noexcept {
+    return masterMix_;
+}
+
+bool ProjectState::setTrackMix(tracks::TrackId track,
+                               mixer::TrackMixState state) noexcept {
+    if (!state.isValid()) {
+        return false;
+    }
+    const auto found = std::find_if(tracks_.begin(), tracks_.end(),
+                                    [track](const auto& candidate) {
+                                        return candidate.id == track;
+                                    });
+    if (found == tracks_.end()) {
+        return false;
+    }
+    found->mix = state;
+    return true;
+}
+
+bool ProjectState::setMasterMix(mixer::MasterMixState state) noexcept {
+    if (!state.isValid()) {
+        return false;
+    }
+    masterMix_ = state;
+    return true;
 }
 
 timeline::ProjectFrameCount ProjectState::duration() const noexcept {

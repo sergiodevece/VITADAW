@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/clips/AudioClip.h"
+#include "vitadaw/mixer/MixerState.h"
 
 #include <compare>
 #include <cstdint>
@@ -20,6 +21,7 @@ struct AudioTrack {
     TrackId id{};
     std::string name;
     std::optional<clips::AudioClip> clip;
+    mixer::TrackMixState mix;
 
     [[nodiscard]] bool hasAudio() const noexcept { return clip.has_value(); }
 };

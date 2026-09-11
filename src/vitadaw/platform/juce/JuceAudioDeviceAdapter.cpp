@@ -23,11 +23,14 @@ struct JuceAudioDeviceAdapter::PreparedProject {
     struct TrackResource {
         tracks::TrackId id;
         std::shared_ptr<const PreparedAudio> audio;
+        mixer::PreparedTrackMixState mix;
     };
 
     std::vector<TrackResource> resources;
     std::vector<audio::PreparedTrackView> views;
     timeline::ProjectFrameCount duration;
+    mixer::PreparedMasterMixState masterMix;
+    bool anySolo{};
 };
 
 struct JuceAudioDeviceAdapter::PreparedJuceAudioFile final
@@ -95,13 +98,17 @@ void JuceAudioDeviceAdapter::setStateChangedCallback(StateChangedCallback callba
 
 audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
     const std::filesystem::path& filePath, tracks::TrackId track,
-    timeline::SampleRate projectSampleRate) {
+    timeline::SampleRate projectSampleRate,
+    mixer::PreparedTrackMixState trackMix) {
     try {
         if (!track.isValid()) {
             return {nullptr, "Invalid audio track identity"};
         }
         if (!projectSampleRate.isValid()) {
             return {nullptr, "Project sample rate must be finite and positive"};
+        }
+        if (!trackMix.isValid()) {
+            return {nullptr, "Invalid prepared track mixer state"};
         }
 
         const auto nativePath = filePath.wstring();
@@ -172,13 +179,21 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
         if (preparedProject_ != nullptr) {
             candidateProject->resources = preparedProject_->resources;
         }
+        candidateProject->masterMix = masterMix_;
+        candidateProject->anySolo = anySolo_;
         const auto existing = std::find_if(
             candidateProject->resources.begin(), candidateProject->resources.end(),
             [track](const auto& resource) { return resource.id == track; });
         if (existing == candidateProject->resources.end()) {
-            candidateProject->resources.push_back({track, std::move(prepared)});
+            if (candidateProject->resources.size() >=
+                audio::RealtimeAudioEngine::maximumTrackCount) {
+                return {nullptr, "Realtime prepared track capacity exceeded"};
+            }
+            candidateProject->resources.push_back(
+                {track, std::move(prepared), trackMix});
         } else {
             existing->audio = std::move(prepared);
+            existing->mix = trackMix;
         }
 
         candidateProject->views.reserve(candidateProject->resources.size());
@@ -195,6 +210,7 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
             view.clipDuration = timeline::sourceFramesToProjectDuration(
                 view.frameCount, view.sourceSampleRate, projectSampleRate);
             view.sourceOffset = {0};
+            view.mix = resource.mix;
             for (std::size_t channel = 0; channel < view.channelCount; ++channel) {
                 view.channels[channel] =
                     source.samples.getReadPointer(static_cast<int>(channel));
@@ -216,6 +232,53 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
     } catch (...) {
         return {nullptr, "Unknown error while preparing WAV"};
     }
+}
+
+bool JuceAudioDeviceAdapter::tryUpdateTrackMix(
+    tracks::TrackId track, mixer::PreparedTrackMixState mix,
+    bool anySolo) noexcept {
+    if (preparedProject_ == nullptr || !track.isValid() || !mix.isValid()) {
+        return false;
+    }
+    const auto resource = std::find_if(
+        preparedProject_->resources.begin(), preparedProject_->resources.end(),
+        [track](const auto& candidate) { return candidate.id == track; });
+    const auto view = std::find_if(
+        preparedProject_->views.begin(), preparedProject_->views.end(),
+        [track](const auto& candidate) { return candidate.id == track; });
+    if (resource == preparedProject_->resources.end() ||
+        view == preparedProject_->views.end() ||
+        !realtimeEngine_.tryUpdateTrackMix(track, mix, anySolo)) {
+        return false;
+    }
+    resource->mix = mix;
+    view->mix = mix;
+    anySolo_ = anySolo;
+    preparedProject_->anySolo = anySolo;
+    return true;
+}
+
+bool JuceAudioDeviceAdapter::tryUpdateGlobalSolo(bool anySolo) noexcept {
+    if (!realtimeEngine_.tryUpdateGlobalSolo(anySolo)) {
+        return false;
+    }
+    anySolo_ = anySolo;
+    if (preparedProject_ != nullptr) {
+        preparedProject_->anySolo = anySolo;
+    }
+    return true;
+}
+
+bool JuceAudioDeviceAdapter::tryUpdateMasterMix(
+    mixer::PreparedMasterMixState mix) noexcept {
+    if (!mix.isValid() || !realtimeEngine_.tryUpdateMasterMix(mix)) {
+        return false;
+    }
+    masterMix_ = mix;
+    if (preparedProject_ != nullptr) {
+        preparedProject_->masterMix = mix;
+    }
+    return true;
 }
 
 bool JuceAudioDeviceAdapter::commitPreparedWav(
@@ -383,7 +446,8 @@ void JuceAudioDeviceAdapter::configureRealtimeEngine() noexcept {
     const auto duration = preparedProject_ == nullptr
                               ? timeline::ProjectFrameCount{}
                               : preparedProject_->duration;
-    realtimeEngine_.configure({projectSampleRate_, duration, views});
+    realtimeEngine_.configure(
+        {projectSampleRate_, duration, views, masterMix_, anySolo_});
 }
 
 std::size_t JuceAudioDeviceAdapter::preparedBytes() const noexcept {

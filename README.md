@@ -1,10 +1,10 @@
-# VitaDAW 0.1.0 — N-Track Audio Engine
+# VitaDAW 0.1.1 — Mixer Core
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
 el dispositivo de audio y carga y reproduce una colección variable de pistas WAV
-sincronizadas. El incremento 0.1.0 sustituye la topología fija de dos pistas por
-un motor N-track portable con un único reloj maestro.
+sincronizadas. El incremento 0.1.1 incorpora el primer mixer portable: gain,
+pan, mute y solo por pista, gain master y procesamiento estéreo final.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -96,9 +96,28 @@ tiene un WAV válido preparado, `Play` se rechaza explícitamente.
 Las pistas tienen un `TrackId` monotónico independiente de su posición en el
 vector y no tienen relojes propios. Un único reloj de frames de proyecto
 determina en cada muestra la posición fuente de cada WAV, incluyendo sample
-rates distintos y un futuro inicio de clip desplazado. Cada contribución se suma
-a estéreo con una ganancia provisional fija de `0.125`, independiente del número
-de pistas cargadas.
+rates distintos y un futuro inicio de clip desplazado.
+
+Cada pista conserva gain de `-100 dB` (silencio) a `+12 dB`, pan normalizado de
+`-1` a `+1`, mute y solo. La UI solo envía `SetTrackGain`, `SetTrackPan`,
+`SetTrackMute`, `SetTrackSolo` y `SetMasterGain`; no toca el estado RT. El pan
+mono usa ley equal-power con `-3 dB` al centro. Para fuentes estéreo, el control
+actúa como balance equal-power: el centro conserva ambos canales a unity y cada
+extremo atenúa el canal opuesto.
+
+Si no hay solos, contribuyen todas las pistas no muteadas. Si existe al menos
+un solo, contribuyen únicamente pistas en solo y no muteadas; mute siempre tiene
+precedencia. El gain master usa el mismo rango y se aplica después de la suma.
+No existe ya atenuación fija por pista, clamp ni limiter: `float` puede superar
+`[-1, 1]` internamente y una salida física puede recortar si se excede su rango.
+
+Los valores dB y coeficientes trigonométricos de pan se convierten fuera del
+callback. Un ring SPSC acotado de 64 entradas (63 pendientes utilizables)
+publica estados DSP completos y el
+motor los aplica al inicio de bloque sobre almacenamiento preasignado. El estado
+global de solo incluye también pistas vacías. Una cola
+llena rechaza el comando explícitamente y el modelo no cambia. No hay smoothing
+en 0.1.1, por lo que cambios abruptos pueden producir zipper noise.
 
 La ventana muestra también, de forma provisional, el estado, posición, duración
 y sample rate lógico del proyecto. Al llegar al final natural, el transporte
@@ -145,6 +164,8 @@ La arquitectura y las reglas de tiempo real se describen en
   de recursos verificado frente a regiones RT activas.
 - **0.1.0 — N-Track Audio Engine:** colección variable con identidad estable,
   proyecto preparado RT, render por pista y acumulación general.
+- **0.1.1 — Mixer Core:** gain, pan equal-power, mute/solo global y gain master
+  con actualizaciones ligeras de parámetros hacia RT.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -153,4 +174,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.0.7.md`](docs/validation-0.0.7.md) y
 [`docs/validation-0.0.8.md`](docs/validation-0.0.8.md) y
 [`docs/validation-0.0.9.md`](docs/validation-0.0.9.md) y
-[`docs/validation-0.1.0.md`](docs/validation-0.1.0.md).
+[`docs/validation-0.1.0.md`](docs/validation-0.1.0.md) y
+[`docs/validation-0.1.1.md`](docs/validation-0.1.1.md).

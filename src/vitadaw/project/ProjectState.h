@@ -27,6 +27,10 @@ public:
     [[nodiscard]] tracks::TrackId addAudioTrack(std::string name);
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
+    [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;
+    [[nodiscard]] bool setTrackMix(tracks::TrackId track,
+                                   mixer::TrackMixState state) noexcept;
+    [[nodiscard]] bool setMasterMix(mixer::MasterMixState state) noexcept;
     [[nodiscard]] timeline::ProjectFrameCount duration() const noexcept;
     [[nodiscard]] PreparedAudioClipUpdate prepareAudioClipUpdate(
         tracks::TrackId track,
@@ -40,6 +44,7 @@ private:
     std::vector<tracks::AudioTrack> tracks_;
     tracks::TrackId nextTrackId_{1};
     clips::ClipId nextClipId_{1};
+    mixer::MasterMixState masterMix_;
 };
 
 } // namespace vitadaw::project
