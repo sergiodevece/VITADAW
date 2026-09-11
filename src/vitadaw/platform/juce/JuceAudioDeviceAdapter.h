@@ -6,7 +6,6 @@
 
 #include <juce_audio_devices/juce_audio_devices.h>
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -34,7 +33,7 @@ public:
     void setStateChangedCallback(StateChangedCallback callback);
 
     [[nodiscard]] audio::AudioFilePreparationResult prepareWav(
-        const std::filesystem::path& file, tracks::AudioTrackSlot track,
+        const std::filesystem::path& file, tracks::TrackId track,
         timeline::SampleRate projectSampleRate) override;
     [[nodiscard]] bool commitPreparedWav(
         audio::PreparedAudioFilePtr prepared,
@@ -54,6 +53,7 @@ private:
 
     enum class PendingLifecycleEvent : std::uint8_t { none, stopped, error };
     struct PreparedAudio;
+    struct PreparedProject;
     struct PreparedJuceAudioFile;
 
     void closeDevice(bool publishClosedState) noexcept;
@@ -62,13 +62,12 @@ private:
     void detachAudioCallback() noexcept;
     void attachAudioCallback();
     void configureRealtimeEngine() noexcept;
-    [[nodiscard]] timeline::ProjectFrameCount preparedDuration() const noexcept;
     [[nodiscard]] std::size_t preparedBytes() const noexcept;
 
     juce::AudioDeviceManager deviceManager_;
     audio::AudioDeviceStateModel stateModel_;
     StateChangedCallback stateChangedCallback_;
-    std::array<std::unique_ptr<PreparedAudio>, tracks::audioTrackCount> preparedTracks_;
+    std::unique_ptr<PreparedProject> preparedProject_;
     audio::RealtimeAudioEngine realtimeEngine_;
     timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;

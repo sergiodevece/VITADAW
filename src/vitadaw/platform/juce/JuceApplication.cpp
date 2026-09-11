@@ -6,6 +6,8 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace vitadaw::platform::juce_adapter {
 
@@ -17,7 +19,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.0.9";
+        return "0.1.0";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -39,8 +41,17 @@ public:
             *audioDevice_, projectSampleRate);
         commandDispatcher_ =
             std::make_unique<commands::CommandDispatcher>(*dawApplication_);
-        mainWindow_ =
-            std::make_unique<MainWindow>(audioDevice_->state(), *commandDispatcher_);
+        for (int index = 1; index <= 4; ++index) {
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::AddAudioTrack{"Audio " + std::to_string(index)}));
+        }
+        std::vector<tracks::TrackId> audioTracks;
+        audioTracks.reserve(dawApplication_->project().tracks().size());
+        for (const auto& track : dawApplication_->project().tracks()) {
+            audioTracks.push_back(track.id);
+        }
+        mainWindow_ = std::make_unique<MainWindow>(
+            audioDevice_->state(), *commandDispatcher_, std::move(audioTracks));
         mainWindow_->setTransportState(dawApplication_->transport(),
                                        dawApplication_->project().sampleRate());
         audioDevice_->setStateChangedCallback(

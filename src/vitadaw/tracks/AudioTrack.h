@@ -2,25 +2,19 @@
 
 #include "vitadaw/clips/AudioClip.h"
 
-#include <cstddef>
+#include <compare>
 #include <cstdint>
 #include <optional>
 #include <string>
 
 namespace vitadaw::tracks {
 
-using TrackId = std::uint64_t;
+struct TrackId {
+    std::uint64_t value{};
 
-enum class AudioTrackSlot : std::uint8_t {
-    first = 0,
-    second = 1,
+    [[nodiscard]] constexpr bool isValid() const noexcept { return value != 0; }
+    auto operator<=>(const TrackId&) const = default;
 };
-
-inline constexpr std::size_t audioTrackCount = 2;
-
-[[nodiscard]] constexpr std::size_t toIndex(AudioTrackSlot slot) noexcept {
-    return static_cast<std::size_t>(slot);
-}
 
 struct AudioTrack {
     TrackId id{};

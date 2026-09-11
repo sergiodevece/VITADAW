@@ -2,57 +2,49 @@
 #include "vitadaw/commands/CommandDispatcher.h"
 
 #include <algorithm>
-#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace {
 
 class FakeAudioEngine final : public vitadaw::audio::IAudioEngineControl {
 public:
-    struct ResourceCounters {
-        int destroyed{};
-    };
+    struct ResourceCounters { int destroyed{}; };
 
     class PreparedFile final : public vitadaw::audio::PreparedAudioFile {
     public:
         PreparedFile(vitadaw::audio::AudioFileMetadata metadata,
                      std::filesystem::path source,
-                     vitadaw::tracks::AudioTrackSlot destination,
+                     vitadaw::tracks::TrackId destination,
                      vitadaw::timeline::SampleRate projectRate,
                      ResourceCounters& resourceCounters)
             : vitadaw::audio::PreparedAudioFile(metadata), file(std::move(source)),
               track(destination), projectSampleRate(projectRate),
               counters(resourceCounters) {}
-
-        ~PreparedFile() override {
-            ++counters.destroyed;
-        }
+        ~PreparedFile() override { ++counters.destroyed; }
 
         std::filesystem::path file;
-        vitadaw::tracks::AudioTrackSlot track;
+        vitadaw::tracks::TrackId track;
         vitadaw::timeline::SampleRate projectSampleRate;
         ResourceCounters& counters;
     };
 
-    FakeAudioEngine() {
-        metadata[0] = {vitadaw::timeline::SampleRate{44100.0},
-                       1,
-                       {44100},
-                       {1.0}};
-        metadata[1] = {vitadaw::timeline::SampleRate{48000.0},
-                       2,
-                       {96000},
-                       {2.0}};
-    }
+    struct LiveTrack {
+        vitadaw::tracks::TrackId id;
+        vitadaw::audio::AudioFileMetadata metadata;
+        std::filesystem::path file;
+        vitadaw::audio::PreparedAudioFilePtr resource;
+    };
+
+    FakeAudioEngine() { live.reserve(32); }
 
     vitadaw::audio::AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file,
-        vitadaw::tracks::AudioTrackSlot track,
+        vitadaw::tracks::TrackId track,
         vitadaw::timeline::SampleRate projectSampleRate) override {
         ++loadRequests;
         if (throwNextPreparation) {
@@ -63,61 +55,58 @@ public:
             rejectNextLoad = false;
             return {nullptr, "Invalid WAV"};
         }
-
-        const auto index = vitadaw::tracks::toIndex(track);
-        const auto metadataIndex = index < metadata.size() ? index : 0;
-        return {std::make_unique<PreparedFile>(
-                    metadata[metadataIndex], file, track, projectSampleRate,
-                    resourceCounters),
-                {}};
+        const auto metadata = metadataFor(track);
+        return {std::make_unique<PreparedFile>(metadata, file, track,
+                                               projectSampleRate,
+                                               resourceCounters), {}};
     }
 
     bool commitPreparedWav(
-        vitadaw::audio::PreparedAudioFilePtr preparedFile,
+        vitadaw::audio::PreparedAudioFilePtr prepared,
         vitadaw::audio::AudioFileCommitAction modelCommit) noexcept override {
-        auto* candidate = dynamic_cast<PreparedFile*>(preparedFile.get());
+        auto* candidate = dynamic_cast<PreparedFile*>(prepared.get());
         if (candidate == nullptr || !modelCommit.isValid()) {
             return false;
         }
-        const auto index = vitadaw::tracks::toIndex(candidate->track);
-        if (index >= liveResources.size()) {
-            return false;
-        }
-
         ++commitRequests;
-        loadedFiles[index] = candidate->file;
-        this->prepared[index] = true;
-        snapshotState.playing = false;
-        snapshotState.position = {0};
-        snapshotState.duration = {0};
-        for (std::size_t slot = 0; slot < this->prepared.size(); ++slot) {
-            if (this->prepared[slot]) {
-                snapshotState.duration.value = std::max(
-                    snapshotState.duration.value,
-                    vitadaw::timeline::sourceFramesToProjectDuration(
-                        metadata[slot].sourceFrameCount,
-                        metadata[slot].sourceSampleRate,
-                        candidate->projectSampleRate).value);
-            }
+        auto found = std::find_if(live.begin(), live.end(),
+                                  [id = candidate->track](const auto& track) {
+                                      return track.id == id;
+                                  });
+        if (found == live.end()) {
+            live.push_back({candidate->track, candidate->metadata,
+                            candidate->file, std::move(prepared)});
+        } else {
+            found->metadata = candidate->metadata;
+            found->file = candidate->file;
+            found->resource = std::move(prepared);
         }
-
-        auto previous = std::move(liveResources[index]);
-        liveResources[index] = std::move(preparedFile);
+        snapshot.playing = false;
+        snapshot.position = {0};
+        snapshot.duration = {0};
+        for (const auto& track : live) {
+            snapshot.duration.value = std::max(
+                snapshot.duration.value,
+                vitadaw::timeline::sourceFramesToProjectDuration(
+                    track.metadata.sourceFrameCount,
+                    track.metadata.sourceSampleRate,
+                    candidate->projectSampleRate).value);
+        }
         modelCommit.execute();
         return true;
     }
 
     vitadaw::audio::AudioControlRequestResult tryRequestPlay() noexcept override {
         ++playRequests;
-        if (!acceptRequests || (!prepared[0] && !prepared[1])) {
+        if (!acceptRequests || live.empty()) {
             return {};
         }
         const auto sequence = nextSequence++;
-        if (snapshotState.position.value >= snapshotState.duration.value) {
-            snapshotState.position = {0};
+        if (snapshot.position.value >= snapshot.duration.value) {
+            snapshot.position = {0};
         }
-        snapshotState.playing = true;
-        snapshotState.lastProcessedCommandSequence = sequence;
+        snapshot.playing = true;
+        snapshot.lastProcessedCommandSequence = sequence;
         return {true, sequence};
     }
 
@@ -127,26 +116,31 @@ public:
             return {};
         }
         const auto sequence = nextSequence++;
-        snapshotState.playing = false;
-        snapshotState.position = {0};
-        snapshotState.lastProcessedCommandSequence = sequence;
+        snapshot.playing = false;
+        snapshot.position = {0};
+        snapshot.lastProcessedCommandSequence = sequence;
         return {true, sequence};
     }
 
     vitadaw::audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override {
-        return snapshotState;
+        return snapshot;
     }
 
-    void publishProgress(std::int64_t projectFrame, bool playing) noexcept {
-        snapshotState.position = {projectFrame};
-        snapshotState.playing = playing;
+    void publishProgress(std::int64_t frame, bool playing) noexcept {
+        snapshot.position = {frame};
+        snapshot.playing = playing;
     }
 
-    void close() noexcept { liveResources = {}; }
+    void close() noexcept { live.clear(); }
 
-    std::array<vitadaw::audio::AudioFileMetadata, 2> metadata;
-    std::array<std::optional<std::filesystem::path>, 2> loadedFiles;
-    std::array<bool, 2> prepared{};
+    [[nodiscard]] const LiveTrack* loaded(vitadaw::tracks::TrackId id) const {
+        const auto found = std::find_if(live.begin(), live.end(),
+                                        [id](const auto& track) {
+                                            return track.id == id;
+                                        });
+        return found == live.end() ? nullptr : &*found;
+    }
+
     int loadRequests{};
     int commitRequests{};
     int playRequests{};
@@ -154,10 +148,23 @@ public:
     bool acceptRequests{true};
     bool rejectNextLoad{};
     bool throwNextPreparation{};
-    vitadaw::audio::RealtimeTransportSnapshot snapshotState;
-    vitadaw::audio::AudioCommandSequence nextSequence{1};
     ResourceCounters resourceCounters;
-    std::array<vitadaw::audio::PreparedAudioFilePtr, 2> liveResources;
+
+private:
+    [[nodiscard]] static vitadaw::audio::AudioFileMetadata metadataFor(
+        vitadaw::tracks::TrackId track) {
+        if (track.value == 1) {
+            return {vitadaw::timeline::SampleRate{44100.0}, 1, {44100}, {1.0}};
+        }
+        if (track.value == 4) {
+            return {vitadaw::timeline::SampleRate{48000.0}, 2, {192000}, {4.0}};
+        }
+        return {vitadaw::timeline::SampleRate{48000.0}, 2, {96000}, {2.0}};
+    }
+
+    std::vector<LiveTrack> live;
+    vitadaw::audio::RealtimeTransportSnapshot snapshot;
+    vitadaw::audio::AudioCommandSequence nextSequence{1};
 };
 
 void check(bool condition, std::string_view message) {
@@ -175,131 +182,108 @@ int main() {
     application::DawApplication app{audio, timeline::SampleRate{48000.0}};
     commands::CommandDispatcher dispatcher{app};
 
-    check(app.project().tracks().size() == tracks::audioTrackCount,
-          "project should always contain exactly two tracks");
-    const auto addResult = dispatcher.dispatch(commands::AddAudioTrack{"Audio 3"});
-    check(addResult.status == commands::CommandStatus::rejected,
-          "a third track should be rejected");
+    check(app.project().tracks().empty(),
+          "a project should support a zero-track topology");
+    check(dispatcher.dispatch(commands::Play{}).status ==
+              commands::CommandStatus::rejected,
+          "Play with zero tracks should be rejected");
 
-    const auto playWithoutFile = dispatcher.dispatch(commands::Play{});
-    check(playWithoutFile.status == commands::CommandStatus::rejected,
-          "play without prepared audio should be rejected");
-    const auto stopWithoutFile = dispatcher.dispatch(commands::Stop{});
-    check(stopWithoutFile.status == commands::CommandStatus::accepted &&
-              app.transport().position.value == 0,
-          "stop without audio should remain valid at zero");
+    for (int index = 1; index <= 4; ++index) {
+        check(dispatcher.dispatch(commands::AddAudioTrack{
+                  "Audio " + std::to_string(index)}).status ==
+                  commands::CommandStatus::accepted,
+              "adding an audio track should succeed");
+    }
+    check(app.project().tracks().size() == 4 &&
+              app.project().tracks()[0].id == tracks::TrackId{1} &&
+              app.project().tracks()[3].id == tracks::TrackId{4},
+          "track identities should be stable and monotonic");
+
+    const tracks::TrackId first{1};
+    const tracks::TrackId emptyBetween{2};
+    const tracks::TrackId third{3};
+    const tracks::TrackId fourth{4};
+
+    const auto invalid = dispatcher.dispatch(
+        commands::LoadAudioFile{"invalid.wav", tracks::TrackId{999}});
+    check(invalid.status == commands::CommandStatus::rejected &&
+              app.project().duration().value == 0 && audio.commitRequests == 0,
+          "an unknown track must fail before either side commits");
+
+    check(dispatcher.dispatch(commands::LoadAudioFile{"first.wav", first}).status ==
+              commands::CommandStatus::accepted,
+          "a valid WAV should load by stable track identity");
+    check(dispatcher.dispatch(commands::LoadAudioFile{"third.wav", third}).status ==
+              commands::CommandStatus::accepted,
+          "a track after an empty track should load independently");
+    check(!app.project().tracks()[1].hasAudio() &&
+              app.project().tracks()[2].hasAudio(),
+          "empty tracks between loaded tracks should remain coherent");
+
+    const auto destroyedBeforeReplacement = audio.resourceCounters.destroyed;
+    check(dispatcher.dispatch(commands::LoadAudioFile{
+              "first-replacement.wav", first}).status ==
+              commands::CommandStatus::accepted &&
+              audio.resourceCounters.destroyed == destroyedBeforeReplacement + 1 &&
+              audio.loaded(first)->file == "first-replacement.wav",
+          "replacement should destroy the old resource and preserve track identity");
+
+    check(dispatcher.dispatch(commands::LoadAudioFile{"fourth.wav", fourth}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().duration().value == 192000,
+          "global duration should be the maximum active track end");
 
     audio.rejectNextLoad = true;
-    const auto invalidSecond = dispatcher.dispatch(commands::LoadAudioFile{
-        "invalid.wav", tracks::AudioTrackSlot::second});
-    check(invalidSecond.status == commands::CommandStatus::rejected,
-          "invalid WAV on track two should be rejected");
-    check(!app.project().tracks()[0].hasAudio() &&
-              !app.project().tracks()[1].hasAudio(),
-          "failed load should not mutate either track");
+    check(dispatcher.dispatch(commands::LoadAudioFile{"broken.wav", third}).status ==
+              commands::CommandStatus::rejected &&
+              audio.loaded(third)->file == "third.wav" &&
+              !app.project().findTrack(emptyBetween)->hasAudio(),
+          "a failed load should preserve every existing resource and empty track");
 
-    const auto firstLoad = dispatcher.dispatch(commands::LoadAudioFile{
-        "first.wav", tracks::AudioTrackSlot::first});
-    check(firstLoad.status == commands::CommandStatus::accepted,
-          "valid WAV should load into track one");
-    check(app.project().tracks()[0].clip->sourceFile == "first.wav" &&
-              !app.project().tracks()[1].hasAudio(),
-          "one loaded track should leave the other coherent and empty");
-    check(app.transport().duration.value == 48000,
-          "single loaded track should define project duration");
-
-    const auto firstReplacement = dispatcher.dispatch(commands::LoadAudioFile{
-        "first-replacement.wav", tracks::AudioTrackSlot::first});
-    check(firstReplacement.status == commands::CommandStatus::accepted &&
-              audio.resourceCounters.destroyed == 1,
-          "successive load should destroy the old owned resource");
-    check(app.project().tracks()[0].clip->sourceFile == "first-replacement.wav",
-          "resource replacement should commit model and engine together");
-
-    const auto secondLoad = dispatcher.dispatch(commands::LoadAudioFile{
-        "second.wav", tracks::AudioTrackSlot::second});
-    check(secondLoad.status == commands::CommandStatus::accepted,
-          "valid WAV should load into track two");
-    check(app.project().tracks()[0].hasAudio() && app.project().tracks()[1].hasAudio(),
-          "both fixed tracks should contain one clip");
-    check(app.transport().duration.value == 96000,
-          "project duration should be the longest track");
-
-    audio.rejectNextLoad = true;
-    const auto failedReplacement = dispatcher.dispatch(commands::LoadAudioFile{
-        "broken.wav", tracks::AudioTrackSlot::second});
-    check(failedReplacement.status == commands::CommandStatus::rejected,
-          "invalid replacement should be rejected");
-    check(app.project().tracks()[0].clip->sourceFile == "first-replacement.wav" &&
-              app.project().tracks()[1].clip->sourceFile == "second.wav",
-          "invalid load in one track must preserve both valid resources");
-
-    const auto destroyedBeforeException = audio.resourceCounters.destroyed;
     audio.throwNextPreparation = true;
-    const auto exceptionalLoad = dispatcher.dispatch(commands::LoadAudioFile{
-        "throws.wav", tracks::AudioTrackSlot::first});
-    check(exceptionalLoad.status == commands::CommandStatus::rejected &&
-              audio.resourceCounters.destroyed == destroyedBeforeException &&
-              app.project().tracks()[0].clip->sourceFile ==
-                  "first-replacement.wav",
-          "recoverable preparation exception must preserve model and resource");
+    check(dispatcher.dispatch(commands::LoadAudioFile{"throws.wav", first}).status ==
+              commands::CommandStatus::rejected &&
+              audio.loaded(first)->file == "first-replacement.wav",
+          "a preparation exception should preserve the published project");
 
-    const auto commitsBeforeForcedFailure = audio.commitRequests;
-    const auto resourcesBeforeForcedFailure = audio.resourceCounters.destroyed;
-    const auto forcedModelFailure = dispatcher.dispatch(commands::LoadAudioFile{
-        "prepared-but-invalid-slot.wav",
-        static_cast<tracks::AudioTrackSlot>(tracks::audioTrackCount)});
-    check(forcedModelFailure.status == commands::CommandStatus::rejected &&
-              audio.commitRequests == commitsBeforeForcedFailure &&
-              audio.resourceCounters.destroyed == resourcesBeforeForcedFailure + 1,
-          "a staged ProjectState failure must discard preparation before publication");
-    check(app.project().tracks()[0].clip->sourceFile == "first-replacement.wav" &&
-              app.project().tracks()[1].clip->sourceFile == "second.wav" &&
-              audio.loadedFiles[0] == std::filesystem::path{"first-replacement.wav"} &&
-              audio.loadedFiles[1] == std::filesystem::path{"second.wav"},
-          "transaction failure must leave ProjectState and engine on old resources");
-
-    const auto firstPlay = dispatcher.dispatch(commands::Play{});
-    check(firstPlay.status == commands::CommandStatus::accepted &&
-              app.transport().playback == transport::PlaybackState::playing,
-          "play should start the global transport");
-    audio.publishProgress(48000, true);
+    check(dispatcher.dispatch(commands::Play{}).status ==
+              commands::CommandStatus::accepted,
+          "a variable project with prepared tracks should play");
+    audio.publishProgress(96000, true);
     app.synchroniseTransport();
-    check(app.transport().position.value == 48000 &&
-              app.transport().playback == transport::PlaybackState::playing,
-          "transport should continue when the shorter track ends");
+    check(app.transport().playback == transport::PlaybackState::playing,
+          "shorter tracks ending must not stop the global transport");
 
-    const auto stop = dispatcher.dispatch(commands::Stop{});
-    check(stop.status == commands::CommandStatus::accepted &&
+    check(dispatcher.dispatch(commands::Stop{}).status ==
+              commands::CommandStatus::accepted &&
               app.transport().position.value == 0,
-          "Stop should rewind the shared clock");
-    const auto secondPlay = dispatcher.dispatch(commands::Play{});
-    check(secondPlay.status == commands::CommandStatus::accepted,
-          "Play should restart both tracks after Stop");
+          "Stop should rewind the master clock");
+    check(dispatcher.dispatch(commands::Play{}).status ==
+              commands::CommandStatus::accepted,
+          "Play should restart after Stop");
 
-    audio.publishProgress(96000, false);
+    audio.publishProgress(192000, false);
     app.synchroniseTransport();
     check(app.transport().playback == transport::PlaybackState::stopped &&
               app.transport().position.value == app.transport().duration.value,
-          "global transport should stop at the longest resource end");
-
-    const auto replayAfterEnd = dispatcher.dispatch(commands::Play{});
-    check(replayAfterEnd.status == commands::CommandStatus::accepted,
-          "Play after project end should be accepted");
+          "all tracks ending should stop at the global duration");
+    check(dispatcher.dispatch(commands::Play{}).status ==
+              commands::CommandStatus::accepted,
+          "Play after global end should restart");
     app.synchroniseTransport();
     check(app.transport().position.value == 0,
-          "Play after project end should restart the shared clock at zero");
+          "replay should start the shared clock at zero");
 
     audio.acceptRequests = false;
-    const auto rejectedStop = dispatcher.dispatch(commands::Stop{});
-    check(rejectedStop.status == commands::CommandStatus::rejected &&
+    check(dispatcher.dispatch(commands::Stop{}).status ==
+              commands::CommandStatus::rejected &&
               app.transport().playback == transport::PlaybackState::playing,
-          "rejected RT command must not mutate application transport");
+          "a rejected RT command must not mutate application transport");
 
     const auto destroyedBeforeClose = audio.resourceCounters.destroyed;
     audio.close();
-    check(audio.resourceCounters.destroyed == destroyedBeforeClose + 2,
-          "closing should destroy every live resource");
+    check(audio.resourceCounters.destroyed == destroyedBeforeClose + 3,
+          "closing should destroy all live N-track resources");
 
     std::cout << "All command-flow tests passed\n";
     return EXIT_SUCCESS;

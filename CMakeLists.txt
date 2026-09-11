@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.0.9 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.1.0 LANGUAGES C CXX)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -101,9 +101,9 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_transport_state_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_transport_state_tests COMMAND vitadaw_transport_state_tests)
 
-    add_executable(vitadaw_two_track_playback_tests tests/TwoTrackPlaybackTests.cpp)
-    target_link_libraries(vitadaw_two_track_playback_tests PRIVATE vitadaw_core)
-    add_test(NAME vitadaw_two_track_playback_tests COMMAND vitadaw_two_track_playback_tests)
+    add_executable(vitadaw_n_track_playback_tests tests/NTrackPlaybackTests.cpp)
+    target_link_libraries(vitadaw_n_track_playback_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_n_track_playback_tests COMMAND vitadaw_n_track_playback_tests)
 
     add_executable(vitadaw_realtime_audio_engine_tests tests/RealtimeAudioEngineTests.cpp)
     target_link_libraries(vitadaw_realtime_audio_engine_tests PRIVATE vitadaw_core)

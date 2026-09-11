@@ -3,10 +3,9 @@
 #include "vitadaw/audio/CommandLifecycleGate.h"
 #include "vitadaw/audio/IRealtimeAudioProcessor.h"
 #include "vitadaw/audio/DeviceProcessingState.h"
+#include "vitadaw/audio/PreparedProject.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
 #include "vitadaw/audio/RealtimeTransportExchange.h"
-#include "vitadaw/audio/TwoTrackMixer.h"
-#include "vitadaw/tracks/AudioTrack.h"
 
 #include <array>
 #include <atomic>
@@ -15,22 +14,16 @@
 
 namespace vitadaw::audio {
 
-struct RealtimeProjectContext {
-    timeline::SampleRate projectSampleRate;
-    timeline::ProjectFrameCount duration;
-};
-
-// Portable two-track render used by both the JUCE callback and offline tests.
+// Portable N-track render used by both the JUCE callback and offline tests.
 // configure() and lifecycle transitions that mutate the clock are called only
 // while processBlock() is quiescent. Consumer confirmation may happen at RT
 // callback entry. Resources remain owned by the adapter and must outlive this
-// engine's track views.
+// engine's prepared project view.
 class RealtimeAudioEngine final {
 public:
     static constexpr std::size_t commandCapacity = 8;
 
-    void configure(RealtimeProjectContext context,
-                   std::array<PreparedTrackView, tracks::audioTrackCount> tracks) noexcept;
+    void configure(PreparedProjectView project) noexcept;
     // Lifecycle transitions may race with the application command producer.
     // Transitions away from operational are invoked only while render is
     // quiescent (JUCE serialises them against its callback).
@@ -66,8 +59,7 @@ private:
     void resolveCommandsThrough(AudioCommandSequence sequence) noexcept;
     [[nodiscard]] bool hasPreparedAudio() const noexcept;
 
-    RealtimeProjectContext context_;
-    std::array<PreparedTrackView, tracks::audioTrackCount> tracks_{};
+    PreparedProjectView project_;
     RealtimeProjectClock clock_;
     RealtimeTransportExchange transportExchange_;
     std::array<QueuedCommand, commandCapacity> commands_{};

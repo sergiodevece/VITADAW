@@ -31,7 +31,8 @@ al motor.
 - `commands`: mensajes de intención, resultados y despacho.
 - `audio`: contratos de control no-RT y procesamiento RT.
 - `transport`: estado lógico de reproducción y posición.
-- `tracks`: dos pistas fijas, cada una con un único clip opcional.
+- `tracks`: colección variable de pistas, cada una con identidad estable y un
+  único clip opcional en este incremento.
 - `clips`: referencia a un archivo y región colocada en el timeline.
 - `timeline`: unidades temporales fuertes y conversiones entre archivo,
   proyecto, dispositivo y segundos.
@@ -41,11 +42,10 @@ al motor.
 
 El modelo editable pertenece al hilo de aplicación/UI. El callback de audio no
 lee esas estructuras mutables. Cada WAV se decodifica completamente fuera de RT;
-el adaptador detiene el callback antes de sustituir el recurso preparado de una
-pista y conserva intacto el recurso de la otra.
+el adaptador detiene el callback antes de publicar una topología preparada.
 
 `RealtimeAudioEngine` es la frontera real de procesamiento portable. Posee el
-reloj maestro, la cola SPSC, el render fijo de dos pistas, la suma estéreo y el
+reloj maestro, la cola SPSC, el render N-track, la acumulación estéreo y el
 intercambio de transporte. Su `processBlock` recibe vistas de salida y el sample
 rate del dispositivo, y es exactamente el método invocado por JUCE y por los
 tests offline. El adaptador JUCE conserva dispositivo, filesystem, decodificación
@@ -196,12 +196,27 @@ hilo de aplicación converge así a `Stopped` en el final. Esta política distin
 el final natural de `Stop`, que conserva su semántica de `Stopped` en cero. Un
 Play posterior al final reinicia el reloj en cero.
 
-## Reproducción de dos pistas 0.0.6
+## Motor N-track 0.1.0
 
-El proyecto crea exactamente dos `AudioTrack`, cada una con un único
-`optional<AudioClip>`. `LoadAudioFile` incluye un `AudioTrackSlot` portable y la
-misma posición se usa para seleccionar el recurso del adaptador. No se admite un
-tercer slot ni múltiples clips por pista.
+`ProjectState` conserva un `vector<AudioTrack>` editable solo desde aplicación.
+Cada pista recibe un `TrackId` monotónico de 64 bits que no depende de su índice;
+`LoadAudioFile` dirige la carga mediante esa identidad. Una pista mantiene como
+máximo un `optional<AudioClip>`. No se admiten todavía múltiples clips ni
+operaciones de edición.
+
+El adaptador posee un `PreparedProject` inmutable durante el render. Contiene
+ownership compartido de los buffers decodificados y un vector estable de
+`PreparedTrackView`. Cada vista incluye identidad, canales, frames fuente,
+sample rate fuente, inicio y duración del clip y offset fuente. El motor recibe
+solo un `PreparedProjectView`: sample rate de proyecto, duración global y un
+`span<const PreparedTrackView>`. No recorre `ProjectState` ni posee la colección.
+
+La topología candidata se construye completamente fuera de RT. Para una carga,
+se copian los owners de los recursos vigentes, se sustituye o añade el recurso
+dirigido por `TrackId`, y se reconstruyen vistas y duración. Con el callback
+quiescente, el commit intercambia el owner del proyecto preparado, configura el
+span y ejecuta el commit `noexcept` de `ProjectState`. No hay `push_back`, resize,
+destrucción de recursos ni otra mutación estructural dentro del callback.
 
 `RealtimeProjectClock` es el único estado temporal que avanza en el motor.
 En cada frame de dispositivo produce una posición precisa en frames de proyecto:
@@ -209,32 +224,33 @@ En cada frame de dispositivo produce una posición precisa en frames de proyecto
 ```text
 device frame
     -> RealtimeProjectClock (project frames)
-        -> track 1 source position = project position × rate1 / project rate
-        -> track 2 source position = project position × rate2 / project rate
+        -> for each prepared track
+            source position = source offset
+                            + (project position - clip start)
+                            × source rate / project rate
 ```
 
-No existe un acumulador o cursor por pista. Incluso después de una secuencia
-larga, ambas posiciones se recalculan desde el mismo número, por lo que no pueden
-derivar entre sí. El reloj usa suma compensada cuando proyecto y dispositivo no
-comparten sample rate. La duración global es el máximo de las dos duraciones en
-frames de proyecto. `RealtimeProjectContext` es la única autoridad RT para
-sample rate y duración global; cada recurso conserva solo sample rate, canales,
-frames y punteros fuente.
+No existe un cursor por pista. Todas las posiciones se recalculan desde la misma
+posición global, por lo que el número de pistas no introduce deriva relativa. El
+reloj conserva suma compensada si dispositivo y proyecto difieren de sample
+rate. La duración global es el máximo `clip start + clip duration` de todas las
+pistas preparadas.
 
-`TwoTrackMixer` realiza lectura lineal provisional en la posición derivada. Una
-pista que ya terminó devuelve cero; la otra continúa hasta su propio final. La
-mezcla estéreo es `0.5 × track1 + 0.5 × track2`. La ganancia fija de `0.5`
-(-6,02 dB) por pista evita superar la unidad al sumar dos fuentes normalizadas.
-No hay clipping, faders, pan, mute, solo, buses ni estado de mixer.
+`TrackRenderer` convierte la posición común y produce una contribución estéreo
+por pista mediante interpolación lineal. Una pista fuera de su rango devuelve
+silencio. `StereoAccumulator` suma cada contribución con ganancia provisional
+fija `0.125` (-18,06 dB). La ganancia no depende del número de pistas cargadas:
+reserva margen para ocho señales normalizadas, pero no sustituye el futuro gain
+staging y no aplica limitador ni clipping no lineal.
 
 Una carga válida se construye y decodifica por completo antes de desconectar
 brevemente el callback. `DawApplication` prepara antes el `AudioClip`, su
 `filesystem::path` y el mensaje de resultado; cualquier excepción conserva
 intacto el estado anterior. Con el render ya quiescente, el adaptador intercambia
-el recurso del slot, configura las vistas RT y ejecuta la acción de modelo
+el proyecto preparado, configura las vistas RT y ejecuta la acción de modelo
 `noexcept`. Ese es el único punto de commit. Solo entonces vuelve a registrar el
-callback. El recurso anterior queda temporalmente en el objeto preparado y se
-destruye en el hilo de aplicación una vez que RT ya no lo referencia.
+callback. El proyecto anterior queda temporalmente en el objeto preparado y sus
+recursos sustituidos se destruyen en aplicación cuando RT ya no los referencia.
 
 La garantía de lifetime depende de la misma serialización que usa producción:
 `AudioDeviceManager::removeAudioCallback` espera el bloqueo interno que protege
@@ -249,10 +265,10 @@ Rutas, apertura, creación del reader, decodificación, buffers y metadatos est�
 dentro de la frontera de excepciones de preparación. `std::bad_alloc`,
 `std::exception` y excepciones desconocidas se convierten en resultados de error
 fuera de RT; `DawApplication` contiene además la misma frontera defensiva. Una
-carga fallida no publica nada: el clip y recurso válidos de ambas pistas
-permanecen intactos.
+carga fallida no publica nada: todos los clips y recursos válidos permanecen
+intactos.
 Solo se aceptan uno o dos canales. Se validan sample rates finitos y positivos,
-longitud, productos de tamaño, slots, muestras float finitas y un presupuesto
+longitud, productos de tamaño, identidades, muestras float finitas y un presupuesto
 provisional de preparación de 512 MiB. El presupuesto incluye buffers ya
 publicados y el candidato, limitando también el pico durante una sustitución.
 
@@ -272,8 +288,11 @@ publicados y el candidato, limitando también el pico durante una sustitución.
   el reloj conserva precisión fraccional.
 - WAV float con muestras fuera de `[-1, 1]` puede superar el margen previsto. No
   se introduce todavía limitador ni clipping no lineal.
+- El render actual es escalar y recorre todas las pistas por frame. Valida la
+  arquitectura hasta decenas de pistas, pero no constituye una garantía de
+  rendimiento profesional.
 
-## Evolución hasta 0.1
+## Evolución hasta 0.1.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -294,6 +313,9 @@ publicados y el candidato, limitando también el pico durante una sustitución.
    demostrar la destrucción real de recursos después de que RT quede quiescente.
    Los smoke tests en otros backends y plataformas continúan siendo trabajo
    futuro.
+10. **Completado en 0.1.0:** sustituir la topología fija de dos pistas por una
+    colección preparada N-track con identidad estable, render por pista y
+    acumulación desde un único reloj.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

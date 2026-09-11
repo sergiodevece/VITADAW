@@ -17,11 +17,18 @@ void check(bool condition, std::string_view message) {
     }
 }
 
-vitadaw::audio::PreparedTrackView mono(const std::vector<float>& samples,
-                                       double rate) {
-    return {{{samples.data(), nullptr}}, 1,
+vitadaw::audio::PreparedTrackView mono(vitadaw::tracks::TrackId id,
+                                       const std::vector<float>& samples,
+                                       double sourceRate,
+                                       double projectRate) {
+    return {id, {{samples.data(), nullptr}}, 1,
             {static_cast<std::uint64_t>(samples.size())},
-            vitadaw::timeline::SampleRate{rate}};
+            vitadaw::timeline::SampleRate{sourceRate}, {0},
+            vitadaw::timeline::sourceFramesToProjectDuration(
+                {static_cast<std::uint64_t>(samples.size())},
+                vitadaw::timeline::SampleRate{sourceRate},
+                vitadaw::timeline::SampleRate{projectRate}),
+            {0}};
 }
 
 void render(vitadaw::audio::RealtimeAudioEngine& engine,
@@ -51,8 +58,8 @@ void testShortResource(std::size_t sourceFrames, double sourceRate,
         {static_cast<std::uint64_t>(sourceFrames)},
         timeline::SampleRate{sourceRate}, timeline::SampleRate{projectRate});
     audio::RealtimeAudioEngine engine;
-    engine.configure({timeline::SampleRate{projectRate}, duration},
-                     {mono(signal, sourceRate), {}});
+    const std::array tracks{mono({1}, signal, sourceRate, projectRate)};
+    engine.configure({timeline::SampleRate{projectRate}, duration, tracks});
     enterOperational(engine, projectRate);
     check(engine.tryRequestPlay().accepted, "short resource should accept Play");
 
@@ -61,7 +68,7 @@ void testShortResource(std::size_t sourceFrames, double sourceRate,
     render(engine, left, right, projectRate);
     for (std::size_t frame = 0; frame < outputFrames; ++frame) {
         const auto expected = frame < static_cast<std::size_t>(duration.value)
-                                  ? 0.5F
+                                  ? 0.125F
                                   : 0.0F;
         check(std::abs(left[frame] - expected) < 1.0e-6F,
               "short resource should render only through its exclusive end");
@@ -75,10 +82,17 @@ void testShortResource(std::size_t sourceFrames, double sourceRate,
 int main() {
     using namespace vitadaw;
 
+    audio::RealtimeAudioEngine emptyEngine;
+    const std::vector<audio::PreparedTrackView> noTracks;
+    emptyEngine.configure({timeline::SampleRate{48000.0}, {0}, noTracks});
+    enterOperational(emptyEngine, 48000.0);
+    check(!emptyEngine.tryRequestPlay().accepted,
+          "zero prepared tracks must reject Play coherently");
+
     const std::vector<float> one(4, 1.0F);
     audio::RealtimeAudioEngine engine;
-    engine.configure({timeline::SampleRate{4.0}, {4}},
-                     {mono(one, 4.0), {}});
+    const std::array oneTrack{mono({1}, one, 4.0, 4.0)};
+    engine.configure({timeline::SampleRate{4.0}, {4}, oneTrack});
     check(engine.deviceState() == audio::DeviceProcessingState::unavailable,
           "configured engine should not imply a live device");
     engine.deviceInitialising();
@@ -88,7 +102,7 @@ int main() {
     check(engine.tryRequestPlay().accepted, "one prepared track should play");
     std::vector<float> left(5, -1.0F), right(5, -1.0F);
     render(engine, left, right, 3.0);
-    check(left[0] == 0.5F && left[1] == 0.5F && left[2] == 0.5F &&
+    check(left[0] == 0.125F && left[1] == 0.125F && left[2] == 0.125F &&
               left[3] == 0.0F && left[4] == 0.0F,
           "natural end inside a block should leave the remaining output silent");
     auto ended = engine.transportSnapshot();
@@ -99,11 +113,11 @@ int main() {
           "Play after natural end should be accepted");
     std::vector<float> variableA(1), variableB(1);
     render(engine, variableA, variableB, 4.0);
-    check(variableA[0] == 0.5F && engine.transportSnapshot().position.value == 1,
+    check(variableA[0] == 0.125F && engine.transportSnapshot().position.value == 1,
           "first variable block should render from zero");
     std::vector<float> variableC(2), variableD(2);
     render(engine, variableC, variableD, 4.0);
-    check(variableC[0] == 0.5F && variableC[1] == 0.5F &&
+    check(variableC[0] == 0.125F && variableC[1] == 0.125F &&
               engine.transportSnapshot().position.value == 3,
           "variable block sizes should share one continuous clock");
     check(engine.tryRequestStop().accepted, "Stop should enqueue");
@@ -113,20 +127,21 @@ int main() {
 
     const std::vector<float> half(2, 0.5F);
     engine.deviceUnavailable();
-    engine.configure({timeline::SampleRate{4.0}, {4}},
-                     {mono(one, 4.0), mono(half, 2.0)});
+    const std::array twoTracks{mono({1}, one, 4.0, 4.0),
+                               mono({2}, half, 2.0, 4.0)};
+    engine.configure({timeline::SampleRate{4.0}, {4}, twoTracks});
     enterOperational(engine, 4.0);
     check(engine.tryRequestPlay().accepted, "two tracks should play");
     std::vector<float> mixedLeft(4), mixedRight(4);
     render(engine, mixedLeft, mixedRight, 4.0);
-    check(std::abs(mixedLeft[0] - 0.75F) < 1.0e-6F &&
-              std::abs(mixedLeft[3] - 0.75F) < 1.0e-6F,
+    check(std::abs(mixedLeft[0] - 0.1875F) < 1.0e-6F &&
+              std::abs(mixedLeft[3] - 0.1875F) < 1.0e-6F,
           "same production processBlock should mix two rates offline");
 
     const std::vector<float> longSignal(100, 0.2F);
     engine.deviceUnavailable();
-    engine.configure({timeline::SampleRate{100.0}, {100}},
-                     {mono(longSignal, 100.0), {}});
+    const std::array longTrack{mono({1}, longSignal, 100.0, 100.0)};
+    engine.configure({timeline::SampleRate{100.0}, {100}, longTrack});
     enterOperational(engine, 100.0);
 
     const auto orderedPlay = engine.tryRequestPlay();
@@ -218,21 +233,21 @@ int main() {
 
     const std::vector<float> replacement(4, 0.2F);
     engine.deviceUnavailable();
-    engine.configure({timeline::SampleRate{4.0}, {4}},
-                     {mono(replacement, 4.0), {}});
+    const std::array replacementTrack{mono({1}, replacement, 4.0, 4.0)};
+    engine.configure({timeline::SampleRate{4.0}, {4}, replacementTrack});
     enterOperational(engine, 4.0);
     check(engine.tryRequestPlay().accepted, "replacement resource should play");
     std::vector<float> replacementOut(1), replacementRight(1);
     render(engine, replacementOut, replacementRight, 4.0);
-    check(std::abs(replacementOut[0] - 0.1F) < 1.0e-6F,
+    check(std::abs(replacementOut[0] - 0.025F) < 1.0e-6F,
           "repeated quiescent resource replacement should publish the new view");
 
     // Producer/lifecycle race: either Play is rejected during the transition,
     // or it was accepted first and the transition's cancellation watermark
     // resolves it. No accepted sequence may remain pending indefinitely.
     audio::RealtimeAudioEngine racingEngine;
-    racingEngine.configure({timeline::SampleRate{100.0}, {100}},
-                           {mono(longSignal, 100.0), {}});
+    const std::array racingTrack{mono({1}, longSignal, 100.0, 100.0)};
+    racingEngine.configure({timeline::SampleRate{100.0}, {100}, racingTrack});
     for (int iteration = 0; iteration < 100; ++iteration) {
         enterOperational(racingEngine, 100.0);
         std::atomic<bool> go{};

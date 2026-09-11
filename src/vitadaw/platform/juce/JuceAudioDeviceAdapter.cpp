@@ -19,18 +19,29 @@ struct JuceAudioDeviceAdapter::PreparedAudio {
     timeline::SampleRate sourceSampleRate;
 };
 
+struct JuceAudioDeviceAdapter::PreparedProject {
+    struct TrackResource {
+        tracks::TrackId id;
+        std::shared_ptr<const PreparedAudio> audio;
+    };
+
+    std::vector<TrackResource> resources;
+    std::vector<audio::PreparedTrackView> views;
+    timeline::ProjectFrameCount duration;
+};
+
 struct JuceAudioDeviceAdapter::PreparedJuceAudioFile final
     : audio::PreparedAudioFile {
     PreparedJuceAudioFile(audio::AudioFileMetadata metadata,
-                          tracks::AudioTrackSlot destination,
+                          tracks::TrackId destination,
                           timeline::SampleRate projectRate,
-                          std::unique_ptr<PreparedAudio> resource) noexcept
+                          std::unique_ptr<PreparedProject> project) noexcept
         : audio::PreparedAudioFile(metadata), track(destination),
-          projectSampleRate(projectRate), audioResource(std::move(resource)) {}
+          projectSampleRate(projectRate), preparedProject(std::move(project)) {}
 
-    tracks::AudioTrackSlot track;
+    tracks::TrackId track;
     timeline::SampleRate projectSampleRate;
-    std::unique_ptr<PreparedAudio> audioResource;
+    std::unique_ptr<PreparedProject> preparedProject;
 };
 
 JuceAudioDeviceAdapter::JuceAudioDeviceAdapter() = default;
@@ -83,12 +94,11 @@ void JuceAudioDeviceAdapter::setStateChangedCallback(StateChangedCallback callba
 }
 
 audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
-    const std::filesystem::path& filePath, tracks::AudioTrackSlot track,
+    const std::filesystem::path& filePath, tracks::TrackId track,
     timeline::SampleRate projectSampleRate) {
     try {
-        const auto trackIndex = tracks::toIndex(track);
-        if (trackIndex >= preparedTracks_.size()) {
-            return {nullptr, "Invalid audio track slot"};
+        if (!track.isValid()) {
+            return {nullptr, "Invalid audio track identity"};
         }
         if (!projectSampleRate.isValid()) {
             return {nullptr, "Project sample rate must be finite and positive"};
@@ -135,7 +145,7 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
             return {nullptr, "WAV has invalid sample rate, channels, or length"};
         }
 
-        auto prepared = std::make_unique<PreparedAudio>();
+        auto prepared = std::make_shared<PreparedAudio>();
         prepared->sourceSampleRate = timeline::SampleRate{reader->sampleRate};
         prepared->samples.setSize(static_cast<int>(channelCount),
                                   static_cast<int>(frameCount), false, true, false);
@@ -158,8 +168,46 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
             prepared->sourceSampleRate, static_cast<std::uint32_t>(channelCount),
             {frameCount}, {static_cast<double>(frameCount) / reader->sampleRate}};
 
+        auto candidateProject = std::make_unique<PreparedProject>();
+        if (preparedProject_ != nullptr) {
+            candidateProject->resources = preparedProject_->resources;
+        }
+        const auto existing = std::find_if(
+            candidateProject->resources.begin(), candidateProject->resources.end(),
+            [track](const auto& resource) { return resource.id == track; });
+        if (existing == candidateProject->resources.end()) {
+            candidateProject->resources.push_back({track, std::move(prepared)});
+        } else {
+            existing->audio = std::move(prepared);
+        }
+
+        candidateProject->views.reserve(candidateProject->resources.size());
+        for (const auto& resource : candidateProject->resources) {
+            const auto& source = *resource.audio;
+            audio::PreparedTrackView view;
+            view.id = resource.id;
+            view.channelCount = static_cast<std::uint32_t>(
+                source.samples.getNumChannels());
+            view.frameCount = {static_cast<std::uint64_t>(
+                source.samples.getNumSamples())};
+            view.sourceSampleRate = source.sourceSampleRate;
+            view.clipStart = {0};
+            view.clipDuration = timeline::sourceFramesToProjectDuration(
+                view.frameCount, view.sourceSampleRate, projectSampleRate);
+            view.sourceOffset = {0};
+            for (std::size_t channel = 0; channel < view.channelCount; ++channel) {
+                view.channels[channel] =
+                    source.samples.getReadPointer(static_cast<int>(channel));
+            }
+            candidateProject->duration.value = std::max(
+                candidateProject->duration.value,
+                view.clipStart.value + view.clipDuration.value);
+            candidateProject->views.push_back(view);
+        }
+
         return {std::make_unique<PreparedJuceAudioFile>(
-                    metadata, track, projectSampleRate, std::move(prepared)),
+                    metadata, track, projectSampleRate,
+                    std::move(candidateProject)),
                 {}};
     } catch (const std::bad_alloc&) {
         return {nullptr, "Not enough memory to prepare WAV"};
@@ -175,8 +223,7 @@ bool JuceAudioDeviceAdapter::commitPreparedWav(
     audio::AudioFileCommitAction modelCommit) noexcept {
     auto* candidate = dynamic_cast<PreparedJuceAudioFile*>(prepared.get());
     if (candidate == nullptr || !modelCommit.isValid() ||
-        tracks::toIndex(candidate->track) >= preparedTracks_.size() ||
-        candidate->audioResource == nullptr) {
+        !candidate->track.isValid() || candidate->preparedProject == nullptr) {
         return false;
     }
 
@@ -186,13 +233,12 @@ bool JuceAudioDeviceAdapter::commitPreparedWav(
     // Commit point: from here to modelCommit.execute() every operation is a
     // no-throw scalar assignment, pointer swap or portable no-throw configure.
     // The callback stays quiescent until both engine and ProjectState are new.
-    const auto trackIndex = tracks::toIndex(candidate->track);
-    preparedTracks_[trackIndex].swap(candidate->audioResource);
+    preparedProject_.swap(candidate->preparedProject);
     projectSampleRate_ = candidate->projectSampleRate;
     configureRealtimeEngine();
     modelCommit.execute();
 
-    // candidate now owns the previous buffer. Its destruction happens on this
+    // candidate now owns the previous project. Its destruction happens on this
     // application thread after the engine no longer exposes that view.
     if (callbackWasRegistered) {
         try {
@@ -270,7 +316,7 @@ void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
     suppressLifecycleNotification_.store(false, std::memory_order_release);
     realtimeEngine_.deviceUnavailable();
     if (publishClosedState) {
-        preparedTracks_ = {};
+        preparedProject_.reset();
         projectSampleRate_ = {};
         configureRealtimeEngine();
         stateModel_.markClosed();
@@ -330,45 +376,25 @@ void JuceAudioDeviceAdapter::attachAudioCallback() {
 }
 
 void JuceAudioDeviceAdapter::configureRealtimeEngine() noexcept {
-    std::array<audio::PreparedTrackView, tracks::audioTrackCount> views{};
-    for (std::size_t index = 0; index < preparedTracks_.size(); ++index) {
-        const auto* prepared = preparedTracks_[index].get();
-        if (prepared == nullptr) {
-            continue;
-        }
-        auto& view = views[index];
-        view.channelCount = static_cast<std::uint32_t>(prepared->samples.getNumChannels());
-        view.frameCount = {static_cast<std::uint64_t>(prepared->samples.getNumSamples())};
-        view.sourceSampleRate = prepared->sourceSampleRate;
-        for (std::size_t channel = 0; channel < view.channelCount; ++channel) {
-            view.channels[channel] =
-                prepared->samples.getReadPointer(static_cast<int>(channel));
-        }
-    }
-    realtimeEngine_.configure({projectSampleRate_, preparedDuration()}, views);
-}
-
-timeline::ProjectFrameCount JuceAudioDeviceAdapter::preparedDuration() const noexcept {
-    timeline::ProjectFrameCount duration;
-    for (const auto& track : preparedTracks_) {
-        if (track != nullptr) {
-            duration.value = std::max(
-                duration.value,
-                timeline::sourceFramesToProjectDuration(
-                    {static_cast<std::uint64_t>(track->samples.getNumSamples())},
-                    track->sourceSampleRate, projectSampleRate_).value);
-        }
-    }
-    return duration;
+    const auto views = preparedProject_ == nullptr
+                           ? std::span<const audio::PreparedTrackView>{}
+                           : std::span<const audio::PreparedTrackView>{
+                                 preparedProject_->views};
+    const auto duration = preparedProject_ == nullptr
+                              ? timeline::ProjectFrameCount{}
+                              : preparedProject_->duration;
+    realtimeEngine_.configure({projectSampleRate_, duration, views});
 }
 
 std::size_t JuceAudioDeviceAdapter::preparedBytes() const noexcept {
     std::size_t bytes{};
-    for (const auto& track : preparedTracks_) {
-        if (track != nullptr) {
-            bytes += static_cast<std::size_t>(track->samples.getNumChannels()) *
-                     static_cast<std::size_t>(track->samples.getNumSamples()) * sizeof(float);
-        }
+    if (preparedProject_ == nullptr) {
+        return bytes;
+    }
+    for (const auto& track : preparedProject_->resources) {
+        bytes += static_cast<std::size_t>(track.audio->samples.getNumChannels()) *
+                 static_cast<std::size_t>(track.audio->samples.getNumSamples()) *
+                 sizeof(float);
     }
     return bytes;
 }

@@ -1,16 +1,14 @@
 #include "vitadaw/audio/RealtimeAudioEngine.h"
+#include "vitadaw/audio/StereoAccumulator.h"
 
 #include <algorithm>
 
 namespace vitadaw::audio {
 
-void RealtimeAudioEngine::configure(
-    RealtimeProjectContext context,
-    std::array<PreparedTrackView, tracks::audioTrackCount> tracks) noexcept {
+void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     deviceUnavailable();
-    context_ = context;
-    tracks_ = tracks;
-    clock_.prepare(context_.duration);
+    project_ = project;
+    clock_.prepare(project_.duration);
     publishTransport();
 }
 
@@ -83,20 +81,25 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
 
     consumeCommands();
     if (deviceState() != DeviceProcessingState::operational ||
-        !clock_.isPlaying() || !context_.projectSampleRate.isValid() ||
+        !clock_.isPlaying() || !project_.projectSampleRate.isValid() ||
         !deviceSampleRate.isValid()) {
         publishTransport();
         return;
     }
 
     const auto projectFramesPerDeviceFrame = timeline::projectFramesForDeviceFrames(
-        {1}, context_.projectSampleRate, deviceSampleRate);
+        {1}, project_.projectSampleRate, deviceSampleRate);
     for (std::size_t frame = 0; frame < output.frameCount; ++frame) {
         if (!clock_.isPlaying()) {
             break;
         }
-        const auto mixed = mixTwoTracksAtProjectPosition(
-            tracks_, clock_.position(), context_.projectSampleRate);
+        StereoSample mixed;
+        for (const auto& track : project_.tracks) {
+            accumulateTrackContribution(
+                mixed, renderTrackAtProjectPosition(
+                           track, clock_.position(),
+                           project_.projectSampleRate));
+        }
         if (output.channels != nullptr && output.channelCount > 0 &&
             output.channels[0] != nullptr) {
             output.channels[0][frame] = mixed.left;
@@ -175,7 +178,7 @@ void RealtimeAudioEngine::resolveCommandsThrough(
 }
 
 bool RealtimeAudioEngine::hasPreparedAudio() const noexcept {
-    return std::any_of(tracks_.begin(), tracks_.end(),
+    return std::any_of(project_.tracks.begin(), project_.tracks.end(),
                        [](const auto& track) { return track.isAvailable(); });
 }
 

@@ -61,7 +61,7 @@ public:
     // by the realtime thread.
     [[nodiscard]] virtual AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file,
-        tracks::AudioTrackSlot track,
+        tracks::TrackId track,
         timeline::SampleRate projectSampleRate) = 0;
     [[nodiscard]] virtual bool commitPreparedWav(
         PreparedAudioFilePtr prepared,

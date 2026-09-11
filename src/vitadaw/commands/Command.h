@@ -14,7 +14,7 @@ struct AddAudioTrack {
 
 struct LoadAudioFile {
     std::filesystem::path file;
-    tracks::AudioTrackSlot track{tracks::AudioTrackSlot::first};
+    tracks::TrackId track;
 };
 
 struct Play {};

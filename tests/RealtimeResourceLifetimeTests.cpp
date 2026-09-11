@@ -45,9 +45,10 @@ void check(bool condition, std::string_view message) {
 }
 
 vitadaw::audio::PreparedTrackView view(const InstrumentedResource& resource) {
-    return {{{resource.samples.data(), nullptr}}, 1,
+    return {{1}, {{resource.samples.data(), nullptr}}, 1,
             {static_cast<std::uint64_t>(resource.samples.size())},
-            vitadaw::timeline::SampleRate{100.0}};
+            vitadaw::timeline::SampleRate{100.0}, {0},
+            {static_cast<std::int64_t>(resource.samples.size())}, {0}};
 }
 
 void makeOperational(vitadaw::audio::RealtimeAudioEngine& engine) {
@@ -68,8 +69,8 @@ int main() {
     LifetimeProbe oldProbe;
     auto oldResource = std::make_unique<InstrumentedResource>(0.8F, oldProbe);
     oldResource->published = true;
-    engine.configure({timeline::SampleRate{100.0}, {8}},
-                     {view(*oldResource), {}});
+    const std::array oldViews{view(*oldResource)};
+    engine.configure({timeline::SampleRate{100.0}, {8}, oldViews});
     makeOperational(engine);
     check(engine.tryRequestPlay().accepted,
           "old resource should be playing before replacement");
@@ -78,6 +79,7 @@ int main() {
     auto replacement =
         std::make_unique<InstrumentedResource>(0.4F, replacementProbe);
     replacement->published = true;
+    const std::array replacementViews{view(*replacement)};
     std::binary_semaphore oldCallbackEntered{0};
     std::binary_semaphore finishOldCallback{0};
     std::array<float, 1> oldLeft{}, oldRight{};
@@ -95,8 +97,7 @@ int main() {
     oldCallbackEntered.acquire();
     std::thread replaceOnApplicationThread([&] {
         const std::lock_guard callbackLock{callbackSerialization};
-        engine.configure({timeline::SampleRate{100.0}, {8}},
-                         {view(*replacement), {}});
+        engine.configure({timeline::SampleRate{100.0}, {8}, replacementViews});
         oldResource.reset();
     });
     check(oldProbe.destructions.load(std::memory_order_acquire) == 0,
@@ -104,7 +105,7 @@ int main() {
     finishOldCallback.release();
     realtimeUse.join();
     replaceOnApplicationThread.join();
-    check(std::abs(oldLeft[0] - 0.4F) < 1.0e-6F &&
+    check(std::abs(oldLeft[0] - 0.1F) < 1.0e-6F &&
               oldProbe.destructions.load(std::memory_order_acquire) == 1 &&
               oldProbe.destructionsWhileRealtimeActive.load(
                   std::memory_order_acquire) == 0,
@@ -126,7 +127,7 @@ int main() {
         replacementLeft.data(), replacementRight.data()};
     engine.processBlock({replacementChannels.data(), replacementChannels.size(), 1},
                         timeline::SampleRate{100.0});
-    check(std::abs(replacementLeft[0] - 0.2F) < 1.0e-6F,
+    check(std::abs(replacementLeft[0] - 0.05F) < 1.0e-6F,
           "failed load must preserve the currently published resource");
 
     std::binary_semaphore closeCallbackEntered{0};
@@ -147,7 +148,7 @@ int main() {
     closeCallbackEntered.acquire();
     std::thread closeOnApplicationThread([&] {
         const std::lock_guard callbackLock{callbackSerialization};
-        engine.configure({{}, {}}, {});
+        engine.configure({{}, {}, {}});
         replacement.reset();
     });
     check(replacementProbe.destructions.load(std::memory_order_acquire) == 0,

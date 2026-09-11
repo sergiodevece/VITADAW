@@ -1,11 +1,10 @@
-# VitaDAW 0.0.9 — Concurrency Closure
+# VitaDAW 0.1.0 — N-Track Audio Engine
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
-el dispositivo de audio y carga y reproduce dos archivos WAV en exactamente dos
-pistas sincronizadas. El incremento 0.0.9 cierra formalmente la carrera entre
-aceptación de comandos y lifecycle, y demuestra la liberación segura de recursos
-después del último uso posible desde RT.
+el dispositivo de audio y carga y reproduce una colección variable de pistas WAV
+sincronizadas. El incremento 0.1.0 sustituye la topología fija de dos pistas por
+un motor N-track portable con un único reloj maestro.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -87,26 +86,30 @@ linearización; el índice de cola se publica después. El cierre de lifecycle
 compite sobre el mismo gate: si queda después de la aceptación, su watermark
 incluye la secuencia; si queda antes, el CAS de aceptación falla.
 
-`Load Track 1 WAV` y `Load Track 2 WAV` aceptan únicamente archivos `.wav` que
-`juce::WavAudioFormat` pueda decodificar. `Play` reproduce simultáneamente todas
-las pistas disponibles y `Stop` detiene y vuelve al inicio. Si ninguna pista
+Los cuatro botones provisionales de carga aceptan únicamente archivos `.wav`
+que `juce::WavAudioFormat` pueda decodificar. La interfaz crea cuatro pistas al
+arrancar para el smoke test; el dominio y el motor admiten una colección
+variable. `Play` reproduce simultáneamente todas las pistas disponibles y
+`Stop` detiene y vuelve al inicio. Si ninguna pista
 tiene un WAV válido preparado, `Play` se rechaza explícitamente.
 
-Las pistas no tienen relojes propios. Un único reloj de frames de proyecto
-determina en cada muestra la posición fuente de cada WAV, incluyendo cuando sus
-sample rates difieren. La salida estéreo usa provisionalmente
-`0.5 × pista 1 + 0.5 × pista 2`; esta atenuación fija reserva margen para sumar
-dos señales normalizadas sin introducir faders ni un mixer completo.
+Las pistas tienen un `TrackId` monotónico independiente de su posición en el
+vector y no tienen relojes propios. Un único reloj de frames de proyecto
+determina en cada muestra la posición fuente de cada WAV, incluyendo sample
+rates distintos y un futuro inicio de clip desplazado. Cada contribución se suma
+a estéreo con una ganancia provisional fija de `0.125`, independiente del número
+de pistas cargadas.
 
 La ventana muestra también, de forma provisional, el estado, posición, duración
 y sample rate lógico del proyecto. Al llegar al final natural, el transporte
 queda en `Stopped` y conserva la posición en el final; `Stop` explícito continúa
 rebobinando a cero.
 
-`RealtimeAudioEngine::processBlock` contiene ahora el reloj, la cola de comandos,
-el render de las dos pistas, la mezcla y la publicación del transporte. No
-depende de JUCE. `JuceAudioDeviceAdapter` conserva la adaptación del dispositivo,
-la decodificación WAV y el ownership de los buffers preparados.
+`RealtimeAudioEngine::processBlock` contiene el reloj, la cola de comandos, el
+recorrido del proyecto preparado, el render por pista, la acumulación y la
+publicación del transporte. No depende de JUCE. `JuceAudioDeviceAdapter`
+conserva la adaptación del dispositivo, la decodificación WAV y el ownership de
+los buffers y de la topología preparada.
 
 La carga tiene dos fases. `prepareWav` realiza y captura fuera de RT cualquier
 operación que puede fallar; `ProjectState` prepara también el nuevo clip y el
@@ -114,6 +117,11 @@ mensaje. El commit detiene el callback, intercambia el recurso, ejecuta el
 commit portable del modelo —solo swaps y asignaciones `noexcept`— y después
 reconecta el callback. El estado final contiene el recurso nuevo en ambos lados
 o conserva el anterior en ambos.
+
+La topología RT es un `span` inmutable sobre vistas construidas fuera del
+callback. Cargar o sustituir un WAV prepara primero una copia completa del
+proyecto RT; el commit intercambia su owner sin reservar memoria mientras el
+render está activo. La duración global es el máximo final de todos los clips.
 
 La preparación admite WAV mono o estéreo y rechaza sample rates o muestras no
 finitos, tamaños con overflow y preparaciones que superarían un presupuesto
@@ -135,6 +143,8 @@ La arquitectura y las reglas de tiempo real se describen en
   consumidor, cancelación concurrente y carga WAV transaccional.
 - **0.0.9 — Concurrency Closure:** admisión linealizable de comandos y lifetime
   de recursos verificado frente a regiones RT activas.
+- **0.1.0 — N-Track Audio Engine:** colección variable con identidad estable,
+  proyecto preparado RT, render por pista y acumulación general.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -142,4 +152,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.0.6.md`](docs/validation-0.0.6.md) y
 [`docs/validation-0.0.7.md`](docs/validation-0.0.7.md) y
 [`docs/validation-0.0.8.md`](docs/validation-0.0.8.md) y
-[`docs/validation-0.0.9.md`](docs/validation-0.0.9.md).
+[`docs/validation-0.0.9.md`](docs/validation-0.0.9.md) y
+[`docs/validation-0.1.0.md`](docs/validation-0.1.0.md).

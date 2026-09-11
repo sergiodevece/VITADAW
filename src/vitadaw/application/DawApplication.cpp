@@ -19,9 +19,17 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
         [this](const auto& value) -> commands::CommandResult {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, commands::AddAudioTrack>) {
-                static_cast<void>(value);
-                return {commands::CommandStatus::rejected,
-                        "This increment has exactly two fixed audio tracks"};
+                try {
+                    const auto id = project_.addAudioTrack(value.name);
+                    return {commands::CommandStatus::accepted,
+                            "Added audio track " + std::to_string(id.value)};
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to add audio track"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Audio track could not be added"};
+                }
             } else if constexpr (std::is_same_v<T, commands::LoadAudioFile>) {
                 audio::AudioFilePreparationResult preparation;
                 try {
@@ -52,7 +60,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                         metadata.sourceSampleRate));
 
                     std::ostringstream message;
-                    message << "Loaded track " << (tracks::toIndex(value.track) + 1)
+                    message << "Loaded track " << value.track.value
                             << ": " << value.file.filename().string() << " | "
                             << std::fixed << std::setprecision(0)
                             << metadata.sourceSampleRate.hertz() << " Hz | "

@@ -7,6 +7,8 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include <vector>
+
 namespace vitadaw::platform::juce_adapter {
 
 class AudioStatusComponent;
@@ -14,7 +16,8 @@ class AudioStatusComponent;
 class MainWindow final : public juce::DocumentWindow {
 public:
     MainWindow(const audio::AudioDeviceState& initialAudioState,
-               commands::ICommandDispatcher& commandDispatcher);
+               commands::ICommandDispatcher& commandDispatcher,
+               std::vector<tracks::TrackId> audioTracks);
     void closeButtonPressed() override;
     void setAudioDeviceState(const audio::AudioDeviceState& state);
     void setTransportState(const transport::TransportState& state,

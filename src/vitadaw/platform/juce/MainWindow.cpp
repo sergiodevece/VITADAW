@@ -4,7 +4,8 @@ namespace vitadaw::platform::juce_adapter {
 
 class AudioStatusComponent final : public juce::Component {
 public:
-    explicit AudioStatusComponent(commands::ICommandDispatcher& commandDispatcher)
+    AudioStatusComponent(commands::ICommandDispatcher& commandDispatcher,
+                         std::vector<tracks::TrackId> audioTracks)
         : commandDispatcher_(commandDispatcher) {
         statusLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
         statusLabel_.setJustificationType(juce::Justification::centredLeft);
@@ -16,16 +17,16 @@ public:
         transportLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
         addAndMakeVisible(transportLabel_);
 
-        loadTrack1Button_.onClick = [this] {
-            chooseWav(tracks::AudioTrackSlot::first);
-        };
-        loadTrack2Button_.onClick = [this] {
-            chooseWav(tracks::AudioTrackSlot::second);
-        };
+        for (std::size_t index = 0; index < audioTracks.size(); ++index) {
+            auto button = std::make_unique<juce::TextButton>(
+                "Load Audio " + juce::String(static_cast<int>(index + 1)));
+            const auto track = audioTracks[index];
+            button->onClick = [this, track] { chooseWav(track); };
+            addAndMakeVisible(*button);
+            loadButtons_.push_back(std::move(button));
+        }
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
-        addAndMakeVisible(loadTrack1Button_);
-        addAndMakeVisible(loadTrack2Button_);
         addAndMakeVisible(playButton_);
         addAndMakeVisible(stopButton_);
     }
@@ -77,20 +78,22 @@ public:
         bounds.removeFromTop(12);
         transportLabel_.setBounds(bounds.removeFromTop(32));
         bounds.removeFromTop(12);
-        auto buttons = bounds.removeFromTop(32);
-        loadTrack1Button_.setBounds(buttons.removeFromLeft(150));
-        buttons.removeFromLeft(8);
-        loadTrack2Button_.setBounds(buttons.removeFromLeft(150));
-        buttons.removeFromLeft(8);
-        playButton_.setBounds(buttons.removeFromLeft(80));
-        buttons.removeFromLeft(8);
-        stopButton_.setBounds(buttons.removeFromLeft(80));
+        auto loadButtons = bounds.removeFromTop(32);
+        for (auto& button : loadButtons_) {
+            button->setBounds(loadButtons.removeFromLeft(136));
+            loadButtons.removeFromLeft(8);
+        }
+        bounds.removeFromTop(8);
+        auto transportButtons = bounds.removeFromTop(32);
+        playButton_.setBounds(transportButtons.removeFromLeft(80));
+        transportButtons.removeFromLeft(8);
+        stopButton_.setBounds(transportButtons.removeFromLeft(80));
         bounds.removeFromTop(12);
         resultLabel_.setBounds(bounds.removeFromTop(32));
     }
 
 private:
-    void chooseWav(tracks::AudioTrackSlot track) {
+    void chooseWav(tracks::TrackId track) {
         fileChooser_ = std::make_unique<juce::FileChooser>(
             "Select a WAV file", juce::File{}, "*.wav");
         constexpr auto flags = juce::FileBrowserComponent::openMode |
@@ -123,20 +126,21 @@ private:
     juce::Label statusLabel_;
     juce::Label transportLabel_;
     juce::Label resultLabel_;
-    juce::TextButton loadTrack1Button_{"Load Track 1 WAV"};
-    juce::TextButton loadTrack2Button_{"Load Track 2 WAV"};
+    std::vector<std::unique_ptr<juce::TextButton>> loadButtons_;
     juce::TextButton playButton_{"Play"};
     juce::TextButton stopButton_{"Stop"};
     std::unique_ptr<juce::FileChooser> fileChooser_;
 };
 
 MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
-                       commands::ICommandDispatcher& commandDispatcher)
+                       commands::ICommandDispatcher& commandDispatcher,
+                       std::vector<tracks::TrackId> audioTracks)
     : DocumentWindow("VitaDAW",
                      juce::Colours::darkgrey,
                      DocumentWindow::allButtons) {
     setUsingNativeTitleBar(true);
-    content_ = new AudioStatusComponent(commandDispatcher);
+    content_ = new AudioStatusComponent(commandDispatcher,
+                                        std::move(audioTracks));
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
     centreWithSize(800, 500);

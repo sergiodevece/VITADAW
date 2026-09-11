@@ -2,10 +2,11 @@
 
 #include "vitadaw/tracks/AudioTrack.h"
 
-#include <array>
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vitadaw::project {
 
@@ -13,7 +14,8 @@ namespace vitadaw::project {
 class ProjectState {
 public:
     struct PreparedAudioClipUpdate {
-        tracks::AudioTrackSlot track{tracks::AudioTrackSlot::first};
+        tracks::TrackId track;
+        std::size_t trackIndex{};
         std::optional<clips::AudioClip> replacement;
         clips::ClipId nextClipId{};
     };
@@ -21,11 +23,13 @@ public:
     explicit ProjectState(timeline::SampleRate projectSampleRate);
 
     [[nodiscard]] timeline::SampleRate sampleRate() const noexcept;
-    [[nodiscard]] const std::array<tracks::AudioTrack, tracks::audioTrackCount>&
-    tracks() const noexcept;
+    [[nodiscard]] const std::vector<tracks::AudioTrack>& tracks() const noexcept;
+    [[nodiscard]] tracks::TrackId addAudioTrack(std::string name);
+    [[nodiscard]] const tracks::AudioTrack* findTrack(
+        tracks::TrackId track) const noexcept;
     [[nodiscard]] timeline::ProjectFrameCount duration() const noexcept;
     [[nodiscard]] PreparedAudioClipUpdate prepareAudioClipUpdate(
-        tracks::AudioTrackSlot track,
+        tracks::TrackId track,
         const std::filesystem::path& sourceFile,
         timeline::SourceFrameCount sourceFrameCount,
         timeline::SampleRate sourceSampleRate) const;
@@ -33,7 +37,8 @@ public:
 
 private:
     timeline::SampleRate projectSampleRate_;
-    std::array<tracks::AudioTrack, tracks::audioTrackCount> tracks_;
+    std::vector<tracks::AudioTrack> tracks_;
+    tracks::TrackId nextTrackId_{1};
     clips::ClipId nextClipId_{1};
 };
 
