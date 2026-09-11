@@ -10,35 +10,59 @@ namespace {
 class FakeAudioEngine final : public vitadaw::audio::IAudioEngineControl {
 public:
     vitadaw::audio::AudioFileLoadResult loadWav(
-        const std::filesystem::path& file) override {
+        const std::filesystem::path& file,
+        vitadaw::timeline::SampleRate projectSampleRate) override {
         ++loadRequests;
         if (!loadShouldSucceed) {
             return {false, {}, "Invalid WAV"};
         }
-
         loadedFile = file;
         prepared = true;
-        playhead = 0;
-        return {true, {44100.0, 1, 44100, 1.0}, {}};
+        snapshotState = {false, {0},
+                         vitadaw::timeline::sourceFramesToProjectFrames(
+                             {44100}, vitadaw::timeline::SampleRate{44100.0},
+                             projectSampleRate),
+                         lastProcessedSequence};
+        return {true,
+                {vitadaw::timeline::SampleRate{44100.0}, 1, {44100}, {1.0}},
+                {}};
     }
 
-    bool tryRequestPlay() noexcept override {
+    vitadaw::audio::AudioControlRequestResult tryRequestPlay() noexcept override {
         ++playRequests;
         if (!acceptRequests || !prepared) {
-            return false;
+            return {};
         }
-        playing = true;
-        return true;
+        const auto sequence = nextSequence++;
+        if (snapshotState.position.value >= snapshotState.duration.value) {
+            snapshotState.position = {0};
+        }
+        snapshotState.playing = true;
+        snapshotState.lastProcessedCommandSequence = sequence;
+        lastProcessedSequence = sequence;
+        return {true, sequence};
     }
 
-    bool tryRequestStop() noexcept override {
+    vitadaw::audio::AudioControlRequestResult tryRequestStop() noexcept override {
         ++stopRequests;
         if (!acceptRequests) {
-            return false;
+            return {};
         }
-        playing = false;
-        playhead = 0;
-        return true;
+        const auto sequence = nextSequence++;
+        snapshotState.playing = false;
+        snapshotState.position = {0};
+        snapshotState.lastProcessedCommandSequence = sequence;
+        lastProcessedSequence = sequence;
+        return {true, sequence};
+    }
+
+    vitadaw::audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override {
+        return snapshotState;
+    }
+
+    void publishProgress(std::int64_t projectFrame, bool playing) noexcept {
+        snapshotState.position = {projectFrame};
+        snapshotState.playing = playing;
     }
 
     int loadRequests{};
@@ -47,9 +71,10 @@ public:
     bool acceptRequests{true};
     bool loadShouldSucceed{true};
     bool prepared{};
-    bool playing{};
-    std::uint64_t playhead{};
     std::filesystem::path loadedFile;
+    vitadaw::audio::RealtimeTransportSnapshot snapshotState;
+    vitadaw::audio::AudioCommandSequence nextSequence{1};
+    vitadaw::audio::AudioCommandSequence lastProcessedSequence{};
 };
 
 void check(bool condition, std::string_view message) {
@@ -63,9 +88,8 @@ void check(bool condition, std::string_view message) {
 
 int main() {
     using namespace vitadaw;
-
     FakeAudioEngine audio;
-    application::DawApplication app{audio};
+    application::DawApplication app{audio, timeline::SampleRate{48000.0}};
     commands::CommandDispatcher dispatcher{app};
 
     const auto addResult = dispatcher.dispatch(commands::AddAudioTrack{"Audio 1"});
@@ -88,11 +112,11 @@ int main() {
     const auto stopWithoutFile = dispatcher.dispatch(commands::Stop{});
     check(stopWithoutFile.status == commands::CommandStatus::accepted,
           "stop without a file should remain valid");
-    check(app.transport().playhead == 0, "stop without a file should stay at the start");
+    check(app.transport().position.value == 0,
+          "stop without a file should stay at the start");
 
     audio.loadShouldSucceed = false;
-    const auto invalidLoad =
-        dispatcher.dispatch(commands::LoadAudioFile{"invalid.wav"});
+    const auto invalidLoad = dispatcher.dispatch(commands::LoadAudioFile{"invalid.wav"});
     check(invalidLoad.status == commands::CommandStatus::rejected,
           "invalid WAV should be rejected");
     check(app.project().tracks().front().clips.empty(),
@@ -104,11 +128,12 @@ int main() {
           "valid WAV should be accepted");
     check(validLoad.message.find("44100 Hz | 1 ch | 1.000 s") != std::string::npos,
           "valid load should report portable audio metadata");
-    check(app.project().tracks().size() == 1, "load should use exactly one track");
+    check(app.project().sampleRate() == timeline::SampleRate{48000.0},
+          "project sample rate should be explicit and stable");
+    check(app.transport().duration.value == 48000,
+          "source duration should be represented in project frames");
     check(app.project().tracks().front().clips.size() == 1,
           "load should create exactly one clip");
-    check(app.project().tracks().front().clips.front().sourceFile == "valid.wav",
-          "clip should reference the loaded WAV");
 
     const auto firstPlay = dispatcher.dispatch(commands::Play{});
     check(firstPlay.status == commands::CommandStatus::accepted,
@@ -116,18 +141,36 @@ int main() {
     check(app.transport().playback == transport::PlaybackState::playing,
           "accepted play should update transport");
 
-    audio.playhead = 1234;
+    audio.publishProgress(24000, true);
+    app.synchroniseTransport();
+    check(app.transport().position.value == 24000,
+          "application transport should follow RT progress");
+
     const auto stop = dispatcher.dispatch(commands::Stop{});
     check(stop.status == commands::CommandStatus::accepted, "stop should be accepted");
     check(audio.stopRequests == 2, "stop command should reach audio control");
-    check(audio.playhead == 0, "audio engine should rewind on stop");
     check(app.transport().playback == transport::PlaybackState::stopped,
           "stop command should update application transport");
-    check(app.transport().playhead == 0, "application transport should rewind on stop");
+    check(app.transport().position.value == 0,
+          "application transport should rewind on stop");
 
     const auto secondPlay = dispatcher.dispatch(commands::Play{});
     check(secondPlay.status == commands::CommandStatus::accepted,
           "play should work again after stop");
+
+    audio.publishProgress(48000, false);
+    app.synchroniseTransport();
+    check(app.transport().playback == transport::PlaybackState::stopped,
+          "natural end should transition Playing to Stopped");
+    check(app.transport().position.value == app.transport().duration.value,
+          "natural end should preserve the logical end position");
+
+    const auto replayAfterEnd = dispatcher.dispatch(commands::Play{});
+    check(replayAfterEnd.status == commands::CommandStatus::accepted,
+          "play after natural end should restart");
+    app.synchroniseTransport();
+    check(app.transport().position.value == 0,
+          "play after natural end should restart at zero");
 
     audio.loadShouldSucceed = false;
     const auto failedReplacement =

@@ -112,7 +112,7 @@ audio::AudioFileLoadResult JuceAudioDeviceAdapter::loadWav(
     }
 
     const audio::AudioFileMetadata metadata{
-        {reader->sampleRate},
+        timeline::SampleRate{reader->sampleRate},
         static_cast<std::uint32_t>(reader->numChannels),
         {static_cast<std::uint64_t>(reader->lengthInSamples)},
         {static_cast<double>(reader->lengthInSamples) / reader->sampleRate}};

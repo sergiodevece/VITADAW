@@ -5,6 +5,11 @@ incremental. La aplicación actual abre una ventana mínima, inicializa y observ
 el dispositivo de audio y carga y reproduce un único archivo WAV en una única
 pista.
 
+El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
+al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
+usa `48000 Hz` como valor de reserva. No cambia automáticamente si después se
+reconfigura el dispositivo.
+
 ## Tecnología propuesta
 
 - **C++20** para el núcleo y el callback de audio.
@@ -70,6 +75,11 @@ fuera del callback de audio.
 decodificar. `Play` inicia la reproducción, `Stop` detiene y vuelve al inicio, y
 un nuevo `Play` reproduce otra vez desde el primer frame. Si no hay un WAV válido
 preparado, `Play` se rechaza explícitamente.
+
+La ventana muestra también, de forma provisional, el estado, posición, duración
+y sample rate lógico del proyecto. Al llegar al final natural, el transporte
+queda en `Stopped` y conserva la posición en el final; `Stop` explícito continúa
+rebobinando a cero.
 
 La arquitectura y las reglas de tiempo real se describen en
 [`docs/architecture.md`](docs/architecture.md).

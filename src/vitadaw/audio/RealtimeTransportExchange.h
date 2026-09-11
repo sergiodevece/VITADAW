@@ -57,6 +57,7 @@ public:
 private:
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+    static_assert(std::atomic<bool>::is_always_lock_free);
 
     std::atomic<std::uint64_t> revision_{};
     std::atomic<bool> playing_{};

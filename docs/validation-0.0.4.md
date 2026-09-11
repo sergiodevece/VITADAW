@@ -33,3 +33,23 @@ ocurren antes de publicarlo al callback.
 
 La ruta de audio perceptual no se captura automáticamente; la validación
 automatizada cubre las transiciones, el cursor y el ratio de sample rates.
+
+## Validación de tiempo y fin natural
+
+- Sample rate lógico del proyecto observado: `48000 Hz`, fijado a partir del
+  dispositivo activo al abrir la aplicación.
+- La ventana mostró avance del transporte durante reproducción, expresado en
+  segundos derivados de frames de proyecto.
+- `Stop` mantuvo la política de posición cero.
+- El fin natural se valida de forma determinista sin hardware: el cursor queda
+  en el frame final, publica `playing = false` y la aplicación adopta
+  `Stopped` conservando la posición final.
+- Las conversiones `44.1 kHz ↔ 48 kHz`, segundos ↔ frames de proyecto y una
+  duración de seis horas pasaron sin drift de frames observable.
+
+## Builds y tests
+
+- Build completo con JUCE: correcto.
+- Build `VITADAW_BUILD_APP=OFF`: correcto; confirma que el núcleo no depende de
+  JUCE ni de un dispositivo físico.
+- Tests: `5/5` correctos en ambos builds.

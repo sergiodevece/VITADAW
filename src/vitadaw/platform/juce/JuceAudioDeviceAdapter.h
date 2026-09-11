@@ -14,8 +14,8 @@
 
 namespace vitadaw::platform::juce_adapter {
 
-// Owns the JUCE audio-device lifecycle. Playback control remains deliberately
-// unavailable until the realtime engine is implemented in a later increment.
+// JUCE platform adapter: owns device, WAV decoding and the RT playback callback.
+// Portable application/domain code only sees IAudioEngineControl.
 class JuceAudioDeviceAdapter final : public audio::IAudioEngineControl,
                                      private juce::AudioIODeviceCallback,
                                      private juce::ChangeListener {

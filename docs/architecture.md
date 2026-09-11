@@ -33,7 +33,8 @@ al motor.
 - `transport`: estado lógico de reproducción y posición.
 - `tracks`: pistas de audio y su colección de clips.
 - `clips`: referencia a un archivo y región colocada en el timeline.
-- `timeline`: posiciones y rangos expresados en frames enteros.
+- `timeline`: unidades temporales fuertes y conversiones entre archivo,
+  proyecto, dispositivo y segundos.
 - `ui`: frontera de UI; se implementará con JUCE sin acceder a `audio`.
 - `platform/juce`: composición nativa, ventana y adaptador de dispositivo; es
   la única capa que depende de JUCE.
@@ -84,7 +85,42 @@ se usa el resampler de JUCE en este incremento. La interpolación lineal mantien
 duración y tono correctos, aunque no es la solución de calidad final para un DAW.
 
 La pista única conserva la longitud en frames del archivo fuente y su sample
-rate. Aún no existe un sample rate de proyecto ni un timeline gráfico.
+rate. No existe todavía un timeline gráfico.
+
+## Tiempo de proyecto y sincronización del transporte
+
+`ProjectState` posee un `SampleRate` explícito. En este incremento se fija una
+sola vez durante la composición de la aplicación: adopta el sample rate del
+dispositivo activo o `48000 Hz` si el dispositivo no pudo inicializarse. Una
+reinicialización posterior del dispositivo no cambia esa escala. Esta política
+está encapsulada en la composición JUCE y permite introducir más adelante una
+selección o persistencia propia del proyecto sin cambiar el dominio.
+
+El módulo `timeline` evita valores numéricos sin unidad mediante:
+
+- `SourceFrameCount`, `SourceFramePosition` y `SourceFrameDuration` para el WAV;
+- `ProjectFrameCount` y `ProjectFramePosition` para el timeline lógico;
+- `DeviceFrameCount` para bloques procesados por el dispositivo;
+- `Seconds` y `SampleRate` para conversiones explícitas.
+
+La duración de un clip se convierte una sola vez de frames fuente a frames de
+proyecto. El callback conserva su cursor en frames fuente y calcula el avance a
+partir de frames de dispositivo. La posición que publica se convierte a frames
+de proyecto, por lo que `TransportState` nunca contiene frames del archivo ni
+tipos JUCE.
+
+El callback publica `playing`, posición, duración y la última secuencia de
+comando procesada en `RealtimeTransportExchange`. Es un snapshot de atomics
+lock-free con escritor único: publicar tiene coste acotado y no reserva memoria,
+no bloquea y no toca `ProjectState`. El hilo de aplicación lo consulta a 30 Hz y
+actualiza `TransportState`; el número de secuencia impide que una observación
+antigua deshaga visualmente un Play o Stop recién aceptado.
+
+Al alcanzar el último frame, el cursor RT deja de producir el recurso, publica
+`playing = false` y conserva la posición lógica exactamente en la duración. El
+hilo de aplicación converge así a `Stopped` en el final. Esta política distingue
+el final natural de `Stop`, que conserva su semántica de `Stopped` en cero. Un
+Play posterior al final reinicia el cursor en cero.
 
 ### Límites conscientes de este incremento
 
@@ -97,8 +133,9 @@ rate. Aún no existe un sample rate de proyecto ni un timeline gráfico.
 - La cola es SPSC porque la UI es el único productor actual. Futuras fuentes de
   comandos necesitarán serialización previa, no productores concurrentes sobre
   esta cola.
-- El final natural del archivo detiene el cursor RT, pero aún no publica esa
-  transición de vuelta al estado de transporte de la aplicación.
+- La posición pública se redondea al frame de proyecto más cercano. Para
+  multipista habrá que definir una única posición maestra por bloque y derivar
+  de ella todos los cursores, en vez de publicar una posición por pista.
 
 ## Evolución hasta 0.1
 
@@ -109,7 +146,9 @@ rate. Aún no existe un sample rate de proyecto ni un timeline gráfico.
 4. **Completado:** implementar `Play` y `Stop` sobre una cola SPSC acotada; al detener, limpiar
    la salida y confirmar el estado al hilo de aplicación. La inserción en la
    cola devuelve éxito o fallo: nunca se pierde silenciosamente un comando.
-5. Añadir pruebas de render offline y smoke tests del dispositivo.
+5. **Completado:** introducir tiempo de proyecto explícito, posición observable
+   y transición determinista al final natural.
+6. Añadir pruebas de render offline y smoke tests del dispositivo.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

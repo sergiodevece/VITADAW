@@ -34,9 +34,11 @@ struct TransportState {
                      timeline::ProjectFramePosition newPosition,
                      timeline::ProjectFrameCount newDuration) noexcept {
         duration = newDuration;
-        position = newPosition.value >= newDuration.value
-                       ? timeline::ProjectFramePosition{newDuration.value}
-                       : newPosition;
+        position = newPosition.value <= 0
+                       ? timeline::ProjectFramePosition{0}
+                       : (newPosition.value >= newDuration.value
+                              ? timeline::ProjectFramePosition{newDuration.value}
+                              : newPosition);
         playback = isPlaying ? PlaybackState::playing : PlaybackState::stopped;
     }
 };

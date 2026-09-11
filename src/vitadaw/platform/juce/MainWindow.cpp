@@ -13,12 +13,30 @@ public:
         resultLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
         addAndMakeVisible(resultLabel_);
 
+        transportLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
+        addAndMakeVisible(transportLabel_);
+
         loadButton_.onClick = [this] { chooseWav(); };
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
         addAndMakeVisible(loadButton_);
         addAndMakeVisible(playButton_);
         addAndMakeVisible(stopButton_);
+    }
+
+    void setTransportState(const transport::TransportState& state,
+                           timeline::SampleRate projectSampleRate) {
+        const auto position = timeline::projectPositionToSeconds(
+            state.position, projectSampleRate);
+        const auto duration = timeline::projectFramesToSeconds(
+            state.duration, projectSampleRate);
+        juce::String text;
+        text << "Transport: "
+             << (state.playback == transport::PlaybackState::playing ? "Playing" : "Stopped")
+             << " | " << juce::String(position.value, 3) << " / "
+             << juce::String(duration.value, 3) << " s"
+             << " | Project: " << juce::String(projectSampleRate.hertz(), 0) << " Hz";
+        transportLabel_.setText(text, juce::NotificationType::dontSendNotification);
     }
 
     void setAudioDeviceState(const audio::AudioDeviceState& state) {
@@ -50,6 +68,8 @@ public:
     void resized() override {
         auto bounds = getLocalBounds().reduced(24);
         statusLabel_.setBounds(bounds.removeFromTop(150));
+        bounds.removeFromTop(12);
+        transportLabel_.setBounds(bounds.removeFromTop(32));
         bounds.removeFromTop(12);
         auto buttons = bounds.removeFromTop(32);
         loadButton_.setBounds(buttons.removeFromLeft(120));
@@ -93,6 +113,7 @@ private:
 
     commands::ICommandDispatcher& commandDispatcher_;
     juce::Label statusLabel_;
+    juce::Label transportLabel_;
     juce::Label resultLabel_;
     juce::TextButton loadButton_{"Load WAV"};
     juce::TextButton playButton_{"Play"};
@@ -120,6 +141,11 @@ void MainWindow::closeButtonPressed() {
 
 void MainWindow::setAudioDeviceState(const audio::AudioDeviceState& state) {
     content_->setAudioDeviceState(state);
+}
+
+void MainWindow::setTransportState(const transport::TransportState& state,
+                                   timeline::SampleRate projectSampleRate) {
+    content_->setTransportState(state, projectSampleRate);
 }
 
 } // namespace vitadaw::platform::juce_adapter

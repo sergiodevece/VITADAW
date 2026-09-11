@@ -91,4 +91,12 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_playback_cursor_tests tests/PlaybackCursorTests.cpp)
     target_link_libraries(vitadaw_playback_cursor_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_playback_cursor_tests COMMAND vitadaw_playback_cursor_tests)
+
+    add_executable(vitadaw_time_conversion_tests tests/TimeConversionTests.cpp)
+    target_link_libraries(vitadaw_time_conversion_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_time_conversion_tests COMMAND vitadaw_time_conversion_tests)
+
+    add_executable(vitadaw_transport_state_tests tests/TransportStateTests.cpp)
+    target_link_libraries(vitadaw_transport_state_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_transport_state_tests COMMAND vitadaw_transport_state_tests)
 endif()
