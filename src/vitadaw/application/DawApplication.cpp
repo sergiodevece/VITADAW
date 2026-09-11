@@ -1,6 +1,7 @@
 #include "vitadaw/application/DawApplication.h"
 
 #include <exception>
+#include <array>
 #include <iomanip>
 #include <new>
 #include <optional>
@@ -174,20 +175,16 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 } else {
                     updated.solo = value.solo;
                 }
-                bool anySolo{};
-                for (const auto& candidate : project_.tracks()) {
-                    anySolo = anySolo ||
-                              (candidate.id == value.track
-                                   ? updated.solo
-                                   : candidate.mix.solo);
-                }
+                const auto audibility = resolveAudibility(
+                    project_, value.track, &updated);
                 const auto published = audioEngine_.tryUpdateTrackMix(
-                    value.track, mixer::prepare(updated), anySolo);
+                    value.track, mixer::prepare(updated), audibility);
                 if (!published) {
                     return {commands::CommandStatus::rejected,
                             "Mixer parameter queue is full"};
                 }
                 static_cast<void>(project_.setTrackMix(value.track, updated));
+                audibility_ = audibility;
                 return {commands::CommandStatus::accepted,
                         "Track mixer state updated"};
             } else if constexpr (std::is_same_v<T, commands::SetMasterGain>) {
@@ -203,6 +200,45 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 static_cast<void>(project_.setMasterMix(updated));
                 return {commands::CommandStatus::accepted,
                         "Master mixer state updated"};
+            } else if constexpr (
+                std::is_same_v<T, commands::SetBusGain> ||
+                std::is_same_v<T, commands::SetBusPan> ||
+                std::is_same_v<T, commands::SetBusMute> ||
+                std::is_same_v<T, commands::SetBusSolo>) {
+                const auto* bus = project_.findBus(value.bus);
+                if (bus == nullptr) {
+                    return {commands::CommandStatus::rejected,
+                            "Audio bus does not exist"};
+                }
+                auto updated = bus->mix;
+                if constexpr (std::is_same_v<T, commands::SetBusGain>) {
+                    if (!value.gain.isValid()) {
+                        return {commands::CommandStatus::rejected,
+                                "Bus gain must be finite and between -100 and +12 dB"};
+                    }
+                    updated.gain = value.gain;
+                } else if constexpr (std::is_same_v<T, commands::SetBusPan>) {
+                    if (!value.pan.isValid()) {
+                        return {commands::CommandStatus::rejected,
+                                "Bus balance must be finite and between -1 and +1"};
+                    }
+                    updated.balance = value.pan;
+                } else if constexpr (std::is_same_v<T, commands::SetBusMute>) {
+                    updated.muted = value.muted;
+                } else {
+                    updated.solo = value.solo;
+                }
+                const auto audibility = resolveAudibility(
+                    project_, {}, nullptr, value.bus, &updated);
+                if (!audioEngine_.tryUpdateBusMix(
+                        value.bus, mixer::prepare(updated), audibility)) {
+                    return {commands::CommandStatus::rejected,
+                            "Mixer parameter queue is full"};
+                }
+                static_cast<void>(project_.setBusMix(value.bus, updated));
+                audibility_ = audibility;
+                return {commands::CommandStatus::accepted,
+                        "Bus mixer state updated"};
             } else if constexpr (
                 std::is_same_v<T, commands::SetTrackOutputDestination>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
@@ -238,7 +274,10 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
     const project::ProjectState& project) const {
     audio::ProcessingPlanSpecification result;
     result.projectSampleRate = project.sampleRate();
-    result.buses = project.routing().buses();
+    result.buses.reserve(project.routing().buses().size());
+    for (const auto& bus : project.routing().buses()) {
+        result.buses.push_back({bus.id, mixer::prepare(bus.mix)});
+    }
     result.masterMix = mixer::prepare(project.masterMix());
     result.tracks.reserve(project.tracks().size());
     for (const auto& track : project.tracks()) {
@@ -248,7 +287,6 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
         }
         result.tracks.push_back(
             {track.id, mixer::prepare(track.mix), route->destination});
-        result.anySolo = result.anySolo || track.mix.solo;
     }
     return result;
 }
@@ -268,12 +306,14 @@ commands::CommandResult DawApplication::commitStructuralProject(
     struct CommitContext {
         DawApplication* application;
         project::ProjectState* candidate;
-    } context{this, &candidate};
+        audio::PreparedAudibilityState audibility;
+    } context{this, &candidate, resolveAudibility(candidate)};
     const audio::AudioFileCommitAction commit{
         &context,
         [](void* raw) noexcept {
             auto& value = *static_cast<CommitContext*>(raw);
             value.application->project_.swap(*value.candidate);
+            value.application->audibility_ = value.audibility;
             value.application->transport_.stopAndRewind();
             value.application->transport_.setDuration(
                 value.application->project_.duration());
@@ -286,6 +326,48 @@ commands::CommandResult DawApplication::commitStructuralProject(
     pendingAudioCommandSequence_ =
         audioEngine_.transportSnapshot().lastProcessedCommandSequence;
     return {commands::CommandStatus::accepted, std::move(successMessage)};
+}
+
+audio::PreparedAudibilityState DawApplication::resolveAudibility(
+    const project::ProjectState& project, tracks::TrackId overriddenTrack,
+    const mixer::TrackMixState* trackMix,
+    routing::BusId overriddenBus,
+    const mixer::BusMixState* busMix) const noexcept {
+    const auto& tracks = project.tracks();
+    const auto& buses = project.routing().buses();
+    const auto effectiveTrackMix = [&](const auto& track) -> const auto& {
+        return trackMix != nullptr && track.id == overriddenTrack
+                   ? *trackMix
+                   : track.mix;
+    };
+    const auto effectiveBusMix = [&](const auto& bus) -> const auto& {
+        return busMix != nullptr && bus.id == overriddenBus ? *busMix
+                                                            : bus.mix;
+    };
+    std::array<audio::AudibilityTrackInput, audio::audibilityTrackCapacity>
+        resolvedTracks{};
+    std::array<bool, audio::audibilityBusCapacity> busSolos{};
+    for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
+        resolvedTracks[trackIndex].solo =
+            effectiveTrackMix(tracks[trackIndex]).solo;
+        const auto* route = project.routing().findTrackRoute(
+            tracks[trackIndex].id);
+        if (route != nullptr &&
+            route->destination.kind == routing::DestinationKind::bus) {
+            for (std::size_t busIndex = 0; busIndex < buses.size(); ++busIndex) {
+                if (buses[busIndex].id == route->destination.bus) {
+                    resolvedTracks[trackIndex].destinationBusIndex = busIndex;
+                    break;
+                }
+            }
+        }
+    }
+    for (std::size_t busIndex = 0; busIndex < buses.size(); ++busIndex) {
+        busSolos[busIndex] = effectiveBusMix(buses[busIndex]).solo;
+    }
+    return audio::resolveAudibility(
+        {resolvedTracks.data(), tracks.size()},
+        {busSolos.data(), buses.size()});
 }
 
 void DawApplication::synchroniseTransport() noexcept {

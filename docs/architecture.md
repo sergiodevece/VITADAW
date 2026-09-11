@@ -290,13 +290,12 @@ array fijo para un máximo preparado de 256 pistas. El productor único escribe
 un estado completo y publica el índice con release; el callback adquiere el
 índice, consume FIFO al inicio de bloque y actualiza solo su almacenamiento
 preasignado. Una cola llena rechaza explícitamente el comando; entonces ni
-`PreparedProject` ni `ProjectState` cambian. Cada `PreparedTrackView` conserva
+`PreparedProject` ni `ProjectState` cambian. Cada descriptor preparado conserva
 también el estado vigente para que una posterior reconstrucción estructural lo
 publique sin volver a valores por defecto. La carga de un WAV para una pista
-vacía recibe su estado de mezcla actual desde el modelo. Cada cambio publica
-también `anySolo`, calculado sobre todas las pistas del proyecto: una pista vacía
-en solo silencia correctamente las pistas cargadas que no estén en solo, sin
-crear un recurso RT ficticio.
+vacía recibe su estado de mezcla actual desde el modelo. Desde 0.2.1, cada
+cambio de pista o bus publica además un `PreparedAudibilityState` que representa
+la resolución completa de Solo contra el routing, incluidas pistas vacías.
 
 La suma interna usa `float` y puede superar `[-1, 1]`. No se aplica clamp ni
 limitador; el recorte depende del backend/hardware final.
@@ -466,7 +465,59 @@ modelo, compilador, plan y ejecutor son core-only.
   contribución resultante.
 - Se usa un buffer completo por bus; no hay reutilización avanzada de scratch.
 
-## Evolución hasta 0.2.0
+## Bus Mixer Controls 0.2.1
+
+`AudioBus` conserva su `BusId` estable y añade un `BusMixState` portable:
+gain, balance estéreo, mute y solo. La especificación del plan transforma ese
+estado en `PreparedBusMixState`; ninguna conversión dB→lineal ni trigonometría
+ocurre por muestra.
+
+El punto de procesamiento queda fijado explícitamente:
+
+```text
+entradas acumuladas
+    -> gain smoothing
+    -> balance smoothing
+    -> mute/solo
+    -> bus peak meter
+    -> Master accumulator
+```
+
+Este orden deja entre acumulación y metering el punto natural para futuros
+inserts y decisiones pre/post, sin implementar todavía ninguna de ellas. El
+meter es post-mute y post-Solo: refleja exclusivamente la señal audible que el
+bus entrega a Master.
+
+`BusMixSmoother` mantiene una rampa lineal de 5 ms para amplitud y coeficientes
+de balance. Se avanza exactamente una vez por frame procesado, aunque el callback
+se divida en subbloques. Mute y solo cambian discretamente al inicio de bloque.
+
+### Selección Solo y caminos audibles
+
+La selección del usuario no se aplica como una condición local ingenua. Una
+etapa portable resuelve `PreparedAudibilityState`, formado por máscaras densas
+de pistas y buses:
+
+- sin solos, todas las rutas permanecen abiertas;
+- Track Solo selecciona la pista y abre el bus necesario para llegar a Master;
+- Bus Solo selecciona el bus y todas las pistas cuyo destino es ese bus;
+- varios solos forman la unión de todas las selecciones válidas;
+- una pista directa a Master solo permanece cuando está seleccionada o no hay
+  ningún solo;
+- mute prevalece en el nodo que lo contiene, incluso si está seleccionado.
+
+La resolución usa `TrackId` y `BusId` únicamente en el hilo de aplicación. El
+resultado acompaña atómicamente al comando de parámetros que cambia Solo. El RT
+solo consulta bits por índice denso; no busca identidades ni recorre
+`ProjectState`.
+
+`SetBusGain`, `SetBusPan`, `SetBusMute` y `SetBusSolo` atraviesan la misma
+frontera UI → comandos → aplicación → motor. Son parámetros, no cambios
+estructurales: no detienen Play, no reconstruyen el plan, no retiran el callback
+y no decodifican WAV. Una cola llena rechaza tanto la publicación como el cambio
+del modelo.
+
+## Evolución hasta 0.2.1
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -496,6 +547,8 @@ modelo, compilador, plan y ejecutor son core-only.
     metering portable con intercambio RT hacia aplicación.
 13. **Completado en 0.2.0:** compilar routing editable a un plan portable con
     buses, buffers y orden preparados fuera de RT.
+14. **Completado en 0.2.1:** procesar gain, balance, mute y solo de buses con
+    smoothing y resolución explícita de caminos audibles.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

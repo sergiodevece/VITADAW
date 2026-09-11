@@ -92,8 +92,11 @@ public:
     [[nodiscard]] virtual bool tryUpdateTrackMix(
         tracks::TrackId track,
         mixer::PreparedTrackMixState mix,
-        bool anySolo) noexcept = 0;
-    [[nodiscard]] virtual bool tryUpdateGlobalSolo(bool anySolo) noexcept = 0;
+        PreparedAudibilityState audibility) noexcept = 0;
+    [[nodiscard]] virtual bool tryUpdateBusMix(
+        routing::BusId bus,
+        mixer::PreparedBusMixState mix,
+        PreparedAudibilityState audibility) noexcept = 0;
     [[nodiscard]] virtual bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;

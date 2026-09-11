@@ -29,6 +29,10 @@ struct SetTrackPan { tracks::TrackId track; mixer::Pan pan; };
 struct SetTrackMute { tracks::TrackId track; bool muted{}; };
 struct SetTrackSolo { tracks::TrackId track; bool solo{}; };
 struct SetMasterGain { mixer::GainDb gain; };
+struct SetBusGain { routing::BusId bus; mixer::GainDb gain; };
+struct SetBusPan { routing::BusId bus; mixer::Pan pan; };
+struct SetBusMute { routing::BusId bus; bool muted{}; };
+struct SetBusSolo { routing::BusId bus; bool solo{}; };
 struct SetTrackOutputDestination {
     tracks::TrackId track;
     routing::TrackOutputDestination destination;
@@ -37,6 +41,7 @@ struct SetTrackOutputDestination {
 using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
                              SetTrackGain, SetTrackPan, SetTrackMute,
                              SetTrackSolo, SetMasterGain,
+                             SetBusGain, SetBusPan, SetBusMute, SetBusSolo,
                              SetTrackOutputDestination>;
 
 enum class CommandStatus {

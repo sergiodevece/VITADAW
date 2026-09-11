@@ -54,6 +54,16 @@ bool ProjectState::setTrackOutputDestination(
            routing_.setTrackDestination(track, destination);
 }
 
+const routing::AudioBus* ProjectState::findBus(
+    routing::BusId bus) const noexcept {
+    return routing_.findBus(bus);
+}
+
+bool ProjectState::setBusMix(routing::BusId bus,
+                             mixer::BusMixState state) noexcept {
+    return routing_.setBusMix(bus, state);
+}
+
 const tracks::AudioTrack* ProjectState::findTrack(
     tracks::TrackId track) const noexcept {
     const auto found = std::find_if(tracks_.begin(), tracks_.end(),

@@ -68,4 +68,37 @@ private:
     LinearSmoother gain_;
 };
 
+class BusMixSmoother {
+public:
+    void reset(mixer::PreparedBusMixState state) noexcept {
+        gain_.reset(state.linearGain);
+        leftBalance_.reset(state.leftBalance);
+        rightBalance_.reset(state.rightBalance);
+        muted_ = state.muted;
+        solo_ = state.solo;
+    }
+    void setTarget(mixer::PreparedBusMixState state,
+                   timeline::SampleRate deviceSampleRate) noexcept {
+        gain_.setTarget(state.linearGain, deviceSampleRate,
+                        mixerSmoothingSeconds);
+        leftBalance_.setTarget(state.leftBalance, deviceSampleRate,
+                               mixerSmoothingSeconds);
+        rightBalance_.setTarget(state.rightBalance, deviceSampleRate,
+                                mixerSmoothingSeconds);
+        muted_ = state.muted;
+        solo_ = state.solo;
+    }
+    [[nodiscard]] mixer::PreparedBusMixState next() noexcept {
+        return {gain_.next(), leftBalance_.next(), rightBalance_.next(),
+                muted_, solo_};
+    }
+
+private:
+    LinearSmoother gain_;
+    LinearSmoother leftBalance_;
+    LinearSmoother rightBalance_;
+    bool muted_{};
+    bool solo_{};
+};
+
 } // namespace vitadaw::audio

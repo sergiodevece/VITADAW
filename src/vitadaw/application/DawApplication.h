@@ -24,10 +24,17 @@ private:
         const project::ProjectState& project) const;
     [[nodiscard]] commands::CommandResult commitStructuralProject(
         project::ProjectState candidate, std::string successMessage);
+    [[nodiscard]] audio::PreparedAudibilityState resolveAudibility(
+        const project::ProjectState& project,
+        tracks::TrackId overriddenTrack = {},
+        const mixer::TrackMixState* trackMix = nullptr,
+        routing::BusId overriddenBus = {},
+        const mixer::BusMixState* busMix = nullptr) const noexcept;
 
     audio::IAudioEngineControl& audioEngine_;
     project::ProjectState project_;
     transport::TransportState transport_;
+    audio::PreparedAudibilityState audibility_;
     audio::AudioCommandSequence pendingAudioCommandSequence_{};
 };
 

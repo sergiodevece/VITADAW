@@ -108,7 +108,7 @@ public:
     bool tryUpdateTrackMix(
         vitadaw::tracks::TrackId track,
         vitadaw::mixer::PreparedTrackMixState mix,
-        bool anySolo) noexcept override {
+        vitadaw::audio::PreparedAudibilityState audibility) noexcept override {
         ++trackMixRequests;
         const auto planTrack = std::find_if(
             liveSpecification.tracks.begin(), liveSpecification.tracks.end(),
@@ -118,15 +118,25 @@ public:
             return false;
         }
         planTrack->mix = mix;
-        liveSpecification.anySolo = anySolo;
-        lastGlobalSolo = anySolo;
+        lastAudibility = audibility;
         return true;
     }
 
-    bool tryUpdateGlobalSolo(bool anySolo) noexcept override {
-        ++globalSoloRequests;
-        lastGlobalSolo = anySolo;
-        return acceptMixerRequests;
+    bool tryUpdateBusMix(
+        vitadaw::routing::BusId bus,
+        vitadaw::mixer::PreparedBusMixState mix,
+        vitadaw::audio::PreparedAudibilityState audibility) noexcept override {
+        ++busMixRequests;
+        const auto found = std::find_if(
+            liveSpecification.buses.begin(), liveSpecification.buses.end(),
+            [bus](const auto& candidate) { return candidate.id == bus; });
+        if (!acceptMixerRequests || found == liveSpecification.buses.end() ||
+            !mix.isValid()) {
+            return false;
+        }
+        found->mix = mix;
+        lastAudibility = audibility;
+        return true;
     }
 
     bool tryUpdateMasterMix(
@@ -228,9 +238,9 @@ public:
     bool throwNextPreparation{};
     bool acceptMixerRequests{true};
     int trackMixRequests{};
+    int busMixRequests{};
     int masterMixRequests{};
-    int globalSoloRequests{};
-    bool lastGlobalSolo{};
+    vitadaw::audio::PreparedAudibilityState lastAudibility;
     int structuralPrepareRequests{};
     int structuralCommitRequests{};
     bool rejectNextStructuralPreparation{};
@@ -316,12 +326,53 @@ int main() {
                   routing::TrackOutputDestination::toBus(busA),
           "an unknown bus must preserve the previous model and plan");
 
+    const auto structuralBeforeBusMix = audio.structuralPrepareRequests;
+    check(dispatcher.dispatch(commands::SetBusGain{
+              busA, mixer::GainDb{-6.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetBusPan{
+                  busA, mixer::Pan{0.25F}}).status ==
+                  commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetBusMute{busA, true}).status ==
+                  commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetBusSolo{busA, true}).status ==
+                  commands::CommandStatus::accepted &&
+              audio.busMixRequests == 4 &&
+              audio.structuralPrepareRequests == structuralBeforeBusMix &&
+              app.project().findBus(busA)->mix ==
+                  mixer::BusMixState{{-6.0F}, {0.25F}, true, true} &&
+              audio.lastAudibility.trackIsAudible(0) &&
+              audio.lastAudibility.busIsAudible(0) &&
+              !audio.lastAudibility.trackIsAudible(1),
+          "bus parameters must update model, RT state and resolved solo without rebuilding");
+    check(dispatcher.dispatch(commands::SetBusGain{
+              busA, mixer::GainDb{
+                        std::numeric_limits<float>::infinity()}}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findBus(busA)->mix.gain == mixer::GainDb{-6.0F},
+          "invalid bus parameters must preserve both model and RT state");
+    check(dispatcher.dispatch(commands::SetBusMute{{999}, true}).status ==
+              commands::CommandStatus::rejected &&
+              audio.busMixRequests == 4,
+          "an unknown BusId must fail before publishing a parameter command");
+    audio.acceptMixerRequests = false;
+    check(dispatcher.dispatch(commands::SetBusMute{busA, false}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findBus(busA)->mix.muted,
+          "a rejected bus parameter publication must preserve the model");
+    audio.acceptMixerRequests = true;
+    check(dispatcher.dispatch(commands::SetBusMute{busA, false}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetBusSolo{busA, false}).status ==
+                  commands::CommandStatus::accepted,
+          "bus mute and solo must be independently reversible");
+
     check(dispatcher.dispatch(commands::SetTrackGain{
               emptyBetween, mixer::GainDb{-6.0F}}).status ==
               commands::CommandStatus::accepted &&
               app.project().findTrack(emptyBetween)->mix.gain ==
                   mixer::GainDb{-6.0F} &&
-              audio.trackMixRequests == 1 && audio.globalSoloRequests == 0,
+              audio.trackMixRequests == 1,
           "an empty track should update its prepared mixer state without a WAV");
     check(dispatcher.dispatch(commands::SetTrackPan{
               emptyBetween,
@@ -371,7 +422,8 @@ int main() {
                   mixer::TrackMixState{{}, {-0.5F}, true, true},
           "loaded track commands must update RT before committing the model");
     check(dispatcher.dispatch(commands::SetTrackSolo{emptyBetween, true}).status ==
-              commands::CommandStatus::accepted && audio.lastGlobalSolo,
+              commands::CommandStatus::accepted &&
+              audio.lastAudibility.trackIsAudible(1),
           "solo on an empty track must still update global RT solo eligibility");
     check(dispatcher.dispatch(commands::SetMasterGain{
               mixer::GainDb{-3.0F}}).status ==
@@ -404,6 +456,11 @@ int main() {
               commands::CommandStatus::accepted,
           "a variable project with prepared tracks should play");
     const auto preparationsWhilePlaying = audio.structuralPrepareRequests;
+    check(dispatcher.dispatch(commands::SetBusGain{
+              busA, mixer::GainDb{-3.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              audio.structuralPrepareRequests == preparationsWhilePlaying,
+          "bus parameters must remain available during playback without a graph rebuild");
     check(dispatcher.dispatch(commands::SetTrackOutputDestination{
               first, routing::TrackOutputDestination::master()}).status ==
               commands::CommandStatus::rejected &&

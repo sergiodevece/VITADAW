@@ -39,6 +39,7 @@ struct TrackOutputDestination {
 struct AudioBus {
     BusId id;
     std::string name;
+    mixer::BusMixState mix;
 };
 
 struct TrackRoute {
@@ -52,11 +53,14 @@ public:
     [[nodiscard]] const std::vector<TrackRoute>& trackRoutes() const noexcept;
     [[nodiscard]] const TrackRoute* findTrackRoute(tracks::TrackId track) const noexcept;
     [[nodiscard]] bool containsBus(BusId bus) const noexcept;
+    [[nodiscard]] const AudioBus* findBus(BusId bus) const noexcept;
 
     void addTrack(tracks::TrackId track);
     [[nodiscard]] BusId addBus(std::string name);
     [[nodiscard]] bool setTrackDestination(
         tracks::TrackId track, TrackOutputDestination destination) noexcept;
+    [[nodiscard]] bool setBusMix(BusId bus,
+                                 mixer::BusMixState state) noexcept;
 
 private:
     std::vector<AudioBus> buses_;

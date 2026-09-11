@@ -118,7 +118,39 @@ public:
                                     juce::NotificationType::dontSendNotification);
             controls->meter.setColour(juce::Label::textColourId,
                                       juce::Colours::lightgreen);
+            controls->gain.setRange(mixer::GainDb::silence,
+                                    mixer::GainDb::maximum, 0.1);
+            controls->gain.setValue(bus.mix.gain.value,
+                                    juce::NotificationType::dontSendNotification);
+            controls->gain.setTextValueSuffix(" dB");
+            controls->balance.setRange(mixer::Pan::left, mixer::Pan::right,
+                                       0.01);
+            controls->balance.setValue(
+                bus.mix.balance.value,
+                juce::NotificationType::dontSendNotification);
+            controls->gain.onValueChange = [this, raw = controls.get()] {
+                dispatch(commands::SetBusGain{
+                    raw->bus,
+                    mixer::GainDb{static_cast<float>(raw->gain.getValue())}});
+            };
+            controls->balance.onValueChange = [this, raw = controls.get()] {
+                dispatch(commands::SetBusPan{
+                    raw->bus,
+                    mixer::Pan{static_cast<float>(raw->balance.getValue())}});
+            };
+            controls->mute.onClick = [this, raw = controls.get()] {
+                dispatch(commands::SetBusMute{raw->bus,
+                                              raw->mute.getToggleState()});
+            };
+            controls->solo.onClick = [this, raw = controls.get()] {
+                dispatch(commands::SetBusSolo{raw->bus,
+                                              raw->solo.getToggleState()});
+            };
             addAndMakeVisible(controls->name);
+            addAndMakeVisible(controls->gain);
+            addAndMakeVisible(controls->balance);
+            addAndMakeVisible(controls->mute);
+            addAndMakeVisible(controls->solo);
             addAndMakeVisible(controls->meter);
             busControls_.push_back(std::move(controls));
         }
@@ -236,9 +268,13 @@ public:
             controls.meter.setBounds(row);
         }
         for (auto& controls : busControls_) {
-            auto row = bounds.removeFromTop(30);
-            controls->name.setBounds(row.removeFromLeft(176));
-            controls->meter.setBounds(row.removeFromLeft(240));
+            auto row = bounds.removeFromTop(42);
+            controls->name.setBounds(row.removeFromLeft(80));
+            controls->gain.setBounds(row.removeFromLeft(180));
+            controls->balance.setBounds(row.removeFromLeft(150));
+            controls->mute.setBounds(row.removeFromLeft(64));
+            controls->solo.setBounds(row.removeFromLeft(64));
+            controls->meter.setBounds(row);
         }
         bounds.removeFromTop(8);
         auto masterRow = bounds.removeFromTop(36);
@@ -270,6 +306,12 @@ private:
     struct BusControls {
         routing::BusId bus;
         juce::Label name;
+        juce::Slider gain{juce::Slider::LinearHorizontal,
+                          juce::Slider::TextBoxRight};
+        juce::Slider balance{juce::Slider::LinearHorizontal,
+                             juce::Slider::TextBoxRight};
+        juce::ToggleButton mute{"Mute"};
+        juce::ToggleButton solo{"Solo"};
         juce::Label meter;
     };
 
@@ -327,7 +369,7 @@ MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
     content_ = new AudioStatusComponent(commandDispatcher, project);
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
-    centreWithSize(1040, 700);
+    centreWithSize(1040, 740);
     setResizable(true, false);
     setVisible(true);
 }

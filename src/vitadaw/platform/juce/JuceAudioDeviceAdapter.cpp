@@ -229,7 +229,7 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
 
 bool JuceAudioDeviceAdapter::tryUpdateTrackMix(
     tracks::TrackId track, mixer::PreparedTrackMixState mix,
-    bool anySolo) noexcept {
+    audio::PreparedAudibilityState audibility) noexcept {
     if (preparedProject_ == nullptr || !track.isValid() || !mix.isValid()) {
         return false;
     }
@@ -238,7 +238,7 @@ bool JuceAudioDeviceAdapter::tryUpdateTrackMix(
         preparedProject_->specification.tracks.end(),
         [track](const auto& candidate) { return candidate.id == track; });
     if (planTrack == preparedProject_->specification.tracks.end() ||
-        !realtimeEngine_.tryUpdateTrackMix(track, mix, anySolo)) {
+        !realtimeEngine_.tryUpdateTrackMix(track, mix, audibility)) {
         return false;
     }
     const auto resource = std::find_if(
@@ -247,20 +247,25 @@ bool JuceAudioDeviceAdapter::tryUpdateTrackMix(
     if (resource != preparedProject_->resources.end()) {
         resource->mix = mix;
     }
-    anySolo_ = anySolo;
-    preparedProject_->specification.anySolo = anySolo;
     planTrack->mix = mix;
     return true;
 }
 
-bool JuceAudioDeviceAdapter::tryUpdateGlobalSolo(bool anySolo) noexcept {
-    if (!realtimeEngine_.tryUpdateGlobalSolo(anySolo)) {
+bool JuceAudioDeviceAdapter::tryUpdateBusMix(
+    routing::BusId bus, mixer::PreparedBusMixState mix,
+    audio::PreparedAudibilityState audibility) noexcept {
+    if (preparedProject_ == nullptr || !bus.isValid() || !mix.isValid()) {
         return false;
     }
-    anySolo_ = anySolo;
-    if (preparedProject_ != nullptr) {
-        preparedProject_->specification.anySolo = anySolo;
+    const auto found = std::find_if(
+        preparedProject_->specification.buses.begin(),
+        preparedProject_->specification.buses.end(),
+        [bus](const auto& candidate) { return candidate.id == bus; });
+    if (found == preparedProject_->specification.buses.end() ||
+        !realtimeEngine_.tryUpdateBusMix(bus, mix, audibility)) {
+        return false;
     }
+    found->mix = mix;
     return true;
 }
 
@@ -514,7 +519,6 @@ bool JuceAudioDeviceAdapter::commitPreparedProject(
     preparedProject_.swap(candidate);
     projectSampleRate_ = preparedProject_->specification.projectSampleRate;
     masterMix_ = preparedProject_->specification.masterMix;
-    anySolo_ = preparedProject_->specification.anySolo;
     configureRealtimeEngine();
     modelCommit.execute();
     if (callbackWasRegistered) {

@@ -58,7 +58,9 @@ vitadaw::audio::ProcessingPlanSpecification specification(
     double rate = 48000.0) {
     vitadaw::audio::ProcessingPlanSpecification result;
     result.projectSampleRate = vitadaw::timeline::SampleRate{rate};
-    result.buses.assign(buses.begin(), buses.end());
+    for (const auto& bus : buses) {
+        result.buses.push_back({bus.id, vitadaw::mixer::prepare(bus.mix)});
+    }
     for (std::size_t index = 0; index < tracks.size(); ++index) {
         result.tracks.push_back(
             {tracks[index], {}, destinations[index]});
@@ -88,7 +90,8 @@ RenderResult render(
                         timeline::SampleRate{deviceRate});
     check(engine.tryRequestPlay().accepted, "prepared routed project must play");
     if (update != nullptr) {
-        check(engine.tryUpdateTrackMix({1}, *update, false),
+        check(engine.tryUpdateTrackMix({1}, *update,
+                                       audio::fullyAudibleState()),
               "routed track mixer update must enqueue by resolved identity");
     }
     RenderResult result;
@@ -245,7 +248,6 @@ int main() {
 
     auto soloSpec = specification(twoIds, busA, sameBus);
     soloSpec.tracks[0].mix.solo = true;
-    soloSpec.anySolo = true;
     const auto solo = render(
         audio::prepareProcessingPlan(soloSpec, twoSources, 4), 12, 48000.0);
     check(close(solo.left[0], 0.5F),

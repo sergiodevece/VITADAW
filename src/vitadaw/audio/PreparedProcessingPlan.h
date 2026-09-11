@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/audio/MixerSmoother.h"
+#include "vitadaw/audio/AudibilityState.h"
 #include "vitadaw/audio/PreparedProject.h"
 #include "vitadaw/routing/RoutingState.h"
 
@@ -20,6 +21,8 @@ inline constexpr std::size_t defaultProcessingMemoryBudgetBytes =
     16U * 1024U * 1024U;
 inline constexpr std::size_t masterDestinationIndex =
     std::numeric_limits<std::size_t>::max();
+static_assert(maximumPreparedTracks == audibilityTrackCapacity);
+static_assert(maximumPreparedBuses == audibilityBusCapacity);
 
 struct ProcessingPlanTrackSpecification {
     tracks::TrackId id;
@@ -27,12 +30,16 @@ struct ProcessingPlanTrackSpecification {
     routing::TrackOutputDestination destination;
 };
 
+struct ProcessingPlanBusSpecification {
+    routing::BusId id;
+    mixer::PreparedBusMixState mix;
+};
+
 struct ProcessingPlanSpecification {
     timeline::SampleRate projectSampleRate;
     std::vector<ProcessingPlanTrackSpecification> tracks;
-    std::vector<routing::AudioBus> buses;
+    std::vector<ProcessingPlanBusSpecification> buses;
     mixer::PreparedMasterMixState masterMix;
-    bool anySolo{};
 };
 
 struct PreparedTrackRoute {
@@ -43,6 +50,7 @@ struct PreparedTrackRoute {
 struct PreparedBusNode {
     routing::BusId id;
     std::size_t bufferIndex{};
+    mixer::PreparedBusMixState mix;
 };
 
 enum class ProcessingStepKind : std::uint8_t { track, bus, master };
@@ -61,7 +69,7 @@ struct PreparedProcessingPlan {
     std::size_t blockCapacity{};
     std::size_t runtimeMemoryBytes{};
     mixer::PreparedMasterMixState masterMix;
-    bool anySolo{};
+    PreparedAudibilityState audibility;
 };
 
 struct StereoWorkBuffer {

@@ -76,7 +76,8 @@ std::vector<float> renderSmoothedGain(std::size_t blockSize) {
     engine.configure({timeline::SampleRate{48000.0}, {totalFrames}, tracks});
     makeOperational(engine, 48000.0);
     check(engine.tryRequestPlay().accepted &&
-              engine.tryUpdateTrackMix({1}, mix(1.0F), false),
+              engine.tryUpdateTrackMix({1}, mix(1.0F),
+                                       audio::fullyAudibleState()),
           "buffer equivalence setup must enqueue Play and gain");
     std::vector<float> result(totalFrames), right(totalFrames);
     for (std::size_t offset = 0; offset < totalFrames; offset += blockSize) {
@@ -104,7 +105,8 @@ int main() {
     check(firstLeft[0] == 1.0F && firstRight[0] == 1.0F,
           "gain with no pending target must remain exact");
 
-    check(engine.tryUpdateTrackMix({1}, mix(0.0F), false),
+    check(engine.tryUpdateTrackMix({1}, mix(0.0F),
+                                   audio::fullyAudibleState()),
           "downward gain target must enqueue");
     std::array<float, 5> downLeft{}, downRight{};
     render(engine, downLeft, downRight, 1000.0);
@@ -112,7 +114,8 @@ int main() {
               downLeft[4] == 0.0F,
           "track gain must ramp down linearly over exactly 5 ms");
 
-    check(engine.tryUpdateTrackMix({1}, mix(1.0F), false),
+    check(engine.tryUpdateTrackMix({1}, mix(1.0F),
+                                   audio::fullyAudibleState()),
           "upward gain target must enqueue");
     std::array<float, 5> upLeft{}, upRight{};
     render(engine, upLeft, upRight, 1000.0);
@@ -121,13 +124,15 @@ int main() {
           "track gain must ramp up and land exactly on target");
 
     // Retarget from the instantaneous value, not the original ramp origin.
-    check(engine.tryUpdateTrackMix({1}, mix(0.0F), false),
+    check(engine.tryUpdateTrackMix({1}, mix(0.0F),
+                                   audio::fullyAudibleState()),
           "first rapid fader target must enqueue");
     std::array<float, 2> partialLeft{}, partialRight{};
     render(engine, partialLeft, partialRight, 1000.0);
     check(close(partialLeft[1], 0.6F),
           "first rapid fader move must reach its instantaneous midpoint");
-    check(engine.tryUpdateTrackMix({1}, mix(1.0F), false),
+    check(engine.tryUpdateTrackMix({1}, mix(1.0F),
+                                   audio::fullyAudibleState()),
           "second rapid fader target must enqueue");
     std::array<float, 5> retargetLeft{}, retargetRight{};
     render(engine, retargetLeft, retargetRight, 1000.0);
@@ -142,7 +147,8 @@ int main() {
     panEngine.configure({timeline::SampleRate{1000.0}, {4096}, leftTrack});
     makeOperational(panEngine, 1000.0);
     check(panEngine.tryRequestPlay().accepted &&
-              panEngine.tryUpdateTrackMix({1}, mix(1.0F, 1.0F), false),
+              panEngine.tryUpdateTrackMix({1}, mix(1.0F, 1.0F),
+                                          audio::fullyAudibleState()),
           "left-to-right pan target must enqueue");
     std::array<float, 5> panLeft{}, panRight{};
     render(panEngine, panLeft, panRight, 1000.0);
@@ -150,11 +156,13 @@ int main() {
               panLeft[4] == 0.0F && panRight[4] == 1.0F,
           "pan coefficients must move continuously to the opposite extreme");
 
-    check(panEngine.tryUpdateTrackMix({1}, mix(1.0F, -1.0F), false),
+    check(panEngine.tryUpdateTrackMix({1}, mix(1.0F, -1.0F),
+                                     audio::fullyAudibleState()),
           "first rapid pan target must enqueue");
     std::array<float, 2> partialPanLeft{}, partialPanRight{};
     render(panEngine, partialPanLeft, partialPanRight, 1000.0);
-    check(panEngine.tryUpdateTrackMix({1}, mix(1.0F, 0.0F), false),
+    check(panEngine.tryUpdateTrackMix({1}, mix(1.0F, 0.0F),
+                                     audio::fullyAudibleState()),
           "second rapid pan target must enqueue");
     std::array<float, 5> retargetPanLeft{}, retargetPanRight{};
     render(panEngine, retargetPanLeft, retargetPanRight, 1000.0);
@@ -193,7 +201,8 @@ int main() {
                               {static_cast<std::int64_t>(signal.size())}, tracks});
         makeOperational(rateEngine, rate);
         check(rateEngine.tryRequestPlay().accepted &&
-                  rateEngine.tryUpdateTrackMix({1}, mix(1.0F), false),
+                  rateEngine.tryUpdateTrackMix({1}, mix(1.0F),
+                                               audio::fullyAudibleState()),
               "sample-rate smoothing setup must enqueue");
         std::vector<float> left(rampFrames), right(rampFrames);
         render(rateEngine, left, right, rate);

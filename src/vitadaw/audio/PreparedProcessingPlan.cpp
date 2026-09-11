@@ -1,6 +1,7 @@
 #include "vitadaw/audio/PreparedProcessingPlan.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <memory>
 #include <new>
@@ -87,14 +88,17 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         plan.blockCapacity = blockCapacity;
         plan.runtimeMemoryBytes = runtimeBytes;
         plan.masterMix = specification.masterMix;
-        plan.anySolo = specification.anySolo;
         plan.tracks.reserve(specification.tracks.size());
         plan.buses.reserve(specification.buses.size());
         plan.order.reserve(specification.tracks.size() +
                            specification.buses.size() + 1);
 
         for (std::size_t index = 0; index < specification.buses.size(); ++index) {
-            plan.buses.push_back({specification.buses[index].id, index});
+            if (!specification.buses[index].mix.isValid()) {
+                return {nullptr, "Invalid bus mixer state"};
+            }
+            plan.buses.push_back({specification.buses[index].id, index,
+                                  specification.buses[index].mix});
         }
         for (const auto& track : specification.tracks) {
             if (!track.id.isValid() || !track.mix.isValid() ||
@@ -145,6 +149,21 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             plan.order.push_back({ProcessingStepKind::bus, index});
         }
         plan.order.push_back({ProcessingStepKind::master, 0});
+
+        std::array<AudibilityTrackInput, maximumPreparedTracks>
+            audibilityTracks{};
+        std::array<bool, maximumPreparedBuses> busSolos{};
+        for (std::size_t index = 0; index < plan.tracks.size(); ++index) {
+            audibilityTracks[index] = {
+                plan.tracks[index].destinationBusIndex,
+                specification.tracks[index].mix.solo};
+        }
+        for (std::size_t index = 0; index < plan.buses.size(); ++index) {
+            busSolos[index] = specification.buses[index].mix.solo;
+        }
+        plan.audibility = resolveAudibility(
+            {audibilityTracks.data(), plan.tracks.size()},
+            {busSolos.data(), plan.buses.size()});
 
         ProcessingPlanRuntime runtime{plan.buses.size(), blockCapacity};
         return {std::make_unique<PreparedProcessingBundle>(

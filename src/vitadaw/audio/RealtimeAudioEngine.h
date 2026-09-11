@@ -48,8 +48,10 @@ public:
     [[nodiscard]] AudioControlRequestResult tryRequestStop() noexcept;
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track, mixer::PreparedTrackMixState mix,
-        bool anySolo) noexcept;
-    [[nodiscard]] bool tryUpdateGlobalSolo(bool anySolo) noexcept;
+        PreparedAudibilityState audibility) noexcept;
+    [[nodiscard]] bool tryUpdateBusMix(
+        routing::BusId bus, mixer::PreparedBusMixState mix,
+        PreparedAudibilityState audibility) noexcept;
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept;
     [[nodiscard]] RealtimeTransportSnapshot transportSnapshot() const noexcept;
@@ -71,14 +73,18 @@ private:
     struct TrackMixCommand {
         std::size_t trackIndex{};
         mixer::PreparedTrackMixState mix;
-        bool anySolo{};
+        PreparedAudibilityState audibility;
+    };
+    struct BusMixCommand {
+        std::size_t busIndex{};
+        mixer::PreparedBusMixState mix;
+        PreparedAudibilityState audibility;
     };
     struct MasterMixCommand {
         mixer::PreparedMasterMixState mix;
     };
-    struct GlobalSoloCommand { bool anySolo{}; };
-    using ParameterCommand = std::variant<TrackMixCommand, MasterMixCommand,
-                                          GlobalSoloCommand>;
+    using ParameterCommand =
+        std::variant<TrackMixCommand, BusMixCommand, MasterMixCommand>;
     static_assert(std::is_trivially_copyable_v<ParameterCommand>);
 
     [[nodiscard]] AudioControlRequestResult enqueue(CommandType type) noexcept;
@@ -118,8 +124,10 @@ private:
     std::atomic<AudioCommandSequence> lastResolvedCommandSequence_{};
     std::array<TrackMixSmoother, maximumTrackCount> trackMix_{};
     std::size_t trackMixCount_{};
+    std::array<BusMixSmoother, maximumBusCount> busMix_{};
+    std::size_t busMixCount_{};
     MasterMixSmoother masterMix_;
-    bool anySolo_{};
+    PreparedAudibilityState audibility_;
     std::array<ParameterCommand, parameterCommandCapacity> parameterCommands_{};
     std::atomic<std::size_t> parameterWriteIndex_{};
     std::atomic<std::size_t> parameterReadIndex_{};

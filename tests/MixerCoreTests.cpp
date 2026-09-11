@@ -147,38 +147,44 @@ int main() {
     audio::RealtimeAudioEngine engine;
     engine.configure({timeline::SampleRate{48000.0}, {4096}, baseTracks, {}});
     makeOperational(engine);
-    check(engine.tryUpdateTrackMix({1}, mix(1.0F, 0.0F, true, false), false) &&
+    check(engine.tryUpdateTrackMix({1}, mix(1.0F, 0.0F, true, false),
+                                   audio::fullyAudibleState()) &&
               engine.tryRequestPlay().accepted,
           "a prepared track must accept a lightweight mute update");
     const auto muted = renderOne(engine);
     check(close(muted.left, 0.25F * rootHalf) &&
               engine.transportSnapshot().position.value == 1,
           "muted track must contribute zero while the master clock advances");
-    check(engine.tryUpdateTrackMix({1}, mix(), false),
+    check(engine.tryUpdateTrackMix({1}, mix(),
+                                   audio::fullyAudibleState()),
           "unmute update must be accepted");
     const auto unmuted = renderOne(engine);
     check(close(unmuted.left, 0.5F * rootHalf) &&
               engine.transportSnapshot().position.value == 2,
           "unmute must restore audio without changing clock continuity");
 
+    audio::PreparedAudibilityState firstTrackAudible;
+    firstTrackAudible.setTrack(0);
     check(engine.tryUpdateTrackMix(
-              {1}, mix(1.0F, 0.0F, false, true), true) &&
+              {1}, mix(1.0F, 0.0F, false, true), firstTrackAudible) &&
               engine.tryUpdateTrackMix(
-                  {2}, mix(1.0F, 0.0F, false, false), true),
+                  {2}, mix(1.0F, 0.0F, false, false), firstTrackAudible),
           "solo and pan updates must enqueue");
     const auto oneSolo = renderOne(engine);
     check(close(oneSolo.left, 0.25F * rootHalf) &&
               close(oneSolo.right, 0.25F * rootHalf),
           "one solo must exclude every non-solo track");
+    auto bothTracksAudible = firstTrackAudible;
+    bothTracksAudible.setTrack(1);
     check(engine.tryUpdateTrackMix(
-              {2}, mix(1.0F, 0.0F, false, true), true),
+              {2}, mix(1.0F, 0.0F, false, true), bothTracksAudible),
           "a second solo must enqueue");
     const auto twoSolo = renderOne(engine);
     check(close(twoSolo.left, 0.5F * rootHalf) &&
               close(twoSolo.right, 0.5F * rootHalf),
           "multiple solos must contribute together");
     check(engine.tryUpdateTrackMix(
-              {2}, mix(1.0F, 0.0F, true, true), true),
+              {2}, mix(1.0F, 0.0F, true, true), bothTracksAudible),
           "mute plus solo must enqueue");
     const auto muteSolo = renderOne(engine);
     check(close(muteSolo.left, 0.25F * rootHalf) &&
@@ -235,8 +241,10 @@ int main() {
 
     const auto durationBeforeSolo = engine.transportSnapshot().duration;
     const auto positionBeforeSolo = engine.transportSnapshot().position;
-    check(engine.tryUpdateTrackMix({1}, mix(), true) &&
-              engine.tryUpdateTrackMix({2}, mix(), false),
+    check(engine.tryUpdateTrackMix({1}, mix(),
+                                   audio::fullyAudibleState()) &&
+              engine.tryUpdateTrackMix({2}, mix(),
+                                       audio::fullyAudibleState()),
           "removing every solo must enqueue");
     static_cast<void>(renderOne(engine));
     check(engine.transportSnapshot().duration == durationBeforeSolo &&
@@ -244,11 +252,12 @@ int main() {
                   positionBeforeSolo.value + 1,
           "adding or removing solo must not alter duration or clock progression");
 
-    check(engine.tryUpdateGlobalSolo(true),
+    check(engine.tryUpdateTrackMix({1}, mix(), {}),
           "solo eligibility from an empty track must enqueue");
     check(renderOne(engine) == audio::StereoSample{},
           "an empty solo track must silence loaded non-solo tracks");
-    check(engine.tryUpdateGlobalSolo(false),
+    check(engine.tryUpdateTrackMix({1}, mix(),
+                                   audio::fullyAudibleState()),
           "removing empty-track solo eligibility must enqueue");
     static_cast<void>(renderOne(engine));
 

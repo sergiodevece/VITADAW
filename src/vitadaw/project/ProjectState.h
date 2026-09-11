@@ -31,6 +31,10 @@ public:
     [[nodiscard]] bool setTrackOutputDestination(
         tracks::TrackId track,
         routing::TrackOutputDestination destination) noexcept;
+    [[nodiscard]] const routing::AudioBus* findBus(
+        routing::BusId bus) const noexcept;
+    [[nodiscard]] bool setBusMix(routing::BusId bus,
+                                 mixer::BusMixState state) noexcept;
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
     [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;

@@ -28,6 +28,22 @@ namespace vitadaw::audio {
             input.right * mix.linearGain * rightPan};
 }
 
+[[nodiscard]] inline StereoSample applyTrackMixResolved(
+    StereoSample input, std::uint32_t sourceChannelCount,
+    const mixer::PreparedTrackMixState& mix, bool pathIsAudible) noexcept {
+    if (mix.muted || !pathIsAudible) {
+        return {};
+    }
+
+    if (sourceChannelCount == 1) {
+        input.right = input.left;
+        return {input.left * mix.linearGain * mix.monoLeft,
+                input.right * mix.linearGain * mix.monoRight};
+    }
+    return {input.left * mix.linearGain * mix.stereoLeft,
+            input.right * mix.linearGain * mix.stereoRight};
+}
+
 inline void applyMasterGain(StereoSample& sample,
                             mixer::PreparedMasterMixState master) noexcept {
     sample.left *= master.linearGain;

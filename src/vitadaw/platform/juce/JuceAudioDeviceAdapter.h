@@ -47,8 +47,10 @@ public:
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track,
         mixer::PreparedTrackMixState mix,
-        bool anySolo) noexcept override;
-    [[nodiscard]] bool tryUpdateGlobalSolo(bool anySolo) noexcept override;
+        audio::PreparedAudibilityState audibility) noexcept override;
+    [[nodiscard]] bool tryUpdateBusMix(
+        routing::BusId bus, mixer::PreparedBusMixState mix,
+        audio::PreparedAudibilityState audibility) noexcept override;
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;
@@ -94,7 +96,6 @@ private:
     timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;
     mixer::PreparedMasterMixState masterMix_;
-    bool anySolo_{};
     std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
     std::atomic<bool> suppressLifecycleNotification_{};
     bool callbackRegistered_{};

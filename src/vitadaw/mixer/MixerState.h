@@ -43,6 +43,17 @@ struct TrackMixState {
     bool operator==(const TrackMixState&) const = default;
 };
 
+struct BusMixState {
+    GainDb gain;
+    Pan balance;
+    bool muted{};
+    bool solo{};
+    [[nodiscard]] bool isValid() const noexcept {
+        return gain.isValid() && balance.isValid();
+    }
+    bool operator==(const BusMixState&) const = default;
+};
+
 struct MasterMixState {
     GainDb gain;
     [[nodiscard]] bool isValid() const noexcept { return gain.isValid(); }
@@ -99,6 +110,24 @@ struct PreparedMasterMixState {
     }
 };
 
+struct PreparedBusMixState {
+    static constexpr float maximumLinearGain =
+        PreparedTrackMixState::maximumLinearGain;
+    float linearGain{1.0F};
+    float leftBalance{1.0F};
+    float rightBalance{1.0F};
+    bool muted{};
+    bool solo{};
+    [[nodiscard]] bool isValid() const noexcept {
+        return std::isfinite(linearGain) && linearGain >= 0.0F &&
+               linearGain <= maximumLinearGain &&
+               std::isfinite(leftBalance) && leftBalance >= 0.0F &&
+               leftBalance <= 1.0F &&
+               std::isfinite(rightBalance) && rightBalance >= 0.0F &&
+               rightBalance <= 1.0F;
+    }
+};
+
 [[nodiscard]] inline PreparedTrackMixState prepare(
     const TrackMixState& state) noexcept {
     return prepareLinear(state.gain.linear(), state.pan, state.muted,
@@ -108,6 +137,15 @@ struct PreparedMasterMixState {
 [[nodiscard]] inline PreparedMasterMixState prepare(
     const MasterMixState& state) noexcept {
     return {state.gain.linear()};
+}
+
+[[nodiscard]] inline PreparedBusMixState prepare(
+    const BusMixState& state) noexcept {
+    const auto trackEquivalent = prepareLinear(
+        state.gain.linear(), state.balance, state.muted, state.solo);
+    return {trackEquivalent.linearGain, trackEquivalent.stereoLeft,
+            trackEquivalent.stereoRight, trackEquivalent.muted,
+            trackEquivalent.solo};
 }
 
 } // namespace vitadaw::mixer

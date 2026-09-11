@@ -26,6 +26,13 @@ bool RoutingState::containsBus(BusId bus) const noexcept {
                        [bus](const auto& candidate) { return candidate.id == bus; });
 }
 
+const AudioBus* RoutingState::findBus(BusId bus) const noexcept {
+    const auto found = std::find_if(
+        buses_.begin(), buses_.end(),
+        [bus](const auto& candidate) { return candidate.id == bus; });
+    return found == buses_.end() ? nullptr : &*found;
+}
+
 void RoutingState::addTrack(tracks::TrackId track) {
     if (!track.isValid() || findTrackRoute(track) != nullptr) {
         throw std::invalid_argument{"Invalid or duplicate routing track identity"};
@@ -39,9 +46,24 @@ BusId RoutingState::addBus(std::string name) {
         throw std::overflow_error{"Bus identity space exhausted"};
     }
     const auto id = nextBusId_;
-    buses_.push_back({id, std::move(name)});
+    buses_.push_back({id, std::move(name), {}});
     ++nextBusId_.value;
     return id;
+}
+
+bool RoutingState::setBusMix(BusId bus,
+                             mixer::BusMixState state) noexcept {
+    if (!state.isValid()) {
+        return false;
+    }
+    const auto found = std::find_if(
+        buses_.begin(), buses_.end(),
+        [bus](const auto& candidate) { return candidate.id == bus; });
+    if (found == buses_.end()) {
+        return false;
+    }
+    found->mix = state;
+    return true;
 }
 
 bool RoutingState::setTrackDestination(

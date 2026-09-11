@@ -19,7 +19,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.2.0";
+        return "0.2.1";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {

@@ -189,7 +189,7 @@ int main() {
     const std::array routedSources{view(*routedResource)};
     audio::ProcessingPlanSpecification routedSpecification;
     routedSpecification.projectSampleRate = timeline::SampleRate{100.0};
-    routedSpecification.buses.push_back({{1}, "Lifetime bus"});
+    routedSpecification.buses.push_back({{1}, {}});
     routedSpecification.tracks.push_back(
         {{1}, {}, routing::TrackOutputDestination::toBus({1})});
     auto routedPreparation = audio::prepareProcessingPlan(

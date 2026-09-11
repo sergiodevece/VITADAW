@@ -1,10 +1,12 @@
-# VitaDAW 0.2.0 — Routing Foundation
+# VitaDAW 0.2.1 — Bus Mixer Controls
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
 el dispositivo de audio y carga y reproduce una colección variable de pistas WAV
 sincronizadas. El incremento 0.2.0 sustituye la suma directa al master por un
 plan portable preparado con buses estéreo, destinos de pista y metering de bus.
+El incremento 0.2.1 convierte esos buses en canales funcionales con gain,
+balance, mute, solo y smoothing sample-accurate.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -166,6 +168,20 @@ publicación del transporte. No depende de JUCE. `JuceAudioDeviceAdapter`
 conserva la adaptación del dispositivo, la decodificación WAV y el ownership de
 los buffers y de la topología preparada.
 
+Cada bus conserva ahora un `BusMixState` portable con gain de −100 a +12 dB,
+balance estéreo de −1 a +1, mute y solo. Sus coeficientes DSP se preparan fuera
+de RT. Gain y balance usan las mismas rampas de 5 ms que las pistas; mute y solo
+son discretos. El flujo es acumulación → gain/balance → mute/solo → bus meter →
+Master, de modo que un bus muteado o excluido por Solo marca cero.
+
+Solo se resuelve separando selección y camino audible. Sin solos quedan abiertas
+todas las pistas y buses. Un Track Solo abre esa pista y el bus que necesita;
+un Bus Solo abre el bus y todas las pistas que lo alimentan. Varios solos forman
+la unión de esas selecciones, incluidas pistas directas a Master. Mute prevalece
+en el propio nodo. La aplicación publica el resultado como máscaras densas junto
+al cambio de parámetro, evitando búsquedas de IDs o interpretación del grafo en
+el callback.
+
 La carga tiene dos fases. `prepareWav` realiza y captura fuera de RT cualquier
 operación que puede fallar; `ProjectState` prepara también el nuevo clip y el
 mensaje. El commit detiene el callback, intercambia el recurso, ejecuta el
@@ -206,6 +222,8 @@ La arquitectura y las reglas de tiempo real se describen en
   peak metering portable por pista y master.
 - **0.2.0 — Routing Foundation:** `RoutingState`, buses estéreo, destinos
   Track→Bus/Master y ejecución mediante un plan RT preparado.
+- **0.2.1 — Bus Mixer Controls:** gain, balance, mute y solo de bus con
+  smoothing y resolución portable de caminos audibles.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -217,4 +235,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.1.0.md`](docs/validation-0.1.0.md) y
 [`docs/validation-0.1.1.md`](docs/validation-0.1.1.md) y
 [`docs/validation-0.1.2.md`](docs/validation-0.1.2.md) y
-[`docs/validation-0.2.0.md`](docs/validation-0.2.0.md).
+[`docs/validation-0.2.0.md`](docs/validation-0.2.0.md) y
+[`docs/validation-0.2.1.md`](docs/validation-0.2.1.md).
