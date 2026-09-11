@@ -16,8 +16,6 @@ class FakeAudioEngine final : public vitadaw::audio::IAudioEngineControl {
 public:
     struct ResourceCounters {
         int destroyed{};
-        int destroyedInRealtime{};
-        bool realtimeActive{};
     };
 
     class PreparedFile final : public vitadaw::audio::PreparedAudioFile {
@@ -33,9 +31,6 @@ public:
 
         ~PreparedFile() override {
             ++counters.destroyed;
-            if (counters.realtimeActive) {
-                ++counters.destroyedInRealtime;
-            }
         }
 
         std::filesystem::path file;
@@ -216,9 +211,8 @@ int main() {
     const auto firstReplacement = dispatcher.dispatch(commands::LoadAudioFile{
         "first-replacement.wav", tracks::AudioTrackSlot::first});
     check(firstReplacement.status == commands::CommandStatus::accepted &&
-              audio.resourceCounters.destroyed == 1 &&
-              audio.resourceCounters.destroyedInRealtime == 0,
-          "successive load should destroy the old real resource outside RT");
+              audio.resourceCounters.destroyed == 1,
+          "successive load should destroy the old owned resource");
     check(app.project().tracks()[0].clip->sourceFile == "first-replacement.wav",
           "resource replacement should commit model and engine together");
 
@@ -304,9 +298,8 @@ int main() {
 
     const auto destroyedBeforeClose = audio.resourceCounters.destroyed;
     audio.close();
-    check(audio.resourceCounters.destroyed == destroyedBeforeClose + 2 &&
-              audio.resourceCounters.destroyedInRealtime == 0,
-          "closing should destroy every live resource outside RT");
+    check(audio.resourceCounters.destroyed == destroyedBeforeClose + 2,
+          "closing should destroy every live resource");
 
     std::cout << "All command-flow tests passed\n";
     return EXIT_SUCCESS;

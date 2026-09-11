@@ -171,7 +171,10 @@ int main() {
     check(engine.transportSnapshot().lastProcessedCommandSequence == lastAccepted &&
               engine.transportSnapshot().playing,
           "wrapped queue commands should execute in FIFO order, not just resolve a maximum");
-    for (std::size_t index = 0; index < audio::RealtimeAudioEngine::commandCapacity - 1;
+    const auto firstAfterFull = engine.tryRequestStop();
+    check(firstAfterFull.accepted && firstAfterFull.sequence == lastAccepted + 1,
+          "queue-full rejection must not consume a command sequence");
+    for (std::size_t index = 1; index < audio::RealtimeAudioEngine::commandCapacity - 1;
          ++index) {
         check(engine.tryRequestStop().accepted,
               "ring queue should remain usable after index wrap-around");

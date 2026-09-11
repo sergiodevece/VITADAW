@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vitadaw/audio/CommandLifecycleGate.h"
 #include "vitadaw/audio/IRealtimeAudioProcessor.h"
 #include "vitadaw/audio/DeviceProcessingState.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
@@ -50,7 +51,6 @@ public:
 private:
     static_assert(std::atomic<std::size_t>::is_always_lock_free);
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
-    static_assert(std::atomic<DeviceProcessingState>::is_always_lock_free);
 
     enum class CommandType : std::uint8_t { play, stop };
     struct QueuedCommand {
@@ -73,10 +73,7 @@ private:
     std::array<QueuedCommand, commandCapacity> commands_{};
     std::atomic<std::size_t> commandWriteIndex_{};
     std::atomic<std::size_t> commandReadIndex_{};
-    std::atomic<AudioCommandSequence> nextCommandSequence_{1};
-    std::atomic<std::uint64_t> generation_{};
-    std::atomic<DeviceProcessingState> deviceState_{
-        DeviceProcessingState::unavailable};
+    CommandLifecycleGate lifecycleGate_;
     std::atomic<AudioCommandSequence> lastResolvedCommandSequence_{};
 };
 

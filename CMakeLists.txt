@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.0.8 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.0.9 LANGUAGES C CXX)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -112,4 +112,16 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_audio_preparation_tests tests/AudioPreparationTests.cpp)
     target_link_libraries(vitadaw_audio_preparation_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_audio_preparation_tests COMMAND vitadaw_audio_preparation_tests)
+
+    add_executable(vitadaw_command_lifecycle_gate_tests
+        tests/CommandLifecycleGateTests.cpp)
+    target_link_libraries(vitadaw_command_lifecycle_gate_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_command_lifecycle_gate_tests
+        COMMAND vitadaw_command_lifecycle_gate_tests)
+
+    add_executable(vitadaw_realtime_resource_lifetime_tests
+        tests/RealtimeResourceLifetimeTests.cpp)
+    target_link_libraries(vitadaw_realtime_resource_lifetime_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_realtime_resource_lifetime_tests
+        COMMAND vitadaw_realtime_resource_lifetime_tests)
 endif()

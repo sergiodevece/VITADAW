@@ -1,11 +1,11 @@
-# VitaDAW 0.0.8 — Lifecycle and Transaction Hardening
+# VitaDAW 0.0.9 — Concurrency Closure
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
 el dispositivo de audio y carga y reproduce dos archivos WAV en exactamente dos
-pistas sincronizadas. El incremento 0.0.8 no añade funciones visibles: cierra
-la disponibilidad real del dispositivo, la cancelación de comandos durante su
-lifecycle y la publicación transaccional de un WAV entre motor y proyecto.
+pistas sincronizadas. El incremento 0.0.9 cierra formalmente la carrera entre
+aceptación de comandos y lifecycle, y demuestra la liberación segura de recursos
+después del último uso posible desde RT.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -80,6 +80,13 @@ dispositivo, o la entrada efectiva en `processBlock`, antes de permitir Play.
 Retirar y volver a registrar el callback no basta por sí solo para declarar el
 dispositivo operativo.
 
+La aceptación usa un gate atómico único que contiene estado y generación. El
+productor reclama temporalmente el gate, reserva y escribe el comando todavía
+invisible, y lo acepta mediante un CAS final. Ese CAS es el punto de
+linearización; el índice de cola se publica después. El cierre de lifecycle
+compite sobre el mismo gate: si queda después de la aceptación, su watermark
+incluye la secuencia; si queda antes, el CAS de aceptación falla.
+
 `Load Track 1 WAV` y `Load Track 2 WAV` aceptan únicamente archivos `.wav` que
 `juce::WavAudioFormat` pueda decodificar. `Play` reproduce simultáneamente todas
 las pistas disponibles y `Stop` detiene y vuelve al inicio. Si ninguna pista
@@ -126,10 +133,13 @@ La arquitectura y las reglas de tiempo real se describen en
   determinista, duración exclusiva y `processBlock` portable.
 - **0.0.8 — Lifecycle and Transaction Hardening:** disponibilidad real del
   consumidor, cancelación concurrente y carga WAV transaccional.
+- **0.0.9 — Concurrency Closure:** admisión linealizable de comandos y lifetime
+  de recursos verificado frente a regiones RT activas.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
 [`docs/validation-0.0.4.md`](docs/validation-0.0.4.md) y
 [`docs/validation-0.0.6.md`](docs/validation-0.0.6.md) y
 [`docs/validation-0.0.7.md`](docs/validation-0.0.7.md) y
-[`docs/validation-0.0.8.md`](docs/validation-0.0.8.md).
+[`docs/validation-0.0.8.md`](docs/validation-0.0.8.md) y
+[`docs/validation-0.0.9.md`](docs/validation-0.0.9.md).

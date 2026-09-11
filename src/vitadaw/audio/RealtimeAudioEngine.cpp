@@ -19,10 +19,7 @@ void RealtimeAudioEngine::deviceInitialising() noexcept {
 }
 
 void RealtimeAudioEngine::deviceConsumerStarted() noexcept {
-    auto expected = DeviceProcessingState::initializing;
-    static_cast<void>(deviceState_.compare_exchange_strong(
-        expected, DeviceProcessingState::operational,
-        std::memory_order_acq_rel, std::memory_order_acquire));
+    lifecycleGate_.consumerStarted();
 }
 
 void RealtimeAudioEngine::deviceStopped() noexcept {
@@ -38,17 +35,13 @@ void RealtimeAudioEngine::deviceUnavailable() noexcept {
 }
 
 DeviceProcessingState RealtimeAudioEngine::deviceState() const noexcept {
-    return deviceState_.load(std::memory_order_acquire);
+    return lifecycleGate_.state();
 }
 
 void RealtimeAudioEngine::transitionAwayFromOperational(
     DeviceProcessingState state) noexcept {
-    deviceState_.store(state, std::memory_order_release);
-    generation_.fetch_add(1, std::memory_order_acq_rel);
-    const auto next = nextCommandSequence_.load(std::memory_order_acquire);
-    if (next > 0) {
-        resolveCommandsThrough(next - 1);
-    }
+    const auto closure = lifecycleGate_.close(state);
+    resolveCommandsThrough(closure.cancellationWatermark);
     clock_.stopAndRewind();
     publishTransport();
 }
@@ -118,32 +111,37 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
 }
 
 AudioControlRequestResult RealtimeAudioEngine::enqueue(CommandType type) noexcept {
-    const auto generation = generation_.load(std::memory_order_acquire);
-    if (deviceState() != DeviceProcessingState::operational) {
+    const auto claim = lifecycleGate_.tryClaim();
+    if (!claim.active) {
         return {};
     }
 
     const auto write = commandWriteIndex_.load(std::memory_order_relaxed);
     const auto nextWrite = (write + 1) % commandCapacity;
     if (nextWrite == commandReadIndex_.load(std::memory_order_acquire)) {
+        lifecycleGate_.reject(claim);
         return {};
     }
 
-    const auto sequence = nextCommandSequence_.fetch_add(1, std::memory_order_relaxed);
-    commands_[write] = {type, sequence, generation};
+    const auto sequence = lifecycleGate_.reserveSequence(claim);
+    if (sequence == 0) {
+        lifecycleGate_.reject(claim);
+        return {};
+    }
+    commands_[write] = {type, sequence, claim.generation};
+
+    if (!lifecycleGate_.tryAccept(claim)) {
+        return {};
+    }
+    // The command becomes visible to RT only after its acceptance point.
     commandWriteIndex_.store(nextWrite, std::memory_order_release);
-
-    if (deviceState() != DeviceProcessingState::operational ||
-        generation_.load(std::memory_order_acquire) != generation) {
-        return {};
-    }
     return {true, sequence};
 }
 
 void RealtimeAudioEngine::consumeCommands() noexcept {
     auto read = commandReadIndex_.load(std::memory_order_relaxed);
     const auto write = commandWriteIndex_.load(std::memory_order_acquire);
-    const auto generation = generation_.load(std::memory_order_acquire);
+    const auto generation = lifecycleGate_.generation();
     while (read != write) {
         const auto queued = commands_[read];
         read = (read + 1) % commandCapacity;

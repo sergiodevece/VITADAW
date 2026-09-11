@@ -136,14 +136,44 @@ ambas revisiones son iguales y pares. La lectura realiza como máximo tres
 intentos y, si todos coinciden con una publicación, devuelve el último snapshot
 coherente del único consumidor. No espera indefinidamente.
 
-La cola conserva capacidad fija de ocho posiciones y una generación de
-lifecycle. Toda transición hacia `initializing`, `stopped`, `error` o
-`unavailable` deja primero de aceptar comandos, incrementa la generación,
-marca como resuelta toda secuencia ya emitida, rebobina y publica un snapshot
-`Stopped` en cero. Los comandos antiguos que aún permanezcan en el anillo se
-consumen sin ejecutarse al volver el dispositivo. La comprobación final de
-estado y generación al encolar garantiza que una carrera `Play`/lifecycle acaba
-o bien rechazada, o bien aceptada y cubierta por la marca de cancelación.
+La cola conserva capacidad fija de ocho posiciones. `CommandLifecycleGate`
+empaqueta estado y generación en un único `atomic<uint64_t>` siempre lock-free;
+el estado interno transitorio `claimed` pertenece al único productor SPSC. El
+protocolo de enqueue es:
+
+1. el productor observa `operational` y cambia mediante CAS el token completo a
+   `claimed`, conservando la generación;
+2. comprueba espacio antes de reservar una secuencia; si la cola está llena,
+   devuelve el gate y rechaza sin crear huecos de secuencia;
+3. reserva una secuencia y escribe el comando en el slot, todavía invisible para
+   RT porque el índice de escritura no ha cambiado;
+4. intenta el CAS `claimed(g) -> operational(g)`. El éxito de este CAS es el
+   punto de linearización de la aceptación;
+5. solo después del éxito publica el índice con release. Si el CAS falla, el
+   comando se rechaza y el slot nunca se publica.
+
+El cierre de lifecycle ejecuta un CAS sobre el mismo gate hacia un estado no
+operativo y la generación siguiente. Ese CAS es su punto de linearización. A
+continuación lee el siguiente número de secuencia, resuelve hasta `next - 1`,
+rebobina y publica el snapshot final. Las relaciones son:
+
+- si el CAS de aceptación precede al cierre en el orden de modificación del
+  gate, el acquire del cierre observa el release de aceptación. La reserva de
+  secuencia, anterior al release, sucede antes de la lectura del watermark y
+  queda incluida en la cancelación;
+- si el cierre sustituye primero `operational` o `claimed`, el CAS final del
+  productor no puede coincidir con su token completo y el comando se rechaza;
+- si el productor comienza después del cierre, no puede reclamar el estado no
+  operativo. Solo una confirmación de consumidor abre la nueva generación.
+
+Por ello ninguna ejecución C++20 puede aceptar una secuencia fuera tanto de la
+cola consumible como del watermark de una generación cerrada. Que el índice se
+publique después de aceptar no abre una ventana: un cierre intermedio ya ha
+resuelto esa secuencia, y el comando publicado conserva la generación antigua,
+por lo que un consumidor posterior lo descarta. El contador no envuelve: al
+agotar el espacio de 64 bits se rechazan nuevas reservas. La generación tampoco
+envuelve; tras agotar sus 61 bits el gate queda en error terminal. El wrap-around
+normal del índice circular sigue siendo seguro y está probado.
 
 `audioDeviceAboutToStart` no demuestra que exista consumo: JUCE también lo
 invoca al añadir un callback a un objeto retenido. Por eso solo establece
@@ -206,6 +236,15 @@ el recurso del slot, configura las vistas RT y ejecuta la acción de modelo
 callback. El recurso anterior queda temporalmente en el objeto preparado y se
 destruye en el hilo de aplicación una vez que RT ya no lo referencia.
 
+La garantía de lifetime depende de la misma serialización que usa producción:
+`AudioDeviceManager::removeAudioCallback` espera el bloqueo interno que protege
+la invocación del callback. Cuando retorna, ningún callback puede conservar una
+vista del recurso sustituido. El adaptador configura las vistas nuevas y el
+último owner antiguo se libera fuera de RT. El test de lifetime reproduce esta
+frontera con una región RT controlada: sustitución y cierre quedan bloqueados
+mientras la vista está activa, y el destructor instrumentado falla si coincide
+con cualquier usuario RT.
+
 Rutas, apertura, creación del reader, decodificación, buffers y metadatos están
 dentro de la frontera de excepciones de preparación. `std::bad_alloc`,
 `std::exception` y excepciones desconocidas se convierten en resultados de error
@@ -250,9 +289,11 @@ publicados y el candidato, limitando también el pico durante una sustitución.
 7. **Completado en 0.0.7:** endurecer intercambio RT, lifecycle, duración,
    validación y extraer el `processBlock` portable.
 8. **Completado en 0.0.8:** exigir un consumidor real para Play, cerrar carreras
-   de lifecycle y publicar cada WAV como una transacción motor/modelo. La
-   instrumentación permanente y los smoke tests multiplataforma continúan
-   siendo trabajo futuro.
+   de lifecycle y publicar cada WAV como una transacción motor/modelo.
+9. **Completado en 0.0.9:** linearizar enqueue frente al cierre de generación y
+   demostrar la destrucción real de recursos después de que RT quede quiescente.
+   Los smoke tests en otros backends y plataformas continúan siendo trabajo
+   futuro.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.
