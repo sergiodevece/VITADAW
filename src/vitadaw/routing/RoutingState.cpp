@@ -38,6 +38,13 @@ const AudioBus* RoutingState::findBus(BusId bus) const noexcept {
     return found == buses_.end() ? nullptr : &*found;
 }
 
+AudioBus* RoutingState::findBusMutable(BusId bus) noexcept {
+    const auto found = std::find_if(
+        buses_.begin(), buses_.end(),
+        [bus](const auto& candidate) { return candidate.id == bus; });
+    return found == buses_.end() ? nullptr : &*found;
+}
+
 const SendRoute* RoutingState::findSend(SendId send) const noexcept {
     const auto found = std::find_if(
         sends_.begin(), sends_.end(),
@@ -58,7 +65,8 @@ BusId RoutingState::addBus(std::string name) {
         throw std::overflow_error{"Bus identity space exhausted"};
     }
     const auto id = nextBusId_;
-    buses_.push_back({id, std::move(name), {}, OutputDestination::master()});
+    buses_.push_back(
+        {id, std::move(name), {}, OutputDestination::master(), {}});
     ++nextBusId_.value;
     return id;
 }

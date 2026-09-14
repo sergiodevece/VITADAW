@@ -20,7 +20,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.2.4";
+        return "0.3.0";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -91,6 +91,18 @@ public:
                     buses[1].id, buses[4].id,
                     routing::SendTapPoint::postFaderPostPan,
                     mixer::GainDb{-6.0F}}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::AddProcessor{
+                    tracks[0].id,
+                    {processors::internalGainProcessorType}}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::AddProcessor{
+                    buses[0].id,
+                    {processors::internalGainProcessorType}}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::AddProcessor{
+                    processors::MasterTarget{},
+                    {processors::internalGainProcessorType}}));
         }
         mainWindow_ = std::make_unique<MainWindow>(
             audioDevice_->state(), *commandDispatcher_,

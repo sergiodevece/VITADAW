@@ -2,6 +2,7 @@
 
 #include "vitadaw/clips/AudioClip.h"
 #include "vitadaw/mixer/MixerState.h"
+#include "vitadaw/processors/ProcessorState.h"
 
 #include <compare>
 #include <cstdint>
@@ -22,6 +23,7 @@ struct AudioTrack {
     std::string name;
     std::optional<clips::AudioClip> clip;
     mixer::TrackMixState mix;
+    processors::InsertChain inserts;
 
     [[nodiscard]] bool hasAudio() const noexcept { return clip.has_value(); }
 };

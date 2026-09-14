@@ -70,6 +70,17 @@ bool JuceAudioDeviceAdapter::initialise() {
         publishState();
         return false;
     }
+    if (auto* device = deviceManager_.getCurrentAudioDevice()) {
+        deviceSampleRate_ = timeline::SampleRate{
+            device->getCurrentSampleRate()};
+    }
+    std::string preparationError;
+    if (!reprepareForCurrentDevice(preparationError)) {
+        realtimeEngine_.deviceError();
+        stateModel_.markError(std::move(preparationError));
+        publishState();
+        return false;
+    }
     attachAudioCallback();
     refreshState();
     return stateModel_.state().status == audio::AudioDeviceStatus::active;
@@ -79,6 +90,24 @@ bool JuceAudioDeviceAdapter::reinitialise() { return initialise(); }
 void JuceAudioDeviceAdapter::shutdown() noexcept { closeDevice(true); }
 
 void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
+    if (preparedProject_ != nullptr && deviceSampleRate_.isValid() &&
+        preparedProject_->specification.processingSampleRate !=
+            deviceSampleRate_) {
+        const auto callbackWasRegistered = callbackRegistered_;
+        detachAudioCallback();
+        std::string error;
+        if (!reprepareForCurrentDevice(error)) {
+            realtimeEngine_.deviceError();
+            stateModel_.markError(std::move(error));
+            publishState();
+            return;
+        }
+        if (callbackWasRegistered) {
+            attachAudioCallback();
+        }
+        refreshState();
+        return;
+    }
     const auto event = pendingLifecycleEvent_.exchange(PendingLifecycleEvent::none,
                                                         std::memory_order_acq_rel);
     if (event == PendingLifecycleEvent::error) {
@@ -298,6 +327,77 @@ bool JuceAudioDeviceAdapter::tryUpdateMasterMix(
     return true;
 }
 
+namespace {
+
+processors::ProcessorState* findProcessorState(
+    audio::ProcessingPlanSpecification& specification,
+    processors::ProcessorInstanceId processor) noexcept {
+    const auto findIn = [processor](processors::InsertChain& chain)
+        -> processors::ProcessorState* {
+        const auto found = std::find_if(
+            chain.processors.begin(), chain.processors.end(),
+            [processor](const auto& candidate) {
+                return candidate.id == processor;
+            });
+        return found == chain.processors.end() ? nullptr : &*found;
+    };
+    for (auto& track : specification.tracks) {
+        if (auto* found = findIn(track.inserts)) {
+            return found;
+        }
+    }
+    for (auto& bus : specification.buses) {
+        if (auto* found = findIn(bus.inserts)) {
+            return found;
+        }
+    }
+    return findIn(specification.masterInserts);
+}
+
+} // namespace
+
+bool JuceAudioDeviceAdapter::tryUpdateProcessorBypass(
+    processors::ProcessorInstanceId processor, bool bypassed) noexcept {
+    if (preparedProject_ == nullptr) {
+        return false;
+    }
+    auto* state = findProcessorState(preparedProject_->specification,
+                                     processor);
+    if (state == nullptr ||
+        !realtimeEngine_.tryUpdateProcessorBypass(processor, bypassed)) {
+        return false;
+    }
+    state->bypassed = bypassed;
+    return true;
+}
+
+bool JuceAudioDeviceAdapter::tryUpdateProcessorParameter(
+    processors::ProcessorInstanceId processor,
+    processors::ParameterId parameter, float desiredValue,
+    float preparedValue) noexcept {
+    if (preparedProject_ == nullptr || !std::isfinite(desiredValue) ||
+        !std::isfinite(preparedValue)) {
+        return false;
+    }
+    auto* state = findProcessorState(preparedProject_->specification,
+                                     processor);
+    if (state == nullptr) {
+        return false;
+    }
+    const auto found = std::find_if(
+        state->parameters.begin(), state->parameters.end(),
+        [parameter](const auto& candidate) {
+            return candidate.id == parameter;
+        });
+    if (found == state->parameters.end() ||
+        !realtimeEngine_.tryUpdateProcessorParameter(
+            processor, parameter, preparedValue)) {
+        return false;
+    }
+    found->value = desiredValue;
+    return true;
+}
+
 bool JuceAudioDeviceAdapter::commitPreparedWav(
     audio::PreparedAudioFilePtr prepared,
     audio::AudioFileCommitAction modelCommit) noexcept {
@@ -481,15 +581,22 @@ bool JuceAudioDeviceAdapter::prepareProjectPlan(
     PreparedProject& candidate,
     const audio::ProcessingPlanSpecification& specification,
     std::string& errorMessage) {
+    auto effectiveSpecification = specification;
+    effectiveSpecification.processingSampleRate =
+        deviceSampleRate_.isValid() ? deviceSampleRate_
+                                    : specification.projectSampleRate;
+    effectiveSpecification.processingMode =
+        processors::ProcessingMode::realtime;
     std::vector<audio::PreparedTrackView> sources;
     sources.reserve(candidate.resources.size());
     for (auto& resource : candidate.resources) {
         const auto track = std::find_if(
-            specification.tracks.begin(), specification.tracks.end(),
+            effectiveSpecification.tracks.begin(),
+            effectiveSpecification.tracks.end(),
             [id = resource.id](const auto& candidateTrack) {
                 return candidateTrack.id == id;
             });
-        if (track == specification.tracks.end()) {
+        if (track == effectiveSpecification.tracks.end()) {
             errorMessage = "Prepared audio resource has no routing track";
             return false;
         }
@@ -505,7 +612,7 @@ bool JuceAudioDeviceAdapter::prepareProjectPlan(
         view.clipStart = {0};
         view.clipDuration = timeline::sourceFramesToProjectDuration(
             view.frameCount, view.sourceSampleRate,
-            specification.projectSampleRate);
+            effectiveSpecification.projectSampleRate);
         view.sourceOffset = {0};
         view.mix = track->mix;
         for (std::size_t channel = 0; channel < view.channelCount; ++channel) {
@@ -514,13 +621,32 @@ bool JuceAudioDeviceAdapter::prepareProjectPlan(
         }
         sources.push_back(view);
     }
-    auto prepared = audio::prepareProcessingPlan(specification, sources);
+    auto prepared = audio::prepareProcessingPlan(effectiveSpecification,
+                                                 sources);
     if (!prepared.success()) {
         errorMessage = std::move(prepared.errorMessage);
         return false;
     }
-    candidate.specification = specification;
+    candidate.specification = std::move(effectiveSpecification);
     candidate.processing = std::move(prepared.prepared);
+    return true;
+}
+
+bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
+    std::string& errorMessage) {
+    if (preparedProject_ == nullptr) {
+        return true;
+    }
+    auto candidate = std::make_unique<PreparedProject>();
+    candidate->resources = preparedProject_->resources;
+    if (!prepareProjectPlan(*candidate, preparedProject_->specification,
+                            errorMessage)) {
+        return false;
+    }
+    preparedProject_.swap(candidate);
+    projectSampleRate_ = preparedProject_->specification.projectSampleRate;
+    masterMix_ = preparedProject_->specification.masterMix;
+    configureRealtimeEngine();
     return true;
 }
 

@@ -1,4 +1,4 @@
-# VitaDAW 0.2.4 — Bus Sends
+# VitaDAW 0.3.0 — Processor & Insert Core
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -13,6 +13,10 @@ pista hacia buses existentes, con taps pre/post, nivel suavizado, mute propio y
 Solo resuelto por rama. VitaDAW 0.2.4 activa además sends cuyo origen es un bus,
 los integra en el DAG y conserva un único procesamiento de cada bus aunque tenga
 varias ramas.
+VitaDAW 0.3.0 incorpora el primer contrato DSP portable y cadenas de inserts en
+pistas, buses y Master. El procesador interno `internal.gain` se ejecuta por
+subbloques, admite parámetros suavizados y bypass con latencia preservada. No se
+aloja ningún plugin externo ni se compensa todavía la latencia entre rutas.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -69,7 +73,7 @@ ctest --test-dir build-core --output-on-failure
 En macOS:
 
 ```sh
-open build/vitadaw_app_artefacts/VitaDAW.app
+open build/vitadaw_app_artefacts/Debug/VitaDAW.app
 ```
 
 En Windows y Linux, ejecuta `VitaDAW` desde el directorio de artefactos que
@@ -143,8 +147,11 @@ No existe ya atenuación fija por pista, clamp ni limiter: `float` puede superar
 Los valores dB y coeficientes trigonométricos de pan se convierten fuera del
 callback. Un ring SPSC acotado de 64 entradas (63 pendientes utilizables)
 publica estados DSP completos y el motor los aplica al inicio de bloque sobre
-almacenamiento preasignado. El estado global de solo incluye también pistas
-vacías. Una cola llena rechaza el comando explícitamente y el modelo no cambia.
+almacenamiento preasignado. El mismo ring admite eventos triviales de parámetro
+y bypass de procesador con generación de plan, índice denso, `ParameterId`,
+valor ya validado y offset futuro —cero en 0.3.0—. El estado global de solo
+incluye también pistas vacías. Una cola llena rechaza el comando explícitamente
+y el modelo no cambia.
 
 Gain y coeficientes de pan por pista, y gain master, usan rampas lineales de
 5 ms avanzadas por frame de dispositivo. Su duración no depende del tamaño del
@@ -212,6 +219,77 @@ recorrido del proyecto preparado, el render por pista, la acumulación y la
 publicación del transporte. No depende de JUCE. `JuceAudioDeviceAdapter`
 conserva la adaptación del dispositivo, la decodificación WAV y el ownership de
 los buffers y de la topología preparada.
+
+## Processor & Insert Core 0.3.0
+
+El modelo editable conserva un `InsertChain` dentro de cada `AudioTrack`,
+`AudioBus` y Master. Cada `ProcessorState` contiene solo configuración portable:
+`ProcessorInstanceId` monotónico, tipo estable, parámetros deseados,
+serialized state reservado y bypass. No contiene una instancia DSP viva. Los
+targets de comandos son el variant fuerte `TrackId | BusId | MasterTarget`;
+el resto de operaciones usa la identidad global del procesador.
+
+La compilación candidata crea instancias nuevas mediante
+`IAudioProcessorFactory`, llama a `prepare()` con un `ProcessingFormat` explícito
+y resuelve descriptors, rangos de cadena, índices de parámetros, latencias,
+tail y scratch. El `PreparedProcessingBundle` posee en exclusiva plan, runtime,
+`unique_ptr<IAudioProcessor>`, dos buffers scratch por nodo y las líneas dry de
+bypass. El commit sigue siendo transaccional y quiescente: una preparación
+fallida conserva modelo, instancias y audio anteriores; el bundle retirado se
+destruye fuera de cualquier región RT que pudiera observarlo.
+
+Los flujos quedan fijados así:
+
+```text
+TrackRenderer -> Track Inserts -> Track PRE tap -> Gain/Pan/Mute
+                                           -> Track POST tap -> Meter/Main
+
+Bus accumulation -> Bus Inserts -> Bus PRE tap -> Gain/Balance/Mute
+                                         -> Bus POST tap -> Meter/Main
+
+Master accumulation -> Master Inserts -> Master Gain -> Meter -> Output
+```
+
+Una pista mono atraviesa su cadena en mono y solo después se adapta mediante la
+ley de pan equal-power existente. Buses y Master procesan estéreo. Track/Bus
+Sends conservan sus puntos pre/post, ahora posteriores a los inserts del nodo.
+Mute, Solo y fan-out no evitan ni duplican el procesamiento: cada procesador se
+invoca exactamente una vez por subbloque de su nodo, aunque la señal sea cero o
+la rama no sea audible.
+
+`IAudioProcessor` es distinto de `IRealtimeAudioProcessor`: el primero es el
+contrato DSP portable para inserts; el segundo sigue siendo únicamente la
+frontera del callback de dispositivo. El contrato DSP recibe vistas de bloque
+mono/estéreo, contexto de tiempo y modo realtime/offline, y expone `prepare`,
+`processBlock noexcept`, `reset`, latencia, tail y capacidades de aliasing. La
+frecuencia de procesamiento coincide con la del dispositivo activo; una
+reapertura con otro sample rate recrea y prepara las instancias fuera del
+callback antes de volver a publicar el consumidor.
+
+`internal.gain` admite de −100 a +12 dB, con unity en 0 dB, silencio exacto en
+−100 dB y smoothing lineal de 5 ms propiedad del propio procesador. El cambio
+de parámetro y bypass se aplica al comienzo del callback. El bypass es host-side:
+el procesador continúa ejecutándose para conservar su estado y el dry se retrasa
+por la latencia declarada antes de sustituir discretamente al wet.
+
+La latencia usa `ProcessingFrameCount` y suma comprobada. El plan conserva
+latencia de cada cadena, taps pre/post, cada arista main/send —incluidas ramas
+paralelas—, entradas de buses y entrada/salida Master. Las convergencias se
+representan como intervalos mínimo/máximo. **0.3.0 no implementa PDC**: las
+rutas con latencia diferente permanecen desalineadas de forma deliberada. El
+tail se clasifica como none/finite/infinite/unknown, pero aún no se drena tras
+el final lógico; los tests de delay añaden silencio dentro del recurso.
+
+`Stop`, fin natural, sustitución de proyecto y restart de dispositivo resetean
+procesadores y líneas de bypass antes del siguiente Play. Un Stop→Play rápido
+se consume FIFO y el reset actúa como barrera antes de arrancar de nuevo. El
+ejecutor realtime y offline es el mismo; solo cambia `ProcessingMode`.
+
+Los límites iniciales son 16 procesadores por cadena, 512 instancias preparadas,
+256 pistas, 64 buses, 1024 sends y 32 MiB para plan/runtime/scratch portable.
+Se reservan dos buffers estéreo máximos por nodo —las pistas mono usan un canal—;
+no existe todavía reutilización avanzada, PDC, automatización, plugins externos,
+inserts multicanal, tails audibles ni cambios estructurales durante Play.
 
 Cada bus conserva ahora un `BusMixState` portable con gain de −100 a +12 dB,
 balance estéreo de −1 a +1, mute y solo. Sus coeficientes DSP se preparan fuera
@@ -288,6 +366,9 @@ La arquitectura y las reglas de tiempo real se describen en
   pre/post, level, mute, smoothing y audibilidad preparada por aristas.
 - **0.2.4 — Bus Sends:** sends Bus→Bus audibles, taps pre/post de bus,
   integración completa en el DAG y Solo wet-only con permisos por arista.
+- **0.3.0 — Processor & Insert Core:** contrato DSP portable, cadenas de
+  inserts Track/Bus/Master, GainProcessor, parámetros RT, bypass con latencia y
+  metadata de latencia por rutas sin PDC.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -303,4 +384,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.2.1.md`](docs/validation-0.2.1.md) y
 [`docs/validation-0.2.2.md`](docs/validation-0.2.2.md) y
 [`docs/validation-0.2.3.md`](docs/validation-0.2.3.md) y
-[`docs/validation-0.2.4.md`](docs/validation-0.2.4.md).
+[`docs/validation-0.2.4.md`](docs/validation-0.2.4.md) y
+[`docs/validation-0.3.0.md`](docs/validation-0.3.0.md).

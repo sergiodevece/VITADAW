@@ -56,6 +56,14 @@ public:
         mixer::PreparedSendMixState mix) noexcept override;
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept override;
+    [[nodiscard]] bool tryUpdateProcessorBypass(
+        processors::ProcessorInstanceId processor,
+        bool bypassed) noexcept override;
+    [[nodiscard]] bool tryUpdateProcessorParameter(
+        processors::ProcessorInstanceId processor,
+        processors::ParameterId parameter,
+        float desiredValue,
+        float preparedValue) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestStop() noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
@@ -86,6 +94,7 @@ private:
         PreparedProject& candidate,
         const audio::ProcessingPlanSpecification& specification,
         std::string& errorMessage);
+    [[nodiscard]] bool reprepareForCurrentDevice(std::string& errorMessage);
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
         audio::AudioFileCommitAction modelCommit) noexcept;

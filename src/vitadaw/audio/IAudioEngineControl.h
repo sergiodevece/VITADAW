@@ -102,6 +102,11 @@ public:
         mixer::PreparedSendMixState mix) noexcept = 0;
     [[nodiscard]] virtual bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept = 0;
+    [[nodiscard]] virtual bool tryUpdateProcessorBypass(
+        processors::ProcessorInstanceId, bool) noexcept { return false; }
+    [[nodiscard]] virtual bool tryUpdateProcessorParameter(
+        processors::ProcessorInstanceId,
+        processors::ParameterId, float, float) noexcept { return false; }
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestStop() noexcept = 0;
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;

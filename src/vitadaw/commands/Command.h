@@ -2,6 +2,7 @@
 
 #include "vitadaw/tracks/AudioTrack.h"
 #include "vitadaw/routing/RoutingState.h"
+#include "vitadaw/processors/InsertTarget.h"
 
 #include <filesystem>
 #include <string>
@@ -61,6 +62,24 @@ struct SetSendRoute {
 struct RemoveSend { routing::SendId send; };
 struct SetSendLevel { routing::SendId send; mixer::GainDb level; };
 struct SetSendMute { routing::SendId send; bool muted{}; };
+struct AddProcessor {
+    processors::InsertTarget target;
+    processors::ProcessorType type;
+};
+struct RemoveProcessor { processors::ProcessorInstanceId processor; };
+struct MoveProcessor {
+    processors::ProcessorInstanceId processor;
+    std::size_t newIndex{};
+};
+struct SetProcessorBypass {
+    processors::ProcessorInstanceId processor;
+    bool bypassed{};
+};
+struct SetProcessorParameter {
+    processors::ProcessorInstanceId processor;
+    processors::ParameterId parameter;
+    float value{};
+};
 
 using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
                              SetTrackGain, SetTrackPan, SetTrackMute,
@@ -69,7 +88,9 @@ using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
                              SetTrackOutputDestination,
                              SetBusOutputDestination, AddTrackSend, AddBusSend,
                              SetSendRoute, RemoveSend, SetSendLevel,
-                             SetSendMute>;
+                             SetSendMute, AddProcessor, RemoveProcessor,
+                             MoveProcessor, SetProcessorBypass,
+                             SetProcessorParameter>;
 
 enum class CommandStatus {
     accepted,

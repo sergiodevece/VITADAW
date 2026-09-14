@@ -31,6 +31,8 @@ al motor.
 - `commands`: mensajes de intención, resultados y despacho.
 - `audio`: contratos de control no-RT y procesamiento RT.
 - `mixer`: estado portable, unidades y preparación DSP de gain/pan.
+- `processors`: configuración editable, contrato DSP portable, factory e
+  implementación interna de procesadores.
 - `transport`: estado lógico de reproducción y posición.
 - `tracks`: colección variable de pistas, cada una con identidad estable y un
   único clip opcional en este incremento.
@@ -699,7 +701,163 @@ bus, 256 pistas, 64 buses, estéreo y 16 MiB para el plan/runtime portable.
 No se añaden inserts, plugins, PDC, feedback, automatización, PFL/AFL,
 solo-safe, multicanal, routing durante Play ni meters por send.
 
-## Evolución hasta 0.2.4
+## Processor & Insert Core 0.3.0
+
+### Dos fronteras distintas
+
+`IRealtimeAudioProcessor` conserva una única responsabilidad: adaptar el buffer
+de salida que entrega el dispositivo a `RealtimeAudioEngine`. No representa un
+insert. El nuevo `processors::IAudioProcessor` es core-only y define la unidad
+DSP insertable:
+
+```text
+prepare(ProcessingFormat)       // no RT; puede reservar o fallar
+processBlock(context, in, out)  // noexcept, acotado, sin reservas
+reset()                         // noexcept y con procesamiento quiescente
+applyParameter(event)           // noexcept; valor ya validado
+latency / tail / capabilities
+```
+
+`ProcessingFormat` fija sample rate de procesamiento, block size máximo,
+layout mono/estéreo y modo realtime/offline. `AudioBlockView` y
+`ConstAudioBlockView` expresan canales y frames explícitos. El tiempo del
+contexto sigue siendo `PreciseProjectFramePosition`; la latencia DSP utiliza el
+tipo distinto `ProcessingFrameCount`, por lo que no puede sumarse
+accidentalmente a frames de archivo, proyecto o dispositivo.
+
+El sample rate lógico del proyecto continúa siendo la autoridad temporal. El
+sample rate del procesador es el del contexto de ejecución/dispositivo y no
+puede ser redefinido por un WAV ni por el procesador. El adaptador detecta una
+reapertura con frecuencia distinta, retira el callback, recrea/prepara el bundle
+y vuelve a registrar el consumidor. El motor rechaza procesar un bundle cuyo
+formato no coincida con el callback recibido.
+
+### Modelo editable, compilación y ownership
+
+Cada `AudioTrack`, `AudioBus` y Master posee su `InsertChain`. Sus
+`ProcessorState` contienen `ProcessorInstanceId` global y monotónico, tipo
+estable —`internal.gain` en esta versión—, parámetros deseados, bypass y un
+campo portable reservado para serialized state. Nunca contienen el objeto DSP.
+`InsertTarget = TrackId | BusId | MasterTarget` identifica el owner solo al
+crear; remove, move, bypass y parámetros usan después `ProcessorInstanceId`.
+
+```text
+ProjectState editable
+  -> ProcessingPlanSpecification con InsertChains
+  -> factory crea instancias candidatas
+  -> prepare + validación de formato/latencia/memoria
+  -> PreparedProcessorDescriptor + rangos por nodo
+  -> ProcessingPlanRuntime posee instancias/scratch/bypass delay
+  -> PreparedProcessingBundle candidato
+  -> commit quiescente y transaccional
+```
+
+No se comparte una instancia mutable entre planes. Cada compilación recrea
+todo el runtime candidato; si type, estado, formato, capacidad, memoria,
+latencia o `prepare()` fallan, no se publica ninguna parte. Tras el swap, el
+owner viejo se destruye en aplicación y solo después de retirar el callback.
+Los tests de lifetime bloquean una región `processBlock` real y demuestran que
+la instancia anterior sigue viva hasta la quiescencia.
+
+El plan limita 16 inserts por cadena y 512 procesadores totales. Su presupuesto
+portable sube a 32 MiB e incluye descriptors, mappings, runtime declarado,
+líneas dry de bypass, dos scratch por nodo, buses, master, sends y tabla de
+posiciones. Toda multiplicación y suma de tamaño se comprueba antes de reservar.
+
+### Orden de señal y granularidad DSP
+
+```text
+Track:
+source render -> INSERT CHAIN (layout fuente)
+              -> PRE tap -> Gain -> Pan -> Mute/Solo -> POST tap -> Meter/Main
+
+Bus:
+input accumulation -> INSERT CHAIN (stereo)
+                   -> PRE tap -> Gain -> Balance -> Mute/Solo
+                   -> POST tap -> Meter/Main
+
+Master:
+master accumulation -> INSERT CHAIN (stereo)
+                    -> Master Gain -> Master Meter -> Output
+```
+
+El Track pre-tap ya no significa «antes de insert»: significa después de la
+cadena y antes del channel fader/pan. El Bus pre-tap sigue la misma regla. Una
+pista mono atraviesa todos sus inserts como mono; la conversión equal-power a
+estéreo ocurre después y no cambia la ley de pan existente.
+
+Cada nodo llena un scratch con todo el subbloque, ejecuta cada insert una vez y
+solo entonces recorre las muestras para gain/pan, taps, sends, metering y
+routing. Fan-out, sends paralelos, mute, solo o silencio no vuelven a invocar ni
+omiten el procesador. Las llamadas virtuales son por procesador/subbloque, nunca
+por muestra. Callbacks de 64, 128, 256, 512, 1024 frames y mayores que la
+capacidad conservan reloj, smoothers y orden.
+
+Hay dos buffers scratch máximos por nodo. Un procesador out-of-place alterna
+entre ambos; para uno exclusivamente in-place, el host copia la entrada al
+scratch alterno y entrega allí input/output con aliasing. Así conserva además
+la entrada dry original para el bypass. La capacidad queda resuelta en el plan
+y no requiere consultas virtuales adicionales en RT. No existen buffers de
+audio por send.
+
+### Parámetros, bypass y generaciones
+
+`SetProcessorParameter` direcciona
+`ProcessorInstanceId + ParameterId`. La aplicación valida y prepara el valor;
+el motor resuelve fuera de RT el índice denso y publica un evento trivial con
+generación de plan, índice de procesador, `ParameterId`, valor y frame offset.
+Solo se acepta offset cero en 0.3.0. El callback consume el ring SPSC de 64
+entradas al principio del callback y descarta generaciones obsoletas. Si está
+lleno, motor y `ProjectState` conservan el valor anterior.
+
+`GainProcessor` soporta mono/estéreo, −100..+12 dB, 0 dB unity, −100 dB como
+cero exacto, latencia cero y tail none. Su rampa lineal de 5 ms vive dentro de
+la instancia: el host no duplica estado de smoothing de parámetros internos.
+
+El bypass es host-controlled y discreto al comienzo de callback. El procesador
+sigue recibiendo bloques para conservar su historia. Paralelamente, una línea
+dry preasignada avanza siempre; si el insert está bypassed, sustituye el wet por
+el dry retrasado exactamente por la latencia declarada. No hay crossfade en esta
+versión y un toggle puede producir discontinuidad audible.
+
+### Latencia, tail y reset
+
+La suma de latencia de cadena es comprobada. `PreparedProcessingPlan` conserva:
+
+- latencia de cada insert y cadena;
+- latencia en pre/post tap de pista y bus;
+- latencia de cada output principal;
+- latencia individual de cada Track/Bus Send, sin colapsar aristas paralelas;
+- intervalos mínimo/máximo de llegada a buses convergentes;
+- entrada y salida de Master.
+
+Mute, Solo, bypass o −100 dB no modifican este grafo. **No hay PDC en 0.3.0**:
+la metadata hace visible el problema, pero dos caminos con latencias diferentes
+continúan llegando desalineados.
+
+`TailInfo` distingue none, finite, infinite y unknown. No se drenan tails tras
+el final lógico: los tests del `FixedLatencyTestProcessor` incluyen los ceros
+necesarios dentro de la duración del recurso. Esta es una limitación deliberada.
+
+Stop, fin natural, sustitución de bundle y salida del lifecycle operativo
+resetean instancias y bypass delays. El consumo FIFO de Stop→Play ejecuta el
+reset antes de arrancar, incluso si ambos comandos llegan al mismo callback.
+El primer bloque posterior marca `discontinuity` en su contexto. El mismo
+`RealtimeAudioEngine` se usa en modo realtime y offline; con los mismos límites
+de bloque y eventos produce el mismo resultado.
+
+### Límites conscientes de 0.3.0
+
+- Solo existe `internal.gain`; no hay hosting AU/VST3 ni ABI de plugins.
+- No hay PDC, automatización sample-accurate, tails audibles ni crossfade de
+  bypass.
+- No hay inserts multicanal ni negociación de layouts más allá de mono/estéreo.
+- No se modifica estructura durante Play.
+- No hay procesamiento paralelo, pools avanzados ni reutilización de scratch.
+- La cadena completa se recrea en cada cambio estructural; el future state
+  externo podrá reconstruir únicamente los valores aceptados.
+
+## Evolución hasta 0.3.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -737,6 +895,9 @@ solo-safe, multicanal, routing durante Play ni meters por send.
     auxiliares, con identidad estable, parámetros RT y Solo por aristas.
 17. **Completado en 0.2.4:** activar Bus Sends pre/post, incorporarlos al DAG y
     separar contenido upstream de permiso Main para Solo wet-only.
+18. **Completado en 0.3.0:** introducir contrato DSP portable, cadenas de
+    inserts Track/Bus/Master, ejecución por subbloques, parámetros y bypass
+    generation-safe, y metadata completa de latencia sin implementar PDC.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

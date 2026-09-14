@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <new>
@@ -15,15 +16,75 @@ namespace vitadaw::audio {
 StereoWorkBuffer::StereoWorkBuffer(std::size_t capacity)
     : left(capacity), right(capacity) {}
 
+ProcessorNodeScratch::ProcessorNodeScratch(std::size_t capacity)
+    : first(capacity), second(capacity) {}
+
+BypassDelayLine::BypassDelayLine(processors::ProcessingFrameCount latency,
+                                 std::size_t channelCount)
+    : latency_(static_cast<std::size_t>(latency.value)),
+      channelCount_(channelCount) {
+    for (std::size_t channel = 0; channel < channelCount_; ++channel) {
+        samples_[channel].resize(latency_);
+    }
+}
+
+void BypassDelayLine::reset() noexcept {
+    for (std::size_t channel = 0; channel < channelCount_; ++channel) {
+        std::fill(samples_[channel].begin(), samples_[channel].end(), 0.0F);
+    }
+    writePosition_ = 0;
+}
+
+void BypassDelayLine::process(audio::ConstAudioBlockView input,
+                              audio::AudioBlockView output,
+                              bool writeOutput) noexcept {
+    const auto channels = std::min({input.channelCount, output.channelCount,
+                                    channelCount_});
+    const auto frames = std::min(input.frameCount, output.frameCount);
+    if (input.channels == nullptr || output.channels == nullptr) {
+        return;
+    }
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        const auto position = writePosition_;
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+            const auto source = input.channels[channel][frame];
+            const auto delayed = latency_ == 0 ? source
+                                               : samples_[channel][position];
+            if (latency_ != 0) {
+                samples_[channel][position] = source;
+            }
+            if (writeOutput) {
+                output.channels[channel][frame] = delayed;
+            }
+        }
+        if (latency_ != 0) {
+            writePosition_ = (writePosition_ + 1) % latency_;
+        }
+    }
+}
+
+std::size_t BypassDelayLine::memoryBytes() const noexcept {
+    return latency_ * channelCount_ * sizeof(float);
+}
+
 ProcessingPlanRuntime::ProcessingPlanRuntime(std::size_t busCount,
                                              std::size_t sendCount,
+                                             std::size_t nodeCount,
                                              std::size_t capacity)
     : sendMix(sendCount), master(capacity), projectPositions(capacity) {
     buses.reserve(busCount);
     for (std::size_t index = 0; index < busCount; ++index) {
         buses.emplace_back(capacity);
     }
+    processorScratch.reserve(nodeCount);
+    for (std::size_t index = 0; index < nodeCount; ++index) {
+        processorScratch.emplace_back(capacity);
+    }
 }
+
+PreparedProcessingBundle::PreparedProcessingBundle(
+    PreparedProcessingPlan preparedPlan, ProcessingPlanRuntime preparedRuntime)
+    : plan(std::move(preparedPlan)), runtime(std::move(preparedRuntime)) {}
 
 namespace {
 
@@ -45,20 +106,66 @@ namespace {
     return true;
 }
 
-} // namespace
+[[nodiscard]] bool checkedLatencyAdd(
+    processors::ProcessingFrameCount left,
+    processors::ProcessingFrameCount right,
+    processors::ProcessingFrameCount& result) noexcept {
+    if (left.value > std::numeric_limits<std::uint64_t>::max() - right.value) {
+        return false;
+    }
+    result.value = left.value + right.value;
+    return true;
+}
 
-PreparedProcessingBundle::PreparedProcessingBundle(
-    PreparedProcessingPlan preparedPlan, ProcessingPlanRuntime preparedRuntime)
-    : plan(std::move(preparedPlan)), runtime(std::move(preparedRuntime)) {}
+[[nodiscard]] bool addLatency(PreparedLatencyRange input,
+                              processors::ProcessingFrameCount added,
+                              PreparedLatencyRange& result) noexcept {
+    return checkedLatencyAdd(input.minimum, added, result.minimum) &&
+           checkedLatencyAdd(input.maximum, added, result.maximum);
+}
+
+void mergeLatency(bool& hasValue, PreparedLatencyRange& destination,
+                  PreparedLatencyRange value) noexcept {
+    if (!hasValue) {
+        destination = value;
+        hasValue = true;
+        return;
+    }
+    destination.minimum.value =
+        std::min(destination.minimum.value, value.minimum.value);
+    destination.maximum.value =
+        std::max(destination.maximum.value, value.maximum.value);
+}
+
+struct PendingProcessorRuntime {
+    std::unique_ptr<processors::IAudioProcessor> instance;
+    processors::ProcessingFrameCount latency;
+    std::size_t channelCount{};
+    bool bypassed{};
+};
+
+} // namespace
 
 ProcessingPlanPreparationResult prepareProcessingPlan(
     const ProcessingPlanSpecification& specification,
     std::span<const PreparedTrackView> sources,
     std::size_t blockCapacity,
-    std::size_t memoryBudgetBytes) noexcept {
+    std::size_t memoryBudgetBytes,
+    const processors::IAudioProcessorFactory* processorFactory) noexcept {
     try {
+        const auto* factory = processorFactory != nullptr
+                                  ? processorFactory
+                                  : &processors::internalAudioProcessorFactory();
         if (!specification.projectSampleRate.isValid()) {
             return {nullptr, "Project sample rate must be finite and positive"};
+        }
+        const auto processingSampleRate =
+            specification.processingSampleRate.isValid()
+                ? specification.processingSampleRate
+                : specification.projectSampleRate;
+        if (!processingSampleRate.isValid() || blockCapacity == 0 ||
+            !specification.masterMix.isValid()) {
+            return {nullptr, "Invalid processing format or master state"};
         }
         if (specification.tracks.size() > maximumPreparedTracks) {
             return {nullptr, "Prepared track capacity exceeded"};
@@ -69,19 +176,47 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         if (specification.sends.size() > maximumPreparedSends) {
             return {nullptr, "Prepared send capacity exceeded"};
         }
-        if (blockCapacity == 0 || !specification.masterMix.isValid()) {
-            return {nullptr, "Invalid processing format or master state"};
+
+        std::size_t processorCount = specification.masterInserts.processors.size();
+        if (specification.masterInserts.processors.size() >
+            maximumPreparedProcessorsPerChain) {
+            return {nullptr, "Prepared processors-per-chain capacity exceeded"};
+        }
+        for (const auto& track : specification.tracks) {
+            if (track.inserts.processors.size() >
+                maximumPreparedProcessorsPerChain ||
+                !checkedAdd(processorCount, track.inserts.processors.size(),
+                            processorCount)) {
+                return {nullptr, "Prepared processors-per-chain capacity exceeded"};
+            }
+        }
+        for (const auto& bus : specification.buses) {
+            if (bus.inserts.processors.size() >
+                maximumPreparedProcessorsPerChain ||
+                !checkedAdd(processorCount, bus.inserts.processors.size(),
+                            processorCount)) {
+                return {nullptr, "Prepared processors-per-chain capacity exceeded"};
+            }
+        }
+        if (processorCount > maximumPreparedProcessors) {
+            return {nullptr, "Prepared processor capacity exceeded"};
         }
 
-        const auto bufferCount = specification.buses.size() + 1;
-        constexpr auto channelCount = std::size_t{2};
-        std::size_t bufferSampleBytes{};
-        if (!checkedMultiply(bufferCount, channelCount * sizeof(float),
-                             bufferSampleBytes)) {
-            return {nullptr, "Processing buffer size overflow"};
-        }
+        const auto nodeCount = specification.tracks.size() +
+                               specification.buses.size() + 1;
+        const auto mixBufferCount = specification.buses.size() + 1;
+        constexpr auto stereoSampleBytes = std::size_t{2} * sizeof(float);
+        constexpr auto nodeScratchSampleBytes = std::size_t{4} * sizeof(float);
+        std::size_t mixBytesPerFrame{};
+        std::size_t scratchBytesPerFrame{};
         std::size_t bytesPerFrame{};
-        if (!checkedAdd(bufferSampleBytes, sizeof(double), bytesPerFrame)) {
+        if (!checkedMultiply(mixBufferCount, stereoSampleBytes,
+                             mixBytesPerFrame) ||
+            !checkedMultiply(nodeCount, nodeScratchSampleBytes,
+                             scratchBytesPerFrame) ||
+            !checkedAdd(mixBytesPerFrame, scratchBytesPerFrame,
+                        bytesPerFrame) ||
+            !checkedAdd(bytesPerFrame, sizeof(double), bytesPerFrame)) {
             return {nullptr, "Processing buffer size overflow"};
         }
         std::size_t preparedBytes{};
@@ -108,12 +243,14 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                               sizeof(PreparedSendIndex)) ||
             !addPreparedArray(specification.sends.size(),
                               sizeof(SendMixSmoother)) ||
+            !addPreparedArray(processorCount,
+                              sizeof(PreparedProcessorDescriptor)) ||
+            !addPreparedArray(processorCount,
+                              sizeof(PreparedProcessorIndex)) ||
+            !addPreparedArray(processorCount, sizeof(ProcessorRuntime)) ||
             !addPreparedArray(stepCount, sizeof(ProcessingStep)) ||
             !addPreparedArray(1, sizeof(PreparedAudibilityState))) {
             return {nullptr, "Prepared processing size overflow"};
-        }
-        if (preparedBytes > memoryBudgetBytes) {
-            return {nullptr, "Processing buffers exceed the memory budget"};
         }
 
         std::unordered_set<std::uint64_t> busIds;
@@ -160,9 +297,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         std::unordered_set<std::uint64_t> sendIds;
         sendIds.reserve(specification.sends.size());
         std::unordered_map<std::uint64_t, std::size_t> sendsPerTrack;
-        sendsPerTrack.reserve(specification.tracks.size());
         std::unordered_map<std::uint64_t, std::size_t> sendsPerBus;
-        sendsPerBus.reserve(specification.buses.size());
         for (const auto& send : specification.sends) {
             if (!send.id.isValid() || !send.destination.isValid() ||
                 !busIds.contains(send.destination.value) ||
@@ -170,25 +305,17 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                 !sendIds.insert(send.id.value).second) {
                 return {nullptr, "Invalid or duplicate send routing state"};
             }
-            if (const auto* track =
-                    std::get_if<tracks::TrackId>(&send.source)) {
-                if (!track->isValid() || !trackIds.contains(track->value)) {
-                    return {nullptr, "Track send source does not exist"};
-                }
-                auto& count = sendsPerTrack[track->value];
-                ++count;
-                if (count > maximumPreparedSendsPerTrack) {
-                    return {nullptr, "Prepared sends-per-track capacity exceeded"};
+            if (const auto* track = std::get_if<tracks::TrackId>(&send.source)) {
+                if (!track->isValid() || !trackIds.contains(track->value) ||
+                    ++sendsPerTrack[track->value] >
+                        maximumPreparedSendsPerTrack) {
+                    return {nullptr, "Invalid track send source or capacity"};
                 }
             } else if (const auto* bus =
                            std::get_if<routing::BusId>(&send.source)) {
-                if (!bus->isValid() || !busIds.contains(bus->value)) {
-                    return {nullptr, "Bus send source does not exist"};
-                }
-                auto& count = sendsPerBus[bus->value];
-                ++count;
-                if (count > maximumPreparedSendsPerBus) {
-                    return {nullptr, "Prepared sends-per-bus capacity exceeded"};
+                if (!bus->isValid() || !busIds.contains(bus->value) ||
+                    ++sendsPerBus[bus->value] > maximumPreparedSendsPerBus) {
+                    return {nullptr, "Invalid bus send source or capacity"};
                 }
             } else {
                 return {nullptr, "Invalid send source"};
@@ -198,14 +325,96 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         PreparedProcessingPlan plan;
         plan.projectSampleRate = specification.projectSampleRate;
         plan.blockCapacity = blockCapacity;
-        plan.runtimeMemoryBytes = preparedBytes;
+        plan.stereoProcessingFormat = {
+            processingSampleRate, blockCapacity,
+            processors::ChannelLayout::stereo, specification.processingMode};
         plan.masterMix = specification.masterMix;
         plan.tracks.reserve(specification.tracks.size());
         plan.buses.reserve(specification.buses.size());
         plan.sends.reserve(specification.sends.size());
         plan.sendIndexById.reserve(specification.sends.size());
-        plan.order.reserve(specification.tracks.size() +
-                           specification.buses.size() + 1);
+        plan.processors.reserve(processorCount);
+        plan.processorIndexById.reserve(processorCount);
+        plan.order.reserve(stepCount);
+
+        std::vector<PendingProcessorRuntime> pendingProcessors;
+        pendingProcessors.reserve(processorCount);
+        std::unordered_set<std::uint64_t> processorIds;
+        processorIds.reserve(processorCount);
+        const auto prepareChain = [&](const processors::InsertChain& chain,
+                                      processors::ChannelLayout layout,
+                                      std::size_t scratchIndex,
+                                      PreparedInsertRange& result,
+                                      auto&& self) -> std::string {
+            static_cast<void>(self);
+            result.first = plan.processors.size();
+            result.count = chain.processors.size();
+            result.scratchIndex = scratchIndex;
+            result.layout = layout;
+            processors::ProcessingFrameCount chainLatency;
+            std::size_t chainIndex{};
+            for (const auto& state : chain.processors) {
+                if (!state.id.isValid() || !state.type.isValid() ||
+                    !processorIds.insert(state.id.value).second) {
+                    return "Invalid or duplicate ProcessorInstanceId";
+                }
+                std::unordered_set<std::uint32_t> parameterIds;
+                for (const auto& parameter : state.parameters) {
+                    if (!parameter.id.isValid() ||
+                        !std::isfinite(parameter.value) ||
+                        !parameterIds.insert(parameter.id.value).second) {
+                        return "Invalid or duplicate processor parameter";
+                    }
+                }
+                auto instance = factory->create(state);
+                if (instance == nullptr) {
+                    return "Processor type or state could not be created";
+                }
+                const processors::ProcessingFormat format{
+                    processingSampleRate, blockCapacity, layout,
+                    specification.processingMode};
+                const auto capabilities = instance->capabilities();
+                const auto layoutSupported =
+                    layout == processors::ChannelLayout::mono
+                        ? capabilities.supportsMono
+                        : capabilities.supportsStereo;
+                if (!layoutSupported ||
+                    (!capabilities.supportsInPlace &&
+                     !capabilities.supportsOutOfPlace) ||
+                    !instance->prepare(format)) {
+                    return "Processor does not support the prepared format";
+                }
+                const auto latency = instance->latency();
+                processors::ProcessingFrameCount updatedLatency;
+                if (latency.value >
+                        static_cast<std::uint64_t>(
+                            std::numeric_limits<std::size_t>::max()) ||
+                    !checkedLatencyAdd(chainLatency, latency,
+                                       updatedLatency)) {
+                    return "Processor chain latency overflow";
+                }
+                chainLatency = updatedLatency;
+                std::size_t delayBytes{};
+                if (!checkedMultiply(static_cast<std::size_t>(latency.value),
+                                     format.channelCount() * sizeof(float),
+                                     delayBytes) ||
+                    !addPreparedArray(1, instance->runtimeMemoryBytes()) ||
+                    !addPreparedArray(1, delayBytes)) {
+                    return "Processor runtime size overflow";
+                }
+                const auto denseIndex = plan.processors.size();
+                plan.processors.push_back(
+                    {state.id, denseIndex, chainIndex, format, latency,
+                     instance->tail(), capabilities, state.bypassed});
+                plan.processorIndexById.push_back({state.id, denseIndex});
+                pendingProcessors.push_back(
+                    {std::move(instance), latency, format.channelCount(),
+                     state.bypassed});
+                ++chainIndex;
+            }
+            result.latency = chainLatency;
+            return {};
+        };
 
         std::vector<std::size_t> busSpecificationOrder(
             specification.buses.size());
@@ -219,8 +428,11 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                   });
         for (const auto specificationIndex : busSpecificationOrder) {
             const auto& bus = specification.buses[specificationIndex];
-            plan.buses.push_back({bus.id, plan.buses.size(), bus.mix,
-                                  masterDestinationIndex, {}, {}});
+            PreparedBusNode node;
+            node.id = bus.id;
+            node.bufferIndex = plan.buses.size();
+            node.mix = bus.mix;
+            plan.buses.push_back(std::move(node));
         }
         const auto denseBusIndex = [&plan](routing::BusId id) {
             const auto found = std::lower_bound(
@@ -237,10 +449,15 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                 plan.buses[source].destinationBusIndex =
                     denseBusIndex(bus.destination.bus);
             }
+            const auto error = prepareChain(
+                bus.inserts, processors::ChannelLayout::stereo,
+                specification.tracks.size() + source,
+                plan.buses[source].inserts, prepareChain);
+            if (!error.empty()) {
+                return {nullptr, error};
+            }
         }
 
-        // Every bus main output and Bus Send is a structural dependency. Track
-        // Sends do not add bus-to-bus dependencies because tracks execute first.
         std::vector<std::vector<std::size_t>> busEdges(plan.buses.size());
         for (std::size_t index = 0; index < plan.buses.size(); ++index) {
             if (plan.buses[index].destinationBusIndex != masterDestinationIndex) {
@@ -259,7 +476,6 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
         }
 
-        // Validate every bus component, including disconnected and empty buses.
         std::vector<std::uint8_t> colours(plan.buses.size());
         std::vector<std::size_t> path;
         path.reserve(plan.buses.size());
@@ -269,11 +485,13 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             path.push_back(index);
             for (const auto destination : busEdges[index]) {
                 if (colours[destination] == 1) {
-                    const auto beginning = std::find(path.begin(), path.end(), destination);
+                    const auto beginning =
+                        std::find(path.begin(), path.end(), destination);
                     std::ostringstream message;
                     message << "Routing rejected: ";
                     for (auto cursor = beginning; cursor != path.end(); ++cursor) {
-                        message << "Bus " << plan.buses[*cursor].id.value << " -> ";
+                        message << "Bus " << plan.buses[*cursor].id.value
+                                << " -> ";
                     }
                     message << "Bus " << plan.buses[destination].id.value;
                     cycleError = message.str();
@@ -306,7 +524,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             auto selected = masterDestinationIndex;
             for (std::size_t index = 0; index < plan.buses.size(); ++index) {
                 if (!busEmitted[index] && busIndegree[index] == 0) {
-                    selected = index; // dense order is stable BusId order
+                    selected = index;
                     break;
                 }
             }
@@ -335,11 +553,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             std::size_t destination = masterDestinationIndex;
             if (track.destination.kind == routing::DestinationKind::bus) {
                 destination = denseBusIndex(track.destination.bus);
-                if (destination == masterDestinationIndex) {
-                    return {nullptr, "Track output destination does not exist"};
-                }
             }
-
             PreparedTrackView source;
             source.id = track.id;
             source.mix = track.mix;
@@ -351,29 +565,39 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             if (preparedSource != sources.end()) {
                 source = *preparedSource;
                 source.mix = track.mix;
-                if (source.isAvailable()) {
-                    if (source.clipDuration.value >
-                        std::numeric_limits<std::int64_t>::max() -
-                            source.clipStart.value) {
-                        return {nullptr, "Prepared clip end overflows project time"};
-                    }
-                    plan.duration.value = std::max(
-                        plan.duration.value,
-                        source.clipStart.value + source.clipDuration.value);
+                if (source.clipDuration.value >
+                    std::numeric_limits<std::int64_t>::max() -
+                        source.clipStart.value) {
+                    return {nullptr, "Prepared clip end overflows project time"};
                 }
+                plan.duration.value = std::max(
+                    plan.duration.value,
+                    source.clipStart.value + source.clipDuration.value);
             }
-            plan.tracks.push_back({source, destination, {}, {}});
+            PreparedTrackRoute route;
+            route.source = source;
+            route.destinationBusIndex = destination;
+            plan.tracks.push_back(std::move(route));
+            auto& preparedRoute = plan.tracks.back();
+            const auto layout = preparedRoute.source.channelCount == 2
+                                    ? processors::ChannelLayout::stereo
+                                    : processors::ChannelLayout::mono;
+            const auto error = prepareChain(
+                track.inserts, layout, plan.tracks.size() - 1,
+                preparedRoute.inserts, prepareChain);
+            if (!error.empty()) {
+                return {nullptr, error};
+            }
+            const PreparedLatencyRange chainLatency{
+                preparedRoute.inserts.latency,
+                preparedRoute.inserts.latency};
+            preparedRoute.preFaderTapLatency = chainLatency;
+            preparedRoute.postFaderTapLatency = chainLatency;
+            preparedRoute.mainOutputLatency = chainLatency;
             plan.order.push_back(
                 {ProcessingStepKind::track, plan.tracks.size() - 1});
         }
 
-
-        std::vector<std::size_t> sendSpecificationOrder(
-            specification.sends.size());
-        for (std::size_t index = 0; index < sendSpecificationOrder.size();
-             ++index) {
-            sendSpecificationOrder[index] = index;
-        }
         const auto denseTrackIndex = [&plan](tracks::TrackId id) {
             const auto found = std::lower_bound(
                 plan.tracks.begin(), plan.tracks.end(), id,
@@ -396,6 +620,12 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
             return denseBusIndex(std::get<routing::BusId>(source));
         };
+        std::vector<std::size_t> sendSpecificationOrder(
+            specification.sends.size());
+        for (std::size_t index = 0; index < sendSpecificationOrder.size();
+             ++index) {
+            sendSpecificationOrder[index] = index;
+        }
         std::sort(sendSpecificationOrder.begin(), sendSpecificationOrder.end(),
                   [&specification, &sendSourceKind,
                    &sendSourceIndex](const auto left, const auto right) {
@@ -436,7 +666,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             plan.sends.push_back(
                 {send.id, sourceKind, sourceIndex, destinationBusIndex,
                  plan.buses[destinationBusIndex].bufferIndex, send.tapPoint,
-                 runtimeIndex, plan.sends.size(), send.mix});
+                 runtimeIndex, plan.sends.size(), send.mix, {}});
             ++range.count;
         }
         for (std::size_t index = 0; index < plan.sends.size(); ++index) {
@@ -447,10 +677,84 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                       return left.id < right.id;
                   });
 
+        const auto masterError = prepareChain(
+            specification.masterInserts, processors::ChannelLayout::stereo,
+            specification.tracks.size() + specification.buses.size(),
+            plan.masterInserts, prepareChain);
+        if (!masterError.empty()) {
+            return {nullptr, masterError};
+        }
+        std::sort(plan.processorIndexById.begin(),
+                  plan.processorIndexById.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.id < right.id;
+                  });
+
         for (const auto index : topologicalBuses) {
             plan.order.push_back({ProcessingStepKind::bus, index});
         }
         plan.order.push_back({ProcessingStepKind::master, 0});
+
+        std::vector<std::uint8_t> busHasInput(plan.buses.size());
+        std::vector<PreparedLatencyRange> busInput(plan.buses.size());
+        bool masterHasInput{};
+        PreparedLatencyRange masterInput{};
+        const auto routeLatency = [&](std::size_t destination,
+                                      PreparedLatencyRange latency) {
+            if (destination == masterDestinationIndex) {
+                mergeLatency(masterHasInput, masterInput, latency);
+            } else {
+                auto hasInput = busHasInput[destination] != 0;
+                mergeLatency(hasInput, busInput[destination], latency);
+                busHasInput[destination] = hasInput ? 1 : 0;
+            }
+        };
+        for (const auto& track : plan.tracks) {
+            routeLatency(track.destinationBusIndex, track.mainOutputLatency);
+            for (std::size_t index = 0; index < plan.sends.size(); ++index) {
+                auto& send = plan.sends[index];
+                if (send.sourceKind == PreparedSendSourceKind::track &&
+                    send.sourceIndex ==
+                        static_cast<std::size_t>(&track - plan.tracks.data())) {
+                    send.sourceTapLatency =
+                        send.tapPoint == routing::SendTapPoint::preFaderPrePan
+                            ? track.preFaderTapLatency
+                            : track.postFaderTapLatency;
+                    routeLatency(send.destinationBusIndex,
+                                 send.sourceTapLatency);
+                }
+            }
+        }
+        for (const auto busIndex : topologicalBuses) {
+            auto& bus = plan.buses[busIndex];
+            bus.inputLatency = busHasInput[busIndex]
+                                   ? busInput[busIndex]
+                                   : PreparedLatencyRange{};
+            if (!addLatency(bus.inputLatency, bus.inserts.latency,
+                            bus.preFaderTapLatency)) {
+                return {nullptr, "Prepared bus latency overflow"};
+            }
+            bus.postFaderTapLatency = bus.preFaderTapLatency;
+            bus.mainOutputLatency = bus.preFaderTapLatency;
+            routeLatency(bus.destinationBusIndex, bus.mainOutputLatency);
+            for (auto& send : plan.sends) {
+                if (send.sourceKind == PreparedSendSourceKind::bus &&
+                    send.sourceIndex == busIndex) {
+                    send.sourceTapLatency =
+                        send.tapPoint == routing::SendTapPoint::preFaderPrePan
+                            ? bus.preFaderTapLatency
+                            : bus.postFaderTapLatency;
+                    routeLatency(send.destinationBusIndex,
+                                 send.sourceTapLatency);
+                }
+            }
+        }
+        plan.masterInputLatency =
+            masterHasInput ? masterInput : PreparedLatencyRange{};
+        if (!addLatency(plan.masterInputLatency, plan.masterInserts.latency,
+                        plan.masterOutputLatency)) {
+            return {nullptr, "Prepared master latency overflow"};
+        }
 
         std::array<AudibilityTrackInput, maximumPreparedTracks>
             audibilityTracks{};
@@ -480,8 +784,19 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             {audibilityBuses.data(), plan.buses.size()},
             {audibilitySends.data(), plan.sends.size()});
 
-        ProcessingPlanRuntime runtime{plan.buses.size(), plan.sends.size(),
-                                      blockCapacity};
+        if (preparedBytes > memoryBudgetBytes) {
+            return {nullptr, "Processing buffers exceed the memory budget"};
+        }
+        plan.runtimeMemoryBytes = preparedBytes;
+        ProcessingPlanRuntime runtime{
+            plan.buses.size(), plan.sends.size(), nodeCount, blockCapacity};
+        runtime.processors.reserve(pendingProcessors.size());
+        for (auto& pending : pendingProcessors) {
+            runtime.processors.push_back(
+                {std::move(pending.instance),
+                 BypassDelayLine{pending.latency, pending.channelCount},
+                 pending.bypassed});
+        }
         for (std::size_t index = 0; index < plan.sends.size(); ++index) {
             runtime.sendMix[index].reset(plan.sends[index].mix);
         }

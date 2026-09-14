@@ -1,14 +1,8 @@
 #pragma once
 
-#include <cstddef>
+#include "vitadaw/audio/AudioBlockView.h"
 
 namespace vitadaw::audio {
-
-struct AudioBlockView {
-    float* const* channels{};
-    std::size_t channelCount{};
-    std::size_t frameCount{};
-};
 
 // This boundary is called only by the device callback. Implementations must be
 // allocation-free, lock-free, bounded, and noexcept.
@@ -19,4 +13,3 @@ public:
 };
 
 } // namespace vitadaw::audio
-

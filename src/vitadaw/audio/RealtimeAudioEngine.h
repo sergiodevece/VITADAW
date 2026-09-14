@@ -57,6 +57,12 @@ public:
         routing::SendId send, mixer::PreparedSendMixState mix) noexcept;
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept;
+    [[nodiscard]] bool tryUpdateProcessorBypass(
+        processors::ProcessorInstanceId processor, bool bypassed) noexcept;
+    [[nodiscard]] bool tryUpdateProcessorParameter(
+        processors::ProcessorInstanceId processor,
+        processors::ParameterId parameter, float preparedValue,
+        std::uint32_t frameOffset = 0) noexcept;
     [[nodiscard]] RealtimeTransportSnapshot transportSnapshot() const noexcept;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
 
@@ -90,9 +96,22 @@ private:
         std::size_t sendIndex{};
         mixer::PreparedSendMixState mix;
     };
+    struct ProcessorBypassCommand {
+        std::uint64_t planGeneration{};
+        std::size_t processorIndex{};
+        bool bypassed{};
+    };
+    struct ProcessorParameterCommand {
+        std::uint64_t planGeneration{};
+        std::size_t processorIndex{};
+        processors::ParameterId parameter;
+        float preparedValue{};
+        std::uint32_t frameOffset{};
+    };
     using ParameterCommand =
         std::variant<TrackMixCommand, BusMixCommand, MasterMixCommand,
-                     SendMixCommand>;
+                     SendMixCommand, ProcessorBypassCommand,
+                     ProcessorParameterCommand>;
     static_assert(std::is_trivially_copyable_v<ParameterCommand>);
 
     [[nodiscard]] AudioControlRequestResult enqueue(CommandType type) noexcept;
@@ -109,6 +128,18 @@ private:
     void processSubBlock(AudioBlockView output, std::size_t outputOffset,
                          std::size_t frameCount,
                          timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept;
+    void processLegacySubBlock(
+        AudioBlockView output, std::size_t outputOffset,
+        std::size_t validFrames, const double* positions) noexcept;
+    struct ProcessedNodeBlock {
+        float* left{};
+        float* right{};
+        std::size_t channelCount{};
+    };
+    [[nodiscard]] ProcessedNodeBlock processInsertChain(
+        PreparedInsertRange range,
+        const processors::ProcessorProcessContext& context) noexcept;
+    void resetProcessors() noexcept;
     void transitionAwayFromOperational(DeviceProcessingState state) noexcept;
     void resolveCommandsThrough(AudioCommandSequence sequence) noexcept;
     [[nodiscard]] bool hasPreparedAudio() const noexcept;
@@ -119,7 +150,11 @@ private:
     std::span<const PreparedBusNode> buses_;
     std::span<const PreparedSendDescriptor> sends_;
     std::span<const PreparedSendIndex> sendIndexById_;
+    std::span<const PreparedProcessorDescriptor> processors_;
+    std::span<const PreparedProcessorIndex> processorIndexById_;
     std::span<const ProcessingStep> order_;
+    PreparedInsertRange masterInserts_;
+    processors::ProcessingFormat processingFormat_;
     std::size_t blockCapacity_{defaultProcessingBlockCapacity};
     ProcessingPlanRuntime* runtime_{};
     std::array<PreparedTrackRoute, maximumTrackCount> legacyTracks_{};
@@ -144,12 +179,14 @@ private:
     std::array<ParameterCommand, parameterCommandCapacity> parameterCommands_{};
     std::atomic<std::size_t> parameterWriteIndex_{};
     std::atomic<std::size_t> parameterReadIndex_{};
+    std::atomic<std::uint64_t> planGeneration_{1};
     std::array<tracks::TrackId, maximumTrackCount> meterTrackIds_{};
     std::array<mixer::StereoPeak, maximumTrackCount> trackPeaks_{};
     std::array<routing::BusId, maximumBusCount> meterBusIds_{};
     std::array<mixer::StereoPeak, maximumBusCount> busPeaks_{};
     mixer::StereoPeak masterPeak_;
     RealtimeMeterExchange meterExchange_;
+    bool processorDiscontinuity_{true};
 };
 
 } // namespace vitadaw::audio

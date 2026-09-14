@@ -1,10 +1,12 @@
 #pragma once
 
-#include "vitadaw/audio/MixerSmoother.h"
 #include "vitadaw/audio/AudibilityState.h"
+#include "vitadaw/audio/MixerSmoother.h"
 #include "vitadaw/audio/PreparedProject.h"
+#include "vitadaw/processors/IAudioProcessor.h"
 #include "vitadaw/routing/RoutingState.h"
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -19,9 +21,11 @@ inline constexpr std::size_t maximumPreparedBuses = 64;
 inline constexpr std::size_t maximumPreparedSends = 1024;
 inline constexpr std::size_t maximumPreparedSendsPerTrack = 64;
 inline constexpr std::size_t maximumPreparedSendsPerBus = 64;
+inline constexpr std::size_t maximumPreparedProcessors = 512;
+inline constexpr std::size_t maximumPreparedProcessorsPerChain = 16;
 inline constexpr std::size_t defaultProcessingBlockCapacity = 512;
 inline constexpr std::size_t defaultProcessingMemoryBudgetBytes =
-    16U * 1024U * 1024U;
+    32U * 1024U * 1024U;
 inline constexpr std::size_t masterDestinationIndex =
     std::numeric_limits<std::size_t>::max();
 static_assert(maximumPreparedTracks == audibilityTrackCapacity);
@@ -32,12 +36,14 @@ struct ProcessingPlanTrackSpecification {
     tracks::TrackId id;
     mixer::PreparedTrackMixState mix;
     routing::OutputDestination destination;
+    processors::InsertChain inserts;
 };
 
 struct ProcessingPlanBusSpecification {
     routing::BusId id;
     mixer::PreparedBusMixState mix;
     routing::OutputDestination destination{routing::OutputDestination::master()};
+    processors::InsertChain inserts;
 };
 
 struct ProcessingPlanSendSpecification {
@@ -54,6 +60,9 @@ struct ProcessingPlanSpecification {
     std::vector<ProcessingPlanBusSpecification> buses;
     std::vector<ProcessingPlanSendSpecification> sends;
     mixer::PreparedMasterMixState masterMix;
+    processors::InsertChain masterInserts;
+    timeline::SampleRate processingSampleRate;
+    processors::ProcessingMode processingMode{processors::ProcessingMode::realtime};
 };
 
 struct PreparedSendRange {
@@ -63,11 +72,30 @@ struct PreparedSendRange {
     bool operator==(const PreparedSendRange&) const = default;
 };
 
+struct PreparedInsertRange {
+    std::size_t first{};
+    std::size_t count{};
+    std::size_t scratchIndex{};
+    processors::ChannelLayout layout{processors::ChannelLayout::stereo};
+    processors::ProcessingFrameCount latency;
+};
+
+struct PreparedLatencyRange {
+    processors::ProcessingFrameCount minimum;
+    processors::ProcessingFrameCount maximum;
+
+    bool operator==(const PreparedLatencyRange&) const = default;
+};
+
 struct PreparedTrackRoute {
     PreparedTrackView source;
     std::size_t destinationBusIndex{masterDestinationIndex};
     PreparedSendRange preFaderSends;
     PreparedSendRange postFaderSends;
+    PreparedInsertRange inserts;
+    PreparedLatencyRange preFaderTapLatency;
+    PreparedLatencyRange postFaderTapLatency;
+    PreparedLatencyRange mainOutputLatency;
 };
 
 enum class PreparedSendSourceKind : std::uint8_t { track, bus };
@@ -82,6 +110,7 @@ struct PreparedSendDescriptor {
     std::size_t runtimeIndex{};
     std::size_t audibilityIndex{};
     mixer::PreparedSendMixState mix;
+    PreparedLatencyRange sourceTapLatency;
 };
 
 struct PreparedSendIndex {
@@ -96,6 +125,27 @@ struct PreparedBusNode {
     std::size_t destinationBusIndex{masterDestinationIndex};
     PreparedSendRange preFaderSends;
     PreparedSendRange postFaderSends;
+    PreparedInsertRange inserts;
+    PreparedLatencyRange inputLatency;
+    PreparedLatencyRange preFaderTapLatency;
+    PreparedLatencyRange postFaderTapLatency;
+    PreparedLatencyRange mainOutputLatency;
+};
+
+struct PreparedProcessorDescriptor {
+    processors::ProcessorInstanceId id;
+    std::size_t runtimeIndex{};
+    std::size_t chainIndex{};
+    processors::ProcessingFormat format;
+    processors::ProcessingFrameCount latency;
+    processors::TailInfo tail;
+    processors::ProcessorCapabilities capabilities;
+    bool initiallyBypassed{};
+};
+
+struct PreparedProcessorIndex {
+    processors::ProcessorInstanceId id;
+    std::size_t denseIndex{};
 };
 
 enum class ProcessingStepKind : std::uint8_t { track, bus, master };
@@ -112,10 +162,16 @@ struct PreparedProcessingPlan {
     std::vector<PreparedBusNode> buses;
     std::vector<PreparedSendDescriptor> sends;
     std::vector<PreparedSendIndex> sendIndexById;
+    std::vector<PreparedProcessorDescriptor> processors;
+    std::vector<PreparedProcessorIndex> processorIndexById;
     std::vector<ProcessingStep> order;
     std::size_t blockCapacity{};
     std::size_t runtimeMemoryBytes{};
+    processors::ProcessingFormat stereoProcessingFormat;
     mixer::PreparedMasterMixState masterMix;
+    PreparedInsertRange masterInserts;
+    PreparedLatencyRange masterInputLatency;
+    PreparedLatencyRange masterOutputLatency;
     PreparedAudibilityState audibility;
 };
 
@@ -126,14 +182,47 @@ struct StereoWorkBuffer {
     explicit StereoWorkBuffer(std::size_t capacity);
 };
 
+struct ProcessorNodeScratch {
+    StereoWorkBuffer first;
+    StereoWorkBuffer second;
+
+    explicit ProcessorNodeScratch(std::size_t capacity);
+};
+
+class BypassDelayLine {
+public:
+    BypassDelayLine() = default;
+    BypassDelayLine(processors::ProcessingFrameCount latency,
+                    std::size_t channelCount);
+
+    void reset() noexcept;
+    void process(audio::ConstAudioBlockView input,
+                 audio::AudioBlockView output, bool writeOutput) noexcept;
+    [[nodiscard]] std::size_t memoryBytes() const noexcept;
+
+private:
+    std::array<std::vector<float>, 2> samples_;
+    std::size_t latency_{};
+    std::size_t channelCount_{};
+    std::size_t writePosition_{};
+};
+
+struct ProcessorRuntime {
+    std::unique_ptr<processors::IAudioProcessor> instance;
+    BypassDelayLine bypassDelay;
+    bool bypassed{};
+};
+
 struct ProcessingPlanRuntime {
     std::vector<StereoWorkBuffer> buses;
     std::vector<SendMixSmoother> sendMix;
     StereoWorkBuffer master;
     std::vector<double> projectPositions;
+    std::vector<ProcessorNodeScratch> processorScratch;
+    std::vector<ProcessorRuntime> processors;
 
     ProcessingPlanRuntime(std::size_t busCount, std::size_t sendCount,
-                          std::size_t capacity);
+                          std::size_t nodeCount, std::size_t capacity);
 };
 
 struct PreparedProcessingBundle {
@@ -155,6 +244,8 @@ struct ProcessingPlanPreparationResult {
     const ProcessingPlanSpecification& specification,
     std::span<const PreparedTrackView> sources,
     std::size_t blockCapacity = defaultProcessingBlockCapacity,
-    std::size_t memoryBudgetBytes = defaultProcessingMemoryBudgetBytes) noexcept;
+    std::size_t memoryBudgetBytes = defaultProcessingMemoryBudgetBytes,
+    const processors::IAudioProcessorFactory* processorFactory = nullptr)
+    noexcept;
 
 } // namespace vitadaw::audio

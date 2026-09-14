@@ -1,6 +1,7 @@
 #include "vitadaw/project/ProjectState.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -32,7 +33,7 @@ tracks::TrackId ProjectState::addAudioTrack(std::string name) {
         throw std::overflow_error{"Audio track identity space exhausted"};
     }
     const auto id = nextTrackId_;
-    tracks_.push_back({id, std::move(name), std::nullopt, {}});
+    tracks_.push_back({id, std::move(name), std::nullopt, {}, {}});
     try {
         routing_.addTrack(id);
     } catch (...) {
@@ -106,6 +107,207 @@ const tracks::AudioTrack* ProjectState::findTrack(
 
 const mixer::MasterMixState& ProjectState::masterMix() const noexcept {
     return masterMix_;
+}
+
+const processors::InsertChain& ProjectState::masterInserts() const noexcept {
+    return masterInserts_;
+}
+
+processors::InsertChain* ProjectState::findProcessorChain(
+    processors::ProcessorInstanceId processor) noexcept {
+    for (auto& track : tracks_) {
+        if (std::any_of(track.inserts.processors.begin(),
+                        track.inserts.processors.end(),
+                        [processor](const auto& candidate) {
+                            return candidate.id == processor;
+                        })) {
+            return &track.inserts;
+        }
+    }
+    for (const auto& busView : routing_.buses()) {
+        auto* bus = routing_.findBusMutable(busView.id);
+        if (bus != nullptr &&
+            std::any_of(bus->inserts.processors.begin(),
+                        bus->inserts.processors.end(),
+                        [processor](const auto& candidate) {
+                            return candidate.id == processor;
+                        })) {
+            return &bus->inserts;
+        }
+    }
+    if (std::any_of(masterInserts_.processors.begin(),
+                    masterInserts_.processors.end(),
+                    [processor](const auto& candidate) {
+                        return candidate.id == processor;
+                    })) {
+        return &masterInserts_;
+    }
+    return nullptr;
+}
+
+const processors::InsertChain* ProjectState::findProcessorChain(
+    processors::ProcessorInstanceId processor) const noexcept {
+    for (const auto& track : tracks_) {
+        if (std::any_of(track.inserts.processors.begin(),
+                        track.inserts.processors.end(),
+                        [processor](const auto& candidate) {
+                            return candidate.id == processor;
+                        })) {
+            return &track.inserts;
+        }
+    }
+    for (const auto& bus : routing_.buses()) {
+        if (std::any_of(bus.inserts.processors.begin(),
+                        bus.inserts.processors.end(),
+                        [processor](const auto& candidate) {
+                            return candidate.id == processor;
+                        })) {
+            return &bus.inserts;
+        }
+    }
+    if (std::any_of(masterInserts_.processors.begin(),
+                    masterInserts_.processors.end(),
+                    [processor](const auto& candidate) {
+                        return candidate.id == processor;
+                    })) {
+        return &masterInserts_;
+    }
+    return nullptr;
+}
+
+const processors::ProcessorState* ProjectState::findProcessor(
+    processors::ProcessorInstanceId processor) const noexcept {
+    const auto* chain = findProcessorChain(processor);
+    if (chain == nullptr) {
+        return nullptr;
+    }
+    const auto found = std::find_if(
+        chain->processors.begin(), chain->processors.end(),
+        [processor](const auto& candidate) {
+            return candidate.id == processor;
+        });
+    return found == chain->processors.end() ? nullptr : &*found;
+}
+
+processors::ProcessorInstanceId ProjectState::addProcessor(
+    const processors::InsertTarget& target, processors::ProcessorType type) {
+    if (!type.isValid() || !nextProcessorId_.isValid() ||
+        nextProcessorId_.value == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::invalid_argument{"Invalid processor identity or type"};
+    }
+    processors::InsertChain* chain{};
+    std::visit(
+        [this, &chain](const auto& value) {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, tracks::TrackId>) {
+                const auto found = std::find_if(
+                    tracks_.begin(), tracks_.end(),
+                    [value](const auto& candidate) {
+                        return candidate.id == value;
+                    });
+                if (found != tracks_.end()) {
+                    chain = &found->inserts;
+                }
+            } else if constexpr (std::is_same_v<T, routing::BusId>) {
+                if (auto* bus = routing_.findBusMutable(value)) {
+                    chain = &bus->inserts;
+                }
+            } else {
+                chain = &masterInserts_;
+            }
+        },
+        target);
+    if (chain == nullptr) {
+        throw std::out_of_range{"Insert target does not exist"};
+    }
+    const auto id = nextProcessorId_;
+    processors::ProcessorState state;
+    state.id = id;
+    state.type = std::move(type);
+    if (state.type.identifier == processors::internalGainProcessorType) {
+        state.parameters.push_back({processors::gainParameterId, 0.0F});
+    }
+    chain->processors.push_back(std::move(state));
+    ++nextProcessorId_.value;
+    return id;
+}
+
+bool ProjectState::removeProcessor(
+    processors::ProcessorInstanceId processor) noexcept {
+    auto* chain = findProcessorChain(processor);
+    if (chain == nullptr) {
+        return false;
+    }
+    const auto found = std::find_if(
+        chain->processors.begin(), chain->processors.end(),
+        [processor](const auto& candidate) {
+            return candidate.id == processor;
+        });
+    chain->processors.erase(found);
+    return true;
+}
+
+bool ProjectState::moveProcessor(processors::ProcessorInstanceId processor,
+                                 std::size_t newIndex) noexcept {
+    auto* chain = findProcessorChain(processor);
+    if (chain == nullptr || newIndex >= chain->processors.size()) {
+        return false;
+    }
+    const auto found = std::find_if(
+        chain->processors.begin(), chain->processors.end(),
+        [processor](const auto& candidate) {
+            return candidate.id == processor;
+        });
+    const auto oldIndex =
+        static_cast<std::size_t>(found - chain->processors.begin());
+    if (oldIndex == newIndex) {
+        return true;
+    }
+    auto value = std::move(*found);
+    chain->processors.erase(found);
+    chain->processors.insert(
+        chain->processors.begin() + static_cast<std::ptrdiff_t>(newIndex),
+        std::move(value));
+    return true;
+}
+
+bool ProjectState::setProcessorBypass(
+    processors::ProcessorInstanceId processor, bool bypassed) noexcept {
+    auto* chain = findProcessorChain(processor);
+    if (chain == nullptr) {
+        return false;
+    }
+    const auto found = std::find_if(
+        chain->processors.begin(), chain->processors.end(),
+        [processor](const auto& candidate) {
+            return candidate.id == processor;
+        });
+    found->bypassed = bypassed;
+    return true;
+}
+
+bool ProjectState::setProcessorParameter(
+    processors::ProcessorInstanceId processor,
+    processors::ParameterId parameter, float value) noexcept {
+    auto* chain = findProcessorChain(processor);
+    if (chain == nullptr || !parameter.isValid() || !std::isfinite(value)) {
+        return false;
+    }
+    const auto found = std::find_if(
+        chain->processors.begin(), chain->processors.end(),
+        [processor](const auto& candidate) {
+            return candidate.id == processor;
+        });
+    const auto parameterFound = std::find_if(
+        found->parameters.begin(), found->parameters.end(),
+        [parameter](const auto& candidate) {
+            return candidate.id == parameter;
+        });
+    if (parameterFound == found->parameters.end()) {
+        return false;
+    }
+    parameterFound->value = value;
+    return true;
 }
 
 bool ProjectState::setTrackMix(tracks::TrackId track,
@@ -182,6 +384,8 @@ void ProjectState::swap(ProjectState& other) noexcept {
     swap(nextTrackId_, other.nextTrackId_);
     swap(nextClipId_, other.nextClipId_);
     swap(masterMix_, other.masterMix_);
+    swap(masterInserts_, other.masterInserts_);
+    swap(nextProcessorId_, other.nextProcessorId_);
 }
 
 } // namespace vitadaw::project

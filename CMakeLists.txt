@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.2.4 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.3.0 LANGUAGES C CXX)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -13,6 +13,7 @@ add_library(vitadaw_core
     src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
     src/vitadaw/project/ProjectState.cpp
+    src/vitadaw/processors/GainProcessor.cpp
     src/vitadaw/routing/RoutingState.cpp
     src/vitadaw/timeline/Time.cpp
 )
@@ -164,4 +165,16 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_realtime_resource_lifetime_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_realtime_resource_lifetime_tests
         COMMAND vitadaw_realtime_resource_lifetime_tests)
+
+    add_executable(vitadaw_processor_insert_core_tests
+        tests/ProcessorInsertCoreTests.cpp)
+    target_link_libraries(vitadaw_processor_insert_core_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_processor_insert_core_tests
+        COMMAND vitadaw_processor_insert_core_tests)
+
+    add_executable(vitadaw_processor_command_tests
+        tests/ProcessorCommandTests.cpp)
+    target_link_libraries(vitadaw_processor_command_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_processor_command_tests
+        COMMAND vitadaw_processor_command_tests)
 endif()

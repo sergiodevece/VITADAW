@@ -1,4 +1,5 @@
 #include "vitadaw/application/DawApplication.h"
+#include "vitadaw/processors/GainProcessor.h"
 
 #include <exception>
 #include <algorithm>
@@ -358,6 +359,94 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 return {commands::CommandStatus::accepted,
                         "Bus mixer state updated"};
             } else if constexpr (
+                std::is_same_v<T, commands::AddProcessor> ||
+                std::is_same_v<T, commands::RemoveProcessor> ||
+                std::is_same_v<T, commands::MoveProcessor>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Insert structure cannot change during playback"};
+                }
+                try {
+                    auto candidate = project_;
+                    std::string message;
+                    if constexpr (std::is_same_v<T,
+                                                 commands::AddProcessor>) {
+                        const auto id = candidate.addProcessor(value.target,
+                                                               value.type);
+                        message = "Added processor " +
+                                  std::to_string(id.value);
+                    } else if constexpr (std::is_same_v<
+                                             T, commands::RemoveProcessor>) {
+                        if (!candidate.removeProcessor(value.processor)) {
+                            return {commands::CommandStatus::rejected,
+                                    "Processor does not exist"};
+                        }
+                        message = "Removed processor";
+                    } else {
+                        if (!candidate.moveProcessor(value.processor,
+                                                     value.newIndex)) {
+                            return {commands::CommandStatus::rejected,
+                                    "Processor or destination position is invalid"};
+                        }
+                        message = "Moved processor";
+                    }
+                    return commitStructuralProject(std::move(candidate),
+                                                   std::move(message));
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to prepare insert structure"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Insert structure could not be prepared"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Unknown error while preparing insert structure"};
+                }
+            } else if constexpr (
+                std::is_same_v<T, commands::SetProcessorBypass>) {
+                if (project_.findProcessor(value.processor) == nullptr) {
+                    return {commands::CommandStatus::rejected,
+                            "Processor does not exist"};
+                }
+                if (!audioEngine_.tryUpdateProcessorBypass(
+                        value.processor, value.bypassed)) {
+                    return {commands::CommandStatus::rejected,
+                            "Processor parameter queue is full"};
+                }
+                static_cast<void>(project_.setProcessorBypass(
+                    value.processor, value.bypassed));
+                return {commands::CommandStatus::accepted,
+                        "Processor bypass updated"};
+            } else if constexpr (
+                std::is_same_v<T, commands::SetProcessorParameter>) {
+                const auto* processor = project_.findProcessor(value.processor);
+                if (processor == nullptr) {
+                    return {commands::CommandStatus::rejected,
+                            "Processor does not exist"};
+                }
+                if (processor->type.identifier ==
+                        processors::internalGainProcessorType &&
+                    (value.parameter != processors::gainParameterId ||
+                     !processors::GainProcessor::isValidGainDb(value.value))) {
+                    return {commands::CommandStatus::rejected,
+                            "Gain parameter must be finite and between -100 and +12 dB"};
+                }
+                const auto preparedValue =
+                    processor->type.identifier ==
+                            processors::internalGainProcessorType
+                        ? processors::GainProcessor::gainDbToLinear(value.value)
+                        : value.value;
+                if (!audioEngine_.tryUpdateProcessorParameter(
+                        value.processor, value.parameter, value.value,
+                        preparedValue)) {
+                    return {commands::CommandStatus::rejected,
+                            "Processor parameter queue is full"};
+                }
+                static_cast<void>(project_.setProcessorParameter(
+                    value.processor, value.parameter, value.value));
+                return {commands::CommandStatus::accepted,
+                        "Processor parameter updated"};
+            } else if constexpr (
                 std::is_same_v<T, commands::SetTrackOutputDestination> ||
                 std::is_same_v<T, commands::SetBusOutputDestination>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
@@ -405,9 +494,11 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
     result.buses.reserve(project.routing().buses().size());
     for (const auto& bus : project.routing().buses()) {
         result.buses.push_back(
-            {bus.id, mixer::prepare(bus.mix), bus.outputDestination});
+            {bus.id, mixer::prepare(bus.mix), bus.outputDestination,
+             bus.inserts});
     }
     result.masterMix = mixer::prepare(project.masterMix());
+    result.masterInserts = project.masterInserts();
     result.tracks.reserve(project.tracks().size());
     for (const auto& track : project.tracks()) {
         const auto* route = project.routing().findTrackRoute(track.id);
@@ -415,7 +506,8 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
             throw std::logic_error{"Audio track has no output routing"};
         }
         result.tracks.push_back(
-            {track.id, mixer::prepare(track.mix), route->destination});
+            {track.id, mixer::prepare(track.mix), route->destination,
+             track.inserts});
     }
     result.sends.reserve(project.routing().sends().size());
     for (const auto& send : project.routing().sends()) {

@@ -241,6 +241,61 @@ public:
             addAndMakeVisible(controls->muted);
             sendControls_.push_back(std::move(controls));
         }
+        const auto addProcessorControls = [this](
+            const juce::String& owner,
+            const processors::InsertChain& chain) {
+            for (const auto& processor : chain.processors) {
+                if (processor.type.identifier !=
+                    processors::internalGainProcessorType) {
+                    continue;
+                }
+                auto controls = std::make_unique<ProcessorControls>();
+                controls->processor = processor.id;
+                controls->name.setText(
+                    owner + " Insert: Gain #" +
+                        juce::String(static_cast<int>(processor.id.value)),
+                    juce::NotificationType::dontSendNotification);
+                controls->name.setColour(juce::Label::textColourId,
+                                         juce::Colours::white);
+                controls->gain.setRange(mixer::GainDb::silence,
+                                        mixer::GainDb::maximum, 0.1);
+                const auto gain = std::find_if(
+                    processor.parameters.begin(), processor.parameters.end(),
+                    [](const auto& parameter) {
+                        return parameter.id == processors::gainParameterId;
+                    });
+                controls->gain.setValue(
+                    gain == processor.parameters.end() ? 0.0 : gain->value,
+                    juce::NotificationType::dontSendNotification);
+                controls->gain.setTextValueSuffix(" dB insert");
+                controls->bypass.setToggleState(
+                    processor.bypassed,
+                    juce::NotificationType::dontSendNotification);
+                controls->gain.onValueChange =
+                    [this, raw = controls.get()] {
+                        dispatch(commands::SetProcessorParameter{
+                            raw->processor, processors::gainParameterId,
+                            static_cast<float>(raw->gain.getValue())});
+                    };
+                controls->bypass.onClick =
+                    [this, raw = controls.get()] {
+                        dispatch(commands::SetProcessorBypass{
+                            raw->processor,
+                            raw->bypass.getToggleState()});
+                    };
+                addAndMakeVisible(controls->name);
+                addAndMakeVisible(controls->gain);
+                addAndMakeVisible(controls->bypass);
+                processorControls_.push_back(std::move(controls));
+            }
+        };
+        for (const auto& track : project.tracks()) {
+            addProcessorControls(juce::String(track.name), track.inserts);
+        }
+        for (const auto& bus : project.routing().buses()) {
+            addProcessorControls(juce::String(bus.name), bus.inserts);
+        }
+        addProcessorControls("Master", project.masterInserts());
         masterGain_.setRange(mixer::GainDb::silence,
                              mixer::GainDb::maximum, 0.1);
         masterGain_.setValue(0.0, juce::NotificationType::dontSendNotification);
@@ -370,6 +425,12 @@ public:
             controls->level.setBounds(row.removeFromLeft(220));
             controls->muted.setBounds(row.removeFromLeft(80));
         }
+        for (auto& controls : processorControls_) {
+            auto row = bounds.removeFromTop(38);
+            controls->name.setBounds(row.removeFromLeft(220));
+            controls->gain.setBounds(row.removeFromLeft(260));
+            controls->bypass.setBounds(row.removeFromLeft(90));
+        }
         bounds.removeFromTop(8);
         auto masterRow = bounds.removeFromTop(36);
         masterGain_.setBounds(masterRow.removeFromLeft(240));
@@ -419,6 +480,14 @@ private:
         juce::ToggleButton muted{"Send Mute"};
     };
 
+    struct ProcessorControls {
+        processors::ProcessorInstanceId processor;
+        juce::Label name;
+        juce::Slider gain{juce::Slider::LinearHorizontal,
+                          juce::Slider::TextBoxRight};
+        juce::ToggleButton bypass{"Bypass"};
+    };
+
     void chooseWav(tracks::TrackId track) {
         fileChooser_ = std::make_unique<juce::FileChooser>(
             "Select a WAV file", juce::File{}, "*.wav");
@@ -456,6 +525,7 @@ private:
     std::vector<std::unique_ptr<TrackControls>> trackControls_;
     std::vector<std::unique_ptr<BusControls>> busControls_;
     std::vector<std::unique_ptr<SendControls>> sendControls_;
+    std::vector<std::unique_ptr<ProcessorControls>> processorControls_;
     juce::Slider masterGain_{juce::Slider::LinearHorizontal,
                              juce::Slider::TextBoxRight};
     juce::Label masterMeter_;
@@ -474,7 +544,7 @@ MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
     content_ = new AudioStatusComponent(commandDispatcher, project);
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
-    centreWithSize(1040, 980);
+    centreWithSize(1040, 1080);
     setResizable(true, false);
     setVisible(true);
 }

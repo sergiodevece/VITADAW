@@ -2,6 +2,7 @@
 
 #include "vitadaw/tracks/AudioTrack.h"
 #include "vitadaw/routing/RoutingState.h"
+#include "vitadaw/processors/InsertTarget.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -52,6 +53,21 @@ public:
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
     [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;
+    [[nodiscard]] const processors::InsertChain& masterInserts() const noexcept;
+    [[nodiscard]] const processors::ProcessorState* findProcessor(
+        processors::ProcessorInstanceId processor) const noexcept;
+    [[nodiscard]] processors::ProcessorInstanceId addProcessor(
+        const processors::InsertTarget& target,
+        processors::ProcessorType type);
+    [[nodiscard]] bool removeProcessor(
+        processors::ProcessorInstanceId processor) noexcept;
+    [[nodiscard]] bool moveProcessor(processors::ProcessorInstanceId processor,
+                                     std::size_t newIndex) noexcept;
+    [[nodiscard]] bool setProcessorBypass(
+        processors::ProcessorInstanceId processor, bool bypassed) noexcept;
+    [[nodiscard]] bool setProcessorParameter(
+        processors::ProcessorInstanceId processor,
+        processors::ParameterId parameter, float value) noexcept;
     [[nodiscard]] bool setTrackMix(tracks::TrackId track,
                                    mixer::TrackMixState state) noexcept;
     [[nodiscard]] bool setMasterMix(mixer::MasterMixState state) noexcept;
@@ -65,12 +81,19 @@ public:
     void swap(ProjectState& other) noexcept;
 
 private:
+    [[nodiscard]] processors::InsertChain* findProcessorChain(
+        processors::ProcessorInstanceId processor) noexcept;
+    [[nodiscard]] const processors::InsertChain* findProcessorChain(
+        processors::ProcessorInstanceId processor) const noexcept;
+
     timeline::SampleRate projectSampleRate_;
     std::vector<tracks::AudioTrack> tracks_;
     routing::RoutingState routing_;
     tracks::TrackId nextTrackId_{1};
     clips::ClipId nextClipId_{1};
     mixer::MasterMixState masterMix_;
+    processors::InsertChain masterInserts_;
+    processors::ProcessorInstanceId nextProcessorId_{1};
 };
 
 } // namespace vitadaw::project

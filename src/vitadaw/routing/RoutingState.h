@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/tracks/AudioTrack.h"
+#include "vitadaw/processors/ProcessorState.h"
 
 #include <compare>
 #include <cstdint>
@@ -46,6 +47,7 @@ struct AudioBus {
     std::string name;
     mixer::BusMixState mix;
     OutputDestination outputDestination{OutputDestination::master()};
+    processors::InsertChain inserts;
 };
 
 struct TrackRoute {
@@ -88,6 +90,7 @@ public:
     [[nodiscard]] const TrackRoute* findTrackRoute(tracks::TrackId track) const noexcept;
     [[nodiscard]] bool containsBus(BusId bus) const noexcept;
     [[nodiscard]] const AudioBus* findBus(BusId bus) const noexcept;
+    [[nodiscard]] AudioBus* findBusMutable(BusId bus) noexcept;
     [[nodiscard]] const SendRoute* findSend(SendId send) const noexcept;
 
     void addTrack(tracks::TrackId track);
