@@ -139,6 +139,22 @@ SendId RoutingState::addSend(SendSource source, BusId destination,
     return id;
 }
 
+bool RoutingState::setSendRoute(SendId send, BusId destination,
+                                SendTapPoint tapPoint) noexcept {
+    if (!containsBus(destination) || !routing::isValid(tapPoint)) {
+        return false;
+    }
+    const auto found = std::find_if(
+        sends_.begin(), sends_.end(),
+        [send](const auto& candidate) { return candidate.id == send; });
+    if (found == sends_.end()) {
+        return false;
+    }
+    found->destination = destination;
+    found->tapPoint = tapPoint;
+    return true;
+}
+
 bool RoutingState::removeSend(SendId send) noexcept {
     const auto found = std::find_if(
         sends_.begin(), sends_.end(),

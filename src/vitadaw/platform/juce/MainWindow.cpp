@@ -190,12 +190,26 @@ public:
         for (const auto& send : project.routing().sends()) {
             auto controls = std::make_unique<SendControls>();
             controls->send = send.id;
-            const auto source = std::get<tracks::TrackId>(send.source);
             const auto* destination = project.findBus(send.destination);
+            juce::String source;
+            if (const auto* track =
+                    std::get_if<tracks::TrackId>(&send.source)) {
+                const auto* sourceTrack = project.findTrack(*track);
+                source = sourceTrack != nullptr
+                             ? juce::String{sourceTrack->name}
+                             : "T" + juce::String(
+                                         static_cast<int>(track->value));
+            } else {
+                const auto busId = std::get<routing::BusId>(send.source);
+                const auto* sourceBus = project.findBus(busId);
+                source = sourceBus != nullptr
+                             ? juce::String{sourceBus->name}
+                             : "B" + juce::String(
+                                         static_cast<int>(busId.value));
+            }
             controls->name.setText(
                 "Send " + juce::String(static_cast<int>(send.id.value)) +
-                    " T" + juce::String(static_cast<int>(source.value)) +
-                    " -> " +
+                    " " + source + " -> " +
                     (destination != nullptr ? juce::String(destination->name)
                                             : juce::String{"?"}) +
                     (send.tapPoint == routing::SendTapPoint::preFaderPrePan
@@ -460,7 +474,7 @@ MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
     content_ = new AudioStatusComponent(commandDispatcher, project);
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
-    centreWithSize(1040, 900);
+    centreWithSize(1040, 980);
     setResizable(true, false);
     setVisible(true);
 }

@@ -198,14 +198,20 @@ int main() {
     routedSpecification.sends.push_back(
         {{1}, tracks::TrackId{1}, {2},
          routing::SendTapPoint::preFaderPrePan, {}});
+    routedSpecification.sends.push_back(
+        {{2}, routing::BusId{1}, {2},
+         routing::SendTapPoint::postFaderPostPan, {}});
     auto routedPreparation = audio::prepareProcessingPlan(
         routedSpecification, routedSources, 4);
     check(routedPreparation.success() &&
               routedPreparation.prepared->runtime.buses.size() == 2 &&
-              routedPreparation.prepared->runtime.sendMix.size() == 1 &&
-              routedPreparation.prepared->plan.sends.size() == 1 &&
+              routedPreparation.prepared->runtime.sendMix.size() == 2 &&
+              routedPreparation.prepared->plan.sends.size() == 2 &&
+              routedPreparation.prepared->plan.sends[1].sourceKind ==
+                  audio::PreparedSendSourceKind::bus &&
+              routedPreparation.prepared->plan.buses[0].postFaderSends.count == 1 &&
               routedPreparation.prepared->plan.buses[0].destinationBusIndex == 1,
-          "lifetime test must prepare a routed chain, send state and buffers together");
+          "lifetime test must own Bus Send views, smoothers and routed buffers together");
     auto routedOwner = std::make_unique<PreparedPlanOwner>(
         std::move(routedResource), std::move(routedPreparation.prepared),
         planProbe);
@@ -252,7 +258,7 @@ int main() {
         routedOwner.reset();
     });
     check(planProbe.destructions.load(std::memory_order_acquire) == 0,
-          "plan, send runtime, bus buffers, and resource must remain alive during RT use");
+          "plan, Track/Bus Send runtime, buffers, and resource must remain alive during RT use");
     finishRoutedCallback.release();
     routedRealtimeUse.join();
     replaceRoutedPlan.join();
@@ -261,7 +267,7 @@ int main() {
                   std::memory_order_acquire) == 0 &&
               replacementPlanProbe.destructions.load(
                   std::memory_order_acquire) == 0,
-          "a plan containing a send must be destroyed only after RT switches to its replacement");
+          "a plan containing Bus Sends must be destroyed only after RT switches to its replacement");
 
     makeOperational(engine);
     check(engine.tryRequestPlay().accepted,

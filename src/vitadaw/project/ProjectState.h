@@ -41,6 +41,9 @@ public:
     [[nodiscard]] routing::SendId addSend(
         routing::SendSource source, routing::BusId destination,
         routing::SendTapPoint tapPoint, mixer::SendMixState mix);
+    [[nodiscard]] bool setSendRoute(
+        routing::SendId send, routing::BusId destination,
+        routing::SendTapPoint tapPoint) noexcept;
     [[nodiscard]] bool removeSend(routing::SendId send) noexcept;
     [[nodiscard]] bool setSendMix(routing::SendId send,
                                   mixer::SendMixState mix) noexcept;

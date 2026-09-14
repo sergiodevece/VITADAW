@@ -374,42 +374,33 @@ void RealtimeAudioEngine::processSubBlock(
                     destination.left[frame] += contribution.left;
                     destination.right[frame] += contribution.right;
                 }
-                const auto distributeSends =
-                    [this, frame](PreparedSendRange range,
-                                  StereoSample tap) noexcept {
-                        for (std::size_t offset = 0; offset < range.count;
-                             ++offset) {
-                            const auto sendIndex = range.first + offset;
-                            const auto& send = sends_[sendIndex];
-                            const auto sendMix =
-                                runtime_->sendMix[send.runtimeIndex].next();
-                            if (sendMix.muted ||
-                                !audibility_.sendIsAudible(sendIndex)) {
-                                continue;
-                            }
-                            auto& destination =
-                                runtime_->buses[send.destinationBusIndex];
-                            destination.left[frame] +=
-                                tap.left * sendMix.linearGain;
-                            destination.right[frame] +=
-                                tap.right * sendMix.linearGain;
-                        }
-                    };
-                distributeSends(route.preFaderSends, preTap);
-                distributeSends(route.postFaderSends, postTap);
+                distributeSends(route.preFaderSends, preTap, frame);
+                distributeSends(route.postFaderSends, postTap, frame);
             }
         } else if (step.kind == ProcessingStepKind::bus) {
             const auto bufferIndex = buses_[step.index].bufferIndex;
             const auto& bus = runtime_->buses[bufferIndex];
             for (std::size_t frame = 0; frame < validFrames; ++frame) {
-                const auto contribution = applyBusMix(
-                    {bus.left[frame], bus.right[frame]},
-                    busMix_[step.index].next(),
-                    audibility_.busIsAudible(step.index));
+                const StereoSample input{bus.left[frame], bus.right[frame]};
+                const auto mix = busMix_[step.index].next();
+                const auto preTap = makeBusPreFaderPreBalanceTap(input);
+                const auto postTap =
+                    makeBusPostFaderPostBalanceTap(input, mix);
+                const auto contribution = audibility_.busIsAudible(step.index)
+                                              ? postTap
+                                              : StereoSample{};
+                const auto meterSample =
+                    audibility_.busMeterIsAudible(step.index)
+                        ? postTap
+                        : StereoSample{};
                 busPeaks_[step.index].left = std::max(
-                    busPeaks_[step.index].left, std::abs(contribution.left));
+                    busPeaks_[step.index].left, std::abs(meterSample.left));
                 busPeaks_[step.index].right = std::max(
-                    busPeaks_[step.index].right, std::abs(contribution.right));
+                    busPeaks_[step.index].right, std::abs(meterSample.right));
+                distributeSends(buses_[step.index].preFaderSends, preTap,
+                                frame);
+                distributeSends(buses_[step.index].postFaderSends, postTap,
+                                frame);
                 const auto destination = buses_[step.index].destinationBusIndex;
                 if (destination == masterDestinationIndex) {
                     masterLeft[frame] += contribution.left;
@@ -439,6 +430,23 @@ void RealtimeAudioEngine::processSubBlock(
                 }
             }
         }
+    }
+}
+
+void RealtimeAudioEngine::distributeSends(PreparedSendRange range,
+                                          StereoSample tap,
+                                          std::size_t frame) noexcept {
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        const auto sendIndex = range.first + offset;
+        const auto& send = sends_[sendIndex];
+        const auto sendMix = runtime_->sendMix[send.runtimeIndex].next();
+        if (sendMix.muted ||
+            !audibility_.sendIsAudible(send.audibilityIndex)) {
+            continue;
+        }
+        auto& destination = runtime_->buses[send.destinationBufferIndex];
+        destination.left[frame] += tap.left * sendMix.linearGain;
+        destination.right[frame] += tap.right * sendMix.linearGain;
     }
 }
 

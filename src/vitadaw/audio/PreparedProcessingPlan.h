@@ -18,6 +18,7 @@ inline constexpr std::size_t maximumPreparedTracks = 256;
 inline constexpr std::size_t maximumPreparedBuses = 64;
 inline constexpr std::size_t maximumPreparedSends = 1024;
 inline constexpr std::size_t maximumPreparedSendsPerTrack = 64;
+inline constexpr std::size_t maximumPreparedSendsPerBus = 64;
 inline constexpr std::size_t defaultProcessingBlockCapacity = 512;
 inline constexpr std::size_t defaultProcessingMemoryBudgetBytes =
     16U * 1024U * 1024U;
@@ -58,6 +59,8 @@ struct ProcessingPlanSpecification {
 struct PreparedSendRange {
     std::size_t first{};
     std::size_t count{};
+
+    bool operator==(const PreparedSendRange&) const = default;
 };
 
 struct PreparedTrackRoute {
@@ -67,12 +70,17 @@ struct PreparedTrackRoute {
     PreparedSendRange postFaderSends;
 };
 
+enum class PreparedSendSourceKind : std::uint8_t { track, bus };
+
 struct PreparedSendDescriptor {
     routing::SendId id;
-    std::size_t sourceTrackIndex{};
+    PreparedSendSourceKind sourceKind{PreparedSendSourceKind::track};
+    std::size_t sourceIndex{};
     std::size_t destinationBusIndex{masterDestinationIndex};
+    std::size_t destinationBufferIndex{masterDestinationIndex};
     routing::SendTapPoint tapPoint{routing::SendTapPoint::postFaderPostPan};
     std::size_t runtimeIndex{};
+    std::size_t audibilityIndex{};
     mixer::PreparedSendMixState mix;
 };
 
@@ -86,6 +94,8 @@ struct PreparedBusNode {
     std::size_t bufferIndex{};
     mixer::PreparedBusMixState mix;
     std::size_t destinationBusIndex{masterDestinationIndex};
+    PreparedSendRange preFaderSends;
+    PreparedSendRange postFaderSends;
 };
 
 enum class ProcessingStepKind : std::uint8_t { track, bus, master };

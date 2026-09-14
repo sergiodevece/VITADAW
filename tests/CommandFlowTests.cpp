@@ -420,6 +420,52 @@ int main() {
               audio.liveSpecification.sends.size() == 1,
           "removing a send must commit model and prepared specification together");
 
+    check(dispatcher.dispatch(commands::AddBus{"Bus C"}).status ==
+              commands::CommandStatus::accepted,
+          "a destination for Bus Send retargeting should be addable while stopped");
+    const auto busC = app.project().routing().buses()[2].id;
+    check(dispatcher.dispatch(commands::AddBusSend{
+              {999}, busB, routing::SendTapPoint::preFaderPrePan, {}}).status ==
+              commands::CommandStatus::rejected &&
+              dispatcher.dispatch(commands::AddBusSend{
+                  busA, {999}, routing::SendTapPoint::preFaderPrePan, {}}).status ==
+                  commands::CommandStatus::rejected,
+          "Bus Send creation must validate source and destination");
+    check(dispatcher.dispatch(commands::AddBusSend{
+              busA, busB, routing::SendTapPoint::preFaderPrePan,
+              mixer::GainDb{-6.0F}}).status == commands::CommandStatus::accepted &&
+              app.project().findSend({3}) != nullptr &&
+              std::get<routing::BusId>(app.project().findSend({3})->source) ==
+                  busA &&
+              audio.liveSpecification.sends.size() == 2,
+          "AddBusSend must commit a typed BusId source and stable SendId");
+    check(dispatcher.dispatch(commands::SetSendRoute{
+              {3}, busC, routing::SendTapPoint::postFaderPostPan}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().findSend({3})->destination == busC &&
+              app.project().findSend({3})->tapPoint ==
+                  routing::SendTapPoint::postFaderPostPan,
+          "a stopped Bus Send must retarget destination and tap transactionally");
+    const auto planBeforeRejectedBusSend = audio.liveSpecification;
+    check(dispatcher.dispatch(commands::SetSendRoute{
+              {3}, busA, routing::SendTapPoint::preFaderPrePan}).status ==
+              commands::CommandStatus::rejected &&
+              dispatcher.dispatch(commands::AddBusSend{
+                  busB, busA, routing::SendTapPoint::postFaderPostPan, {}}).status ==
+                  commands::CommandStatus::rejected &&
+              app.project().findSend({3})->destination == busC &&
+              audio.liveSpecification.sends.size() ==
+                  planBeforeRejectedBusSend.sends.size(),
+          "self-routes and mixed output/send cycles must preserve the prior model and plan");
+    audio.rejectNextStructuralPreparation = true;
+    check(dispatcher.dispatch(commands::SetSendRoute{
+              {3}, busB, routing::SendTapPoint::preFaderPrePan}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findSend({3})->destination == busC &&
+              app.project().findSend({3})->tapPoint ==
+                  routing::SendTapPoint::postFaderPostPan,
+          "failed Bus Send preparation must leave editable and RT state unchanged");
+
     const auto structuralBeforeBusMix = audio.structuralPrepareRequests;
     check(dispatcher.dispatch(commands::SetBusGain{
               busA, mixer::GainDb{-6.0F}}).status ==
@@ -565,9 +611,15 @@ int main() {
     check(dispatcher.dispatch(commands::AddTrackSend{
               first, busA, routing::SendTapPoint::preFaderPrePan, {}}).status ==
               commands::CommandStatus::rejected &&
+              dispatcher.dispatch(commands::AddBusSend{
+                  busA, busC, routing::SendTapPoint::preFaderPrePan, {}}).status ==
+                  commands::CommandStatus::rejected &&
+              dispatcher.dispatch(commands::SetSendRoute{
+                  {3}, busB, routing::SendTapPoint::preFaderPrePan}).status ==
+                  commands::CommandStatus::rejected &&
               dispatcher.dispatch(commands::RemoveSend{{1}}).status ==
                   commands::CommandStatus::rejected &&
-              app.project().routing().sends().size() == 1,
+              app.project().routing().sends().size() == 2,
           "send topology changes must be rejected during playback");
     check(dispatcher.dispatch(commands::SetTrackOutputDestination{
               first, routing::TrackOutputDestination::master()}).status ==

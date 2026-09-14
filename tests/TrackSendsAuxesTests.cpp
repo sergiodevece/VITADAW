@@ -226,9 +226,11 @@ int main() {
     validFutureBusSend.buses = {busSpec(1), busSpec(2)};
     validFutureBusSend.sends = {{{1}, routing::BusId{1}, {2}, post, {}}};
     const auto futureResult = audio::prepareProcessingPlan(validFutureBusSend, {});
-    check(!futureResult.success() &&
-              futureResult.errorMessage.find("not supported") != std::string::npos,
-          "an acyclic Bus Send must be rejected explicitly in 0.2.3");
+    check(futureResult.success() &&
+              futureResult.prepared->plan.sends[0].sourceKind ==
+                  audio::PreparedSendSourceKind::bus &&
+              futureResult.prepared->plan.buses[0].postFaderSends.count == 1,
+          "an acyclic Bus Send must prepare as a bus-owned post range");
 
     mixer::TrackMixState silencedTrack{{-100.0F}, {1.0F}, true, false};
     mixer::BusMixState mutedBus;

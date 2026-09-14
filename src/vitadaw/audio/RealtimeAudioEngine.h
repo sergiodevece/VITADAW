@@ -9,6 +9,7 @@
 #include "vitadaw/audio/RealtimeMeterExchange.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
 #include "vitadaw/audio/RealtimeTransportExchange.h"
+#include "vitadaw/audio/TrackMixerProcessing.h"
 
 #include <array>
 #include <atomic>
@@ -103,6 +104,8 @@ private:
     void publishMeters() noexcept;
     void clearMeters() noexcept;
     void advanceSmoothers(std::size_t frameCount) noexcept;
+    void distributeSends(PreparedSendRange range, StereoSample tap,
+                         std::size_t frame) noexcept;
     void processSubBlock(AudioBlockView output, std::size_t outputOffset,
                          std::size_t frameCount,
                          timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept;

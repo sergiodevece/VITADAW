@@ -629,7 +629,77 @@ estéreo y 16 MiB para el plan/runtime portable.
 - Los buses suman una mezcla común y no conservan procedencia por rama.
 - No hay limiter ni clamp; varias ramas pueden superar `[-1, 1]`.
 
-## Evolución hasta 0.2.3
+## Bus Sends 0.2.4
+
+`SendSource = TrackId | BusId` deja de ser solo una previsión del modelo: ambos
+orígenes se compilan y ejecutan. Se conservan `AddTrackSend` y `AddBusSend` como
+comandos explícitos para mantener el mejor tipado en los puntos de creación;
+los parámetros y la eliminación continúan siendo genéricos por `SendId`.
+
+El flujo de cada bus es:
+
+```text
+acumulación completa de entradas
+    |-> PRE-FADER/PRE-BALANCE TAP -> sends pre -> buses destino
+    `-> Bus Gain -> Balance -> Mute -> POST TAP
+                                      |-> sends post -> buses destino
+                                      |-> Bus Meter
+                                      `-> main output -> Bus/Master
+```
+
+El bus se visita exactamente una vez por subbloque y por frame obtiene un único
+estado suavizado, un `preTap` y un `postTap`. Cada rango de sends distribuye uno
+de esos valores al buffer de destino. Cada `SendMixSmoother` avanza una vez por
+frame incluso con mute, audibilidad cerrada o entrada silenciosa. No hay buffers
+por send ni búsqueda de `SendId` en RT.
+
+`PreparedSendDescriptor` resuelve `sourceKind`, índice denso de origen, bus e
+índice de buffer destino, tap, índice de smoother e índice de audibilidad. Los
+descriptors quedan en rangos contiguos pre/post dentro de `PreparedTrackRoute` o
+`PreparedBusNode`. `ProcessingPlanRuntime` mantiene un smoother por send y un
+buffer estéreo por bus.
+
+El grafo estructural contiene todas las aristas Bus Output y Bus Send. Mute,
+Send Mute y −100 dB no retiran dependencias. Las aristas paralelas se deduplican
+solo para DFS/Kahn; sus descriptors permanecen separados y se suman en DSP. El
+orden estable por `BusId` garantiza que todo origen preceda a cada destino y que
+las convergencias estén completas antes de procesar el bus receptor.
+
+Solo distingue formalmente dos permisos. `needsFullBusContent` selecciona las
+aristas upstream necesarias para calcular un bus; `busMain` autoriza únicamente
+su salida principal. Por ello, un bus explícitamente en Solo abre su main y sus
+sends propios, mientras un bus usado solo como transporte no abre ramas
+laterales. Un Aux en Solo abre todas sus entradas Track/Bus, conserva los dry
+paths paralelos cerrados y abre solo el camino necesario desde el Aux a Master.
+Varios solos forman la unión de estas selecciones.
+
+Bus Mute y Bus Gain a −100 dB cierran main y post-send; el pre-send ignora Gain,
+Balance y Mute. Send Mute y la máscara de audibilidad cierran solo su arista. El
+Bus Meter continúa leyendo el post-tap del canal, no las salidas de sus sends;
+por eso puede marcar cero mientras un pre-send alimenta un Aux.
+
+Crear, eliminar, retargetear o cambiar el tap exige transporte detenido. Se
+prepara y valida un plan candidato completo, se comprueban referencias, límites,
+memoria y ciclos, y el commit existente intercambia modelo/plan/runtime con el
+callback quiescente. Si falla cualquier fase, el estado publicado anterior se
+conserva. Los límites conscientes son 1024 sends totales, 64 por pista y 64 por
+bus, 256 pistas, 64 buses, estéreo y 16 MiB para el plan/runtime portable.
+
+### Diferencias entre Track Send y Bus Send
+
+- El Track pre-tap adapta primero mono a estéreo; el Bus pre-tap recibe una
+  acumulación ya estéreo.
+- El Track post-tap incluye Track Gain, Pan y Mute; el Bus post-tap incluye Bus
+  Gain, Balance y Mute.
+- Ambos aplican después audibilidad, Send Mute y Send Level, y ambos usan el
+  mismo smoother y destino `BusId`.
+- Track Sends no crean dependencias entre buses; Bus Sends sí participan en el
+  DAG y el orden topológico.
+
+No se añaden inserts, plugins, PDC, feedback, automatización, PFL/AFL,
+solo-safe, multicanal, routing durante Play ni meters por send.
+
+## Evolución hasta 0.2.4
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -665,6 +735,8 @@ estéreo y 16 MiB para el plan/runtime portable.
     orden topológico determinista y resolver Solo a través de rutas encadenadas.
 16. **Completado en 0.2.3:** distribuir taps pre/post de una pista hacia buses
     auxiliares, con identidad estable, parámetros RT y Solo por aristas.
+17. **Completado en 0.2.4:** activar Bus Sends pre/post, incorporarlos al DAG y
+    separar contenido upstream de permiso Main para Solo wet-only.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

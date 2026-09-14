@@ -161,7 +161,8 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         sendIds.reserve(specification.sends.size());
         std::unordered_map<std::uint64_t, std::size_t> sendsPerTrack;
         sendsPerTrack.reserve(specification.tracks.size());
-        bool containsBusSend{};
+        std::unordered_map<std::uint64_t, std::size_t> sendsPerBus;
+        sendsPerBus.reserve(specification.buses.size());
         for (const auto& send : specification.sends) {
             if (!send.id.isValid() || !send.destination.isValid() ||
                 !busIds.contains(send.destination.value) ||
@@ -184,7 +185,11 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                 if (!bus->isValid() || !busIds.contains(bus->value)) {
                     return {nullptr, "Bus send source does not exist"};
                 }
-                containsBusSend = true;
+                auto& count = sendsPerBus[bus->value];
+                ++count;
+                if (count > maximumPreparedSendsPerBus) {
+                    return {nullptr, "Prepared sends-per-bus capacity exceeded"};
+                }
             } else {
                 return {nullptr, "Invalid send source"};
             }
@@ -215,7 +220,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         for (const auto specificationIndex : busSpecificationOrder) {
             const auto& bus = specification.buses[specificationIndex];
             plan.buses.push_back({bus.id, plan.buses.size(), bus.mix,
-                                  masterDestinationIndex});
+                                  masterDestinationIndex, {}, {}});
         }
         const auto denseBusIndex = [&plan](routing::BusId id) {
             const auto found = std::lower_bound(
@@ -234,7 +239,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
         }
 
-        // The structural graph contains main outputs and future Bus Sends. Track
+        // Every bus main output and Bus Send is a structural dependency. Track
         // Sends do not add bus-to-bus dependencies because tracks execute first.
         std::vector<std::vector<std::size_t>> busEdges(plan.buses.size());
         for (std::size_t index = 0; index < plan.buses.size(); ++index) {
@@ -315,11 +320,6 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
         }
 
-        if (containsBusSend) {
-            return {nullptr,
-                    "Bus Sends are structurally validated but not supported in 0.2.3"};
-        }
-
         std::vector<std::size_t> trackSpecificationOrder(
             specification.tracks.size());
         for (std::size_t index = 0; index < trackSpecificationOrder.size(); ++index) {
@@ -384,17 +384,32 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                        ? static_cast<std::size_t>(found - plan.tracks.begin())
                        : maximumPreparedTracks;
         };
+        const auto sendSourceKind = [](const routing::SendSource& source) {
+            return std::holds_alternative<tracks::TrackId>(source)
+                       ? PreparedSendSourceKind::track
+                       : PreparedSendSourceKind::bus;
+        };
+        const auto sendSourceIndex = [&denseTrackIndex, &denseBusIndex](
+                                         const routing::SendSource& source) {
+            if (const auto* track = std::get_if<tracks::TrackId>(&source)) {
+                return denseTrackIndex(*track);
+            }
+            return denseBusIndex(std::get<routing::BusId>(source));
+        };
         std::sort(sendSpecificationOrder.begin(), sendSpecificationOrder.end(),
-                  [&specification, &denseTrackIndex](const auto left,
-                                                     const auto right) {
+                  [&specification, &sendSourceKind,
+                   &sendSourceIndex](const auto left, const auto right) {
                       const auto& a = specification.sends[left];
                       const auto& b = specification.sends[right];
-                      const auto aTrack = denseTrackIndex(
-                          std::get<tracks::TrackId>(a.source));
-                      const auto bTrack = denseTrackIndex(
-                          std::get<tracks::TrackId>(b.source));
-                      if (aTrack != bTrack) {
-                          return aTrack < bTrack;
+                      const auto aKind = sendSourceKind(a.source);
+                      const auto bKind = sendSourceKind(b.source);
+                      if (aKind != bKind) {
+                          return aKind < bKind;
+                      }
+                      const auto aSource = sendSourceIndex(a.source);
+                      const auto bSource = sendSourceIndex(b.source);
+                      if (aSource != bSource) {
+                          return aSource < bSource;
                       }
                       if (a.tapPoint != b.tapPoint) {
                           return a.tapPoint ==
@@ -404,19 +419,24 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                   });
         for (const auto specificationIndex : sendSpecificationOrder) {
             const auto& send = specification.sends[specificationIndex];
-            const auto trackIndex = denseTrackIndex(
-                std::get<tracks::TrackId>(send.source));
-            auto& range = send.tapPoint ==
-                                  routing::SendTapPoint::preFaderPrePan
-                              ? plan.tracks[trackIndex].preFaderSends
-                              : plan.tracks[trackIndex].postFaderSends;
+            const auto sourceKind = sendSourceKind(send.source);
+            const auto sourceIndex = sendSourceIndex(send.source);
+            auto& range = sourceKind == PreparedSendSourceKind::track
+                ? (send.tapPoint == routing::SendTapPoint::preFaderPrePan
+                       ? plan.tracks[sourceIndex].preFaderSends
+                       : plan.tracks[sourceIndex].postFaderSends)
+                : (send.tapPoint == routing::SendTapPoint::preFaderPrePan
+                       ? plan.buses[sourceIndex].preFaderSends
+                       : plan.buses[sourceIndex].postFaderSends);
             if (range.count == 0) {
                 range.first = plan.sends.size();
             }
             const auto runtimeIndex = plan.sends.size();
-            plan.sends.push_back({send.id, trackIndex,
-                                  denseBusIndex(send.destination),
-                                  send.tapPoint, runtimeIndex, send.mix});
+            const auto destinationBusIndex = denseBusIndex(send.destination);
+            plan.sends.push_back(
+                {send.id, sourceKind, sourceIndex, destinationBusIndex,
+                 plan.buses[destinationBusIndex].bufferIndex, send.tapPoint,
+                 runtimeIndex, plan.sends.size(), send.mix});
             ++range.count;
         }
         for (std::size_t index = 0; index < plan.sends.size(); ++index) {
@@ -447,8 +467,10 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         }
         for (std::size_t index = 0; index < plan.sends.size(); ++index) {
             audibilitySends[index] = {
-                AudibilitySendSourceKind::track,
-                plan.sends[index].sourceTrackIndex,
+                plan.sends[index].sourceKind == PreparedSendSourceKind::track
+                    ? AudibilitySendSourceKind::track
+                    : AudibilitySendSourceKind::bus,
+                plan.sends[index].sourceIndex,
                 plan.sends[index].destinationBusIndex,
                 plan.sends[index].tapPoint ==
                     routing::SendTapPoint::postFaderPostPan};

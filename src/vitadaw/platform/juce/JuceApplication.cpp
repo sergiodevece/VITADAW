@@ -20,7 +20,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.2.3";
+        return "0.2.4";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -54,10 +54,12 @@ public:
         static_cast<void>(commandDispatcher_->dispatch(
             commands::AddBus{"Plate Bus"}));
         static_cast<void>(commandDispatcher_->dispatch(
-            commands::AddBus{"Delay Bus"}));
+            commands::AddBus{"Parallel Bus"}));
+        static_cast<void>(commandDispatcher_->dispatch(
+            commands::AddBus{"Room Bus"}));
         const auto& tracks = dawApplication_->project().tracks();
         const auto& buses = dawApplication_->project().routing().buses();
-        if (tracks.size() >= 3 && buses.size() >= 4) {
+        if (tracks.size() >= 3 && buses.size() >= 5) {
             static_cast<void>(commandDispatcher_->dispatch(
                 commands::SetTrackOutputDestination{
                     tracks[0].id,
@@ -80,8 +82,13 @@ public:
                     routing::SendTapPoint::preFaderPrePan,
                     mixer::GainDb{-6.0F}}));
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddTrackSend{
-                    tracks[2].id, buses[3].id,
+                commands::AddBusSend{
+                    buses[0].id, buses[3].id,
+                    routing::SendTapPoint::preFaderPrePan,
+                    mixer::GainDb{-6.0F}}));
+            static_cast<void>(commandDispatcher_->dispatch(
+                commands::AddBusSend{
+                    buses[1].id, buses[4].id,
                     routing::SendTapPoint::postFaderPostPan,
                     mixer::GainDb{-6.0F}}));
         }

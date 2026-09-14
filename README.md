@@ -1,4 +1,4 @@
-# VitaDAW 0.2.3 — Track Sends & Auxes
+# VitaDAW 0.2.4 — Bus Sends
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -10,7 +10,9 @@ balance, mute, solo y smoothing sample-accurate. VitaDAW 0.2.2 permite que la
 salida principal de un bus alimente otro bus mediante un DAG validado y ordenado
 completamente fuera del hilo de audio. VitaDAW 0.2.3 añade múltiples sends por
 pista hacia buses existentes, con taps pre/post, nivel suavizado, mute propio y
-Solo resuelto por rama.
+Solo resuelto por rama. VitaDAW 0.2.4 activa además sends cuyo origen es un bus,
+los integra en el DAG y conserva un único procesamiento de cada bus aunque tenga
+varias ramas.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -113,15 +115,23 @@ extremo atenúa el canal opuesto.
 
 Cada pista puede conservar varios `SendRoute` además de su salida principal.
 `SendId` es monotónico y estable; el origen portable admite `TrackId` o `BusId`,
-aunque 0.2.3 rechaza explícitamente Bus Sends. Cada Track Send termina en un
-`BusId`: el mismo bus puede recibir outputs principales y sends, por lo que no
-existe una clase Aux distinta.
+y ambos tipos se ejecutan en 0.2.4. Cada send termina en un `BusId`: el mismo bus
+puede recibir outputs principales, Track Sends y Bus Sends, por lo que no existe
+una clase Aux distinta.
 
 El tap `PreFaderPrePan` se extrae tras render y antes de gain, pan y mute. Mono
 se centra una sola vez a `x/sqrt(2)` por canal y estéreo conserva L/R. El tap
 `PostFaderPostPan` incluye gain, pan y mute. Después se aplican el permiso Solo
 de la rama, el mute propio y el nivel del send. El pre-send sobrevive a Track
 Mute y al fader en silencio por política explícita de esta versión.
+
+En un bus, el tap pre se extrae una sola vez tras acumular todas sus entradas y
+antes de Bus Gain, Balance y Mute. El tap post se obtiene una sola vez después
+de esos controles. Los sends pre/post y la salida principal distribuyen esos
+dos valores ya calculados; añadir fan-out no reprocesa el bus ni vuelve a
+avanzar sus smoothers o meter. Bus Mute y Bus Gain a −100 dB silencian main y
+post-send, pero el pre-send sigue disponible. El Bus Meter mide únicamente la
+señal post-fader/post-mute del canal principal y nunca suma sends.
 
 Si no hay solos, todas las rutas quedan abiertas y cada mute actúa localmente.
 Si existe al menos un solo, la aplicación prepara los permisos de las ramas
@@ -151,6 +161,12 @@ esté muteado, excluido por Solo o reciba silencio. `SetSendLevel` y
 `SetSendMute` se publican por el ring SPSC durante Play; alta y eliminación son
 cambios estructurales y exigen transporte detenido.
 
+Los Bus Sends reutilizan exactamente ese estado y cada uno mantiene su propio
+smoother. `AddBusSend` conserva tipado explícito sin alterar `AddTrackSend`;
+`SetSendRoute` permite cambiar destino/tap únicamente con el transporte parado.
+`RemoveSend`, `SetSendLevel` y `SetSendMute` siguen operando por `SendId` para
+ambos orígenes.
+
 El motor calcula peak absoluto por bloque para cada pista después de gain, pan y
 mute/solo, y para master después del gain master. No hace clamp, por lo que el
 meter puede indicar valores superiores a 1. Los snapshots RT se publican en
@@ -178,6 +194,13 @@ de recibir todas sus entradas, se mide y entrega su salida a otro bus o Master. 
 capacidad interna preparada de 512 frames divide callbacks mayores sin perder
 continuidad de reloj, smoothing ni máximos de metering. Toda reserva, resolución
 de IDs y construcción topológica ocurre fuera de RT.
+
+El DAG incluye outputs principales y Bus Sends, incluso si una rama está muteada
+o a −100 dB. Para topología, las aristas paralelas origen/destino se deduplican;
+el plan DSP conserva todos sus descriptors y suma todas las contribuciones. Cada
+descriptor resuelve fuera de RT tipo/índice de origen, bus y buffer de destino,
+tap, smoother y permiso de audibilidad, agrupado en rangos pre/post por pista o
+bus.
 
 La ventana muestra también, de forma provisional, el estado, posición, duración
 y sample rate lógico del proyecto. Al llegar al final natural, el transporte
@@ -210,6 +233,12 @@ Bus Solo abre únicamente las rutas que lo alimentan, sin abrir sends laterales;
 Aux Solo produce una escucha wet-only. Las selecciones múltiples forman una
 unión. Después de converger en un bus se procesa una mezcla común: no se intenta
 preservar la procedencia individual de las contribuciones.
+
+Con Bus Sends, «contenido completo necesario» y «salida Main audible» son
+permisos diferentes. Un bus en Solo abre su main y sus sends propios; un bus
+abierto solo como transporte downstream no hereda sus sends laterales. Un Aux
+en Solo abre todas sus aristas de entrada —Track o Bus Sends—, prepara el
+contenido upstream imprescindible y conserva cerrados los dry paths paralelos.
 
 La carga tiene dos fases. `prepareWav` realiza y captura fuera de RT cualquier
 operación que puede fallar; `ProjectState` prepara también el nuevo clip y el
@@ -257,6 +286,8 @@ La arquitectura y las reglas de tiempo real se describen en
   validación de ciclos, orden topológico y Solo resuelto a través del grafo.
 - **0.2.3 — Track Sends & Auxes:** sends múltiples Track→Bus con taps
   pre/post, level, mute, smoothing y audibilidad preparada por aristas.
+- **0.2.4 — Bus Sends:** sends Bus→Bus audibles, taps pre/post de bus,
+  integración completa en el DAG y Solo wet-only con permisos por arista.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -271,4 +302,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.2.0.md`](docs/validation-0.2.0.md) y
 [`docs/validation-0.2.1.md`](docs/validation-0.2.1.md) y
 [`docs/validation-0.2.2.md`](docs/validation-0.2.2.md) y
-[`docs/validation-0.2.3.md`](docs/validation-0.2.3.md).
+[`docs/validation-0.2.3.md`](docs/validation-0.2.3.md) y
+[`docs/validation-0.2.4.md`](docs/validation-0.2.4.md).

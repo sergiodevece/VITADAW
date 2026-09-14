@@ -42,6 +42,7 @@ struct PreparedAudibilityState {
     std::array<std::uint64_t, audibilityBusCapacity / 64> buses{};
     std::array<std::uint64_t, audibilitySendCapacity / 64> sends{};
     std::array<std::uint64_t, audibilityTrackCapacity / 64> trackMeters{};
+    std::array<std::uint64_t, audibilityBusCapacity / 64> busMeters{};
 
     void setTrack(std::size_t index) noexcept {
         if (index < audibilityTrackCapacity) {
@@ -61,6 +62,11 @@ struct PreparedAudibilityState {
     void setTrackMeter(std::size_t index) noexcept {
         if (index < audibilityTrackCapacity) {
             trackMeters[index / 64] |= std::uint64_t{1} << (index % 64);
+        }
+    }
+    void setBusMeter(std::size_t index) noexcept {
+        if (index < audibilityBusCapacity) {
+            busMeters[index / 64] |= std::uint64_t{1} << (index % 64);
         }
     }
     [[nodiscard]] bool trackIsAudible(std::size_t index) const noexcept {
@@ -83,6 +89,11 @@ struct PreparedAudibilityState {
                (trackMeters[index / 64] &
                 (std::uint64_t{1} << (index % 64))) != 0;
     }
+    [[nodiscard]] bool busMeterIsAudible(std::size_t index) const noexcept {
+        return index < audibilityBusCapacity &&
+               (busMeters[index / 64] &
+                (std::uint64_t{1} << (index % 64))) != 0;
+    }
     bool operator==(const PreparedAudibilityState&) const = default;
 };
 
@@ -92,6 +103,7 @@ struct PreparedAudibilityState {
     result.buses.fill(~std::uint64_t{});
     result.sends.fill(~std::uint64_t{});
     result.trackMeters.fill(~std::uint64_t{});
+    result.busMeters.fill(~std::uint64_t{});
     return result;
 }
 
@@ -113,6 +125,7 @@ struct PreparedAudibilityState {
         }
         for (std::size_t index = 0; index < buses.size(); ++index) {
             result.setBus(index);
+            result.setBusMeter(index);
         }
         for (std::size_t index = 0; index < sends.size(); ++index) {
             result.setSend(index);
@@ -122,69 +135,92 @@ struct PreparedAudibilityState {
         }
         return result;
     }
-    // U contains buses whose complete upstream content is selected by Bus Solo.
-    std::array<bool, audibilityBusCapacity> upstreamSelected{};
-    for (std::size_t index = 0; index < buses.size(); ++index) {
-        upstreamSelected[index] = buses[index].solo;
-    }
-    for (std::size_t pass = 0; pass < buses.size(); ++pass) {
-        bool changed{};
-        for (std::size_t index = 0; index < buses.size(); ++index) {
-            const auto destination = buses[index].destinationBusIndex;
-            if (!upstreamSelected[index] &&
-                destination != audibilityMasterDestination &&
-                destination < buses.size() && upstreamSelected[destination]) {
-                upstreamSelected[index] = true;
-                changed = true;
-            }
+    // A bus can need its complete input content without its main output being
+    // audible: this is the defining case for a wet-only Bus Send path.
+    std::array<bool, audibilityBusCapacity> needsFullBusContent{};
+    std::array<bool, audibilityTrackCapacity> trackMain{};
+    std::array<bool, audibilityBusCapacity> busMain{};
+    std::array<bool, audibilitySendCapacity> sendOpen{};
+    const auto openDownstreamMain = [&buses, &busMain](
+                                        std::size_t first) noexcept {
+        auto current = first;
+        for (std::size_t hop = 0;
+             current < buses.size() && hop < buses.size(); ++hop) {
+            busMain[current] = true;
+            current = buses[current].destinationBusIndex;
         }
-        if (!changed) {
-            break;
+    };
+
+    // Explicit Track Solo selects its own dry and send roots. Downstream buses
+    // transport only those selected contributions; their sibling sends stay shut.
+    for (std::size_t index = 0; index < tracks.size(); ++index) {
+        if (!tracks[index].solo) {
+            continue;
+        }
+        trackMain[index] = true;
+        openDownstreamMain(tracks[index].destinationBusIndex);
+        for (std::size_t sendIndex = 0; sendIndex < sends.size(); ++sendIndex) {
+            const auto& send = sends[sendIndex];
+            if (send.sourceKind == AudibilitySendSourceKind::track &&
+                send.sourceIndex == index) {
+                sendOpen[sendIndex] = true;
+                openDownstreamMain(send.destinationBusIndex);
+            }
         }
     }
 
-    // A contains selected buses plus downstream nodes needed only as transport.
-    std::array<bool, audibilityBusCapacity> transport = upstreamSelected;
-    std::array<bool, audibilityTrackCapacity> trackMain{};
-    std::array<bool, audibilitySendCapacity> sendOpen{};
-    for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        const auto destination = tracks[trackIndex].destinationBusIndex;
-        if (tracks[trackIndex].solo ||
-            (destination != audibilityMasterDestination &&
-             destination < buses.size() && upstreamSelected[destination])) {
-            trackMain[trackIndex] = true;
-            if (destination != audibilityMasterDestination &&
-                destination < buses.size()) {
-                transport[destination] = true;
+    // Explicit Bus Solo selects the bus's complete content and its own main and
+    // send roots. This privilege is never inherited by a transport-only bus.
+    for (std::size_t index = 0; index < buses.size(); ++index) {
+        if (!buses[index].solo) {
+            continue;
+        }
+        needsFullBusContent[index] = true;
+        busMain[index] = true;
+        openDownstreamMain(buses[index].destinationBusIndex);
+        for (std::size_t sendIndex = 0; sendIndex < sends.size(); ++sendIndex) {
+            const auto& send = sends[sendIndex];
+            if (send.sourceKind == AudibilitySendSourceKind::bus &&
+                send.sourceIndex == index) {
+                sendOpen[sendIndex] = true;
+                openDownstreamMain(send.destinationBusIndex);
             }
         }
     }
-    for (std::size_t sendIndex = 0; sendIndex < sends.size(); ++sendIndex) {
-        const auto& send = sends[sendIndex];
-        const auto destinationSelected =
-            send.destinationBusIndex < buses.size() &&
-            upstreamSelected[send.destinationBusIndex];
-        const auto sourceTrackSolo =
-            send.sourceKind == AudibilitySendSourceKind::track &&
-            send.sourceIndex < tracks.size() && tracks[send.sourceIndex].solo;
-        if (sourceTrackSolo || destinationSelected) {
-            sendOpen[sendIndex] = true;
-            if (send.destinationBusIndex < buses.size()) {
-                transport[send.destinationBusIndex] = true;
-            }
-        }
-    }
-    // Deliberately do not expand upstream again after opening downstream nodes.
-    for (std::size_t pass = 0; pass < buses.size(); ++pass) {
+
+    // Backward closure for every bus whose full content is selected. Each
+    // incoming edge is opened, but no unrelated outgoing edge is inferred.
+    for (std::size_t pass = 0; pass <= buses.size(); ++pass) {
         bool changed{};
+        for (std::size_t index = 0; index < tracks.size(); ++index) {
+            const auto destination = tracks[index].destinationBusIndex;
+            if (destination < buses.size() &&
+                needsFullBusContent[destination]) {
+                trackMain[index] = true;
+            }
+        }
         for (std::size_t index = 0; index < buses.size(); ++index) {
-            if (!transport[index]) {
+            const auto destination = buses[index].destinationBusIndex;
+            if (destination < buses.size() &&
+                needsFullBusContent[destination]) {
+                busMain[index] = true;
+                if (!needsFullBusContent[index]) {
+                    needsFullBusContent[index] = true;
+                    changed = true;
+                }
+            }
+        }
+        for (std::size_t index = 0; index < sends.size(); ++index) {
+            const auto& send = sends[index];
+            if (send.destinationBusIndex >= buses.size() ||
+                !needsFullBusContent[send.destinationBusIndex]) {
                 continue;
             }
-            const auto destination = buses[index].destinationBusIndex;
-            if (destination != audibilityMasterDestination &&
-                destination < buses.size() && !transport[destination]) {
-                transport[destination] = true;
+            sendOpen[index] = true;
+            if (send.sourceKind == AudibilitySendSourceKind::bus &&
+                send.sourceIndex < buses.size() &&
+                !needsFullBusContent[send.sourceIndex]) {
+                needsFullBusContent[send.sourceIndex] = true;
                 changed = true;
             }
         }
@@ -193,8 +229,9 @@ struct PreparedAudibilityState {
         }
     }
     for (std::size_t index = 0; index < buses.size(); ++index) {
-        if (transport[index]) {
+        if (busMain[index]) {
             result.setBus(index);
+            result.setBusMeter(index);
         }
     }
     for (std::size_t index = 0; index < tracks.size(); ++index) {
@@ -211,6 +248,10 @@ struct PreparedAudibilityState {
             sends[index].sourceKind == AudibilitySendSourceKind::track &&
             sends[index].sourceIndex < tracks.size()) {
             result.setTrackMeter(sends[index].sourceIndex);
+        } else if (sends[index].postFader &&
+                   sends[index].sourceKind == AudibilitySendSourceKind::bus &&
+                   sends[index].sourceIndex < buses.size()) {
+            result.setBusMeter(sends[index].sourceIndex);
         }
     }
     for (std::size_t index = 0; index < tracks.size(); ++index) {

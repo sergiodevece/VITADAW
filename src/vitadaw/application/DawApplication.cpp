@@ -77,6 +77,52 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Track send could not be added"};
                 }
+            } else if constexpr (std::is_same_v<T, commands::AddBusSend>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing cannot change during playback"};
+                }
+                if (!value.level.isValid() ||
+                    !routing::isValid(value.tapPoint)) {
+                    return {commands::CommandStatus::rejected,
+                            "Invalid send level or tap point"};
+                }
+                try {
+                    auto candidate = project_;
+                    const auto id = candidate.addSend(
+                        value.bus, value.destination, value.tapPoint,
+                        mixer::SendMixState{value.level, false});
+                    return commitStructuralProject(
+                        std::move(candidate),
+                        "Added bus send " + std::to_string(id.value));
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to add send"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Bus send could not be added"};
+                }
+            } else if constexpr (std::is_same_v<T, commands::SetSendRoute>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing cannot change during playback"};
+                }
+                try {
+                    auto candidate = project_;
+                    if (!candidate.setSendRoute(
+                            value.send, value.destination, value.tapPoint)) {
+                        return {commands::CommandStatus::rejected,
+                                "Invalid send route"};
+                    }
+                    return commitStructuralProject(std::move(candidate),
+                                                   "Updated send route");
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to update send route"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Send route could not be updated"};
+                }
             } else if constexpr (std::is_same_v<T, commands::RemoveSend>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
                     return {commands::CommandStatus::rejected,
@@ -472,12 +518,28 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
         }
         return audio::audibilityTrackCapacity;
     };
+    const auto sourceKind = [](const routing::SendSource& source) noexcept {
+        return std::holds_alternative<tracks::TrackId>(source)
+                   ? audio::AudibilitySendSourceKind::track
+                   : audio::AudibilitySendSourceKind::bus;
+    };
+    const auto sourceIndex = [&trackIndex, &busIndex](
+                                 const routing::SendSource& source) noexcept {
+        if (const auto* track = std::get_if<tracks::TrackId>(&source)) {
+            return trackIndex(*track);
+        }
+        return busIndex(std::get<routing::BusId>(source));
+    };
     std::sort(orderedSends.begin(), orderedSends.begin() + sends.size(),
-              [&trackIndex](const auto* left, const auto* right) {
-                  const auto leftTrack = std::get<tracks::TrackId>(left->source);
-                  const auto rightTrack = std::get<tracks::TrackId>(right->source);
-                  const auto leftIndex = trackIndex(leftTrack);
-                  const auto rightIndex = trackIndex(rightTrack);
+              [&sourceKind, &sourceIndex](const auto* left,
+                                          const auto* right) {
+                  const auto leftKind = sourceKind(left->source);
+                  const auto rightKind = sourceKind(right->source);
+                  if (leftKind != rightKind) {
+                      return leftKind < rightKind;
+                  }
+                  const auto leftIndex = sourceIndex(left->source);
+                  const auto rightIndex = sourceIndex(right->source);
                   if (leftIndex != rightIndex) {
                       return leftIndex < rightIndex;
                   }
@@ -515,10 +577,9 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
     }
     for (std::size_t index = 0; index < sends.size(); ++index) {
         const auto& send = *orderedSends[index];
-        const auto source = std::get<tracks::TrackId>(send.source);
         resolvedSends[index] = {
-            audio::AudibilitySendSourceKind::track,
-            trackIndex(source), busIndex(send.destination),
+            sourceKind(send.source), sourceIndex(send.source),
+            busIndex(send.destination),
             send.tapPoint == routing::SendTapPoint::postFaderPostPan};
     }
     return audio::resolveAudibility(

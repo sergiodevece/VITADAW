@@ -75,6 +75,12 @@ routing::SendId ProjectState::addSend(
     return routing_.addSend(source, destination, tapPoint, mix);
 }
 
+bool ProjectState::setSendRoute(
+    routing::SendId send, routing::BusId destination,
+    routing::SendTapPoint tapPoint) noexcept {
+    return routing_.setSendRoute(send, destination, tapPoint);
+}
+
 bool ProjectState::removeSend(routing::SendId send) noexcept {
     return routing_.removeSend(send);
 }

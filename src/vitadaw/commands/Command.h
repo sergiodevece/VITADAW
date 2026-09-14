@@ -47,6 +47,17 @@ struct AddTrackSend {
     routing::SendTapPoint tapPoint{routing::SendTapPoint::postFaderPostPan};
     mixer::GainDb level;
 };
+struct AddBusSend {
+    routing::BusId bus;
+    routing::BusId destination;
+    routing::SendTapPoint tapPoint{routing::SendTapPoint::postFaderPostPan};
+    mixer::GainDb level;
+};
+struct SetSendRoute {
+    routing::SendId send;
+    routing::BusId destination;
+    routing::SendTapPoint tapPoint{routing::SendTapPoint::postFaderPostPan};
+};
 struct RemoveSend { routing::SendId send; };
 struct SetSendLevel { routing::SendId send; mixer::GainDb level; };
 struct SetSendMute { routing::SendId send; bool muted{}; };
@@ -56,8 +67,9 @@ using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
                              SetTrackSolo, SetMasterGain,
                              SetBusGain, SetBusPan, SetBusMute, SetBusSolo,
                              SetTrackOutputDestination,
-                             SetBusOutputDestination, AddTrackSend, RemoveSend,
-                             SetSendLevel, SetSendMute>;
+                             SetBusOutputDestination, AddTrackSend, AddBusSend,
+                             SetSendRoute, RemoveSend, SetSendLevel,
+                             SetSendMute>;
 
 enum class CommandStatus {
     accepted,

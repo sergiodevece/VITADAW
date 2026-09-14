@@ -101,6 +101,8 @@ public:
     [[nodiscard]] SendId addSend(SendSource source, BusId destination,
                                  SendTapPoint tapPoint,
                                  mixer::SendMixState mix);
+    [[nodiscard]] bool setSendRoute(SendId send, BusId destination,
+                                    SendTapPoint tapPoint) noexcept;
     [[nodiscard]] bool removeSend(SendId send) noexcept;
     [[nodiscard]] bool setSendMix(SendId send,
                                   mixer::SendMixState mix) noexcept;
