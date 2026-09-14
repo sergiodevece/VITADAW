@@ -1,4 +1,4 @@
-# VitaDAW 0.3.0 — Processor & Insert Core
+# VitaDAW 0.5.0 — Timeline UI Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -18,6 +18,63 @@ pistas, buses y Master. El procesador interno `internal.gain` se ejecuta por
 subbloques, admite parámetros suavizados y bypass con latencia preservada. No se
 aloja ningún plugin externo ni se compensa todavía la latencia entre rutas.
 
+VitaDAW 0.4.0 sustituye el recurso implícito por pista por el modelo explícito
+`AudioSource -> AudioClip -> AudioTrack`. Una fuente PCM inmutable se prepara
+una sola vez por `SourceId`; cualquier número de clips puede reutilizarla con
+inicio, offset y duración propios. Los solapes se suman de forma determinista
+antes de ejecutar una sola vez los inserts y el mixer de la pista.
+
+VitaDAW 0.4.1 añade las primeras operaciones portables de edición no
+destructiva: Move, Duplicate, Split, Trim Left/Right y Delete. Todas localizan
+clips por `ClipId`, se rechazan durante Play, reutilizan el PCM por `SourceId` y
+publican un plan nuevo mediante la transacción estructural existente. La fila
+de botones de edición de la ventana es únicamente un soporte provisional de
+validación; todavía no existe timeline visual.
+
+VitaDAW 0.4.2 añade Undo/Redo portable para esas seis operaciones de clips.
+El historial vive en `ProjectSession`, coordinado por `DawApplication`, y guarda valores de modelo e IDs estables
+y participa en el commit transaccional. Cada Redo restaura los mismos IDs sin
+retroceder sus contadores ni decodificar PCM. Solo funciona con transporte
+detenido. Los botones Undo/Redo son provisionales.
+
+El historial tiene un máximo de 512 entradas y 8 MiB aproximados. Una edición
+nueva confirmada descarta Redo; un fallo conserva la rama. En esta versión,
+una mutación persistente todavía no undoable (import, mixer, routing, send o
+processor) limpia ambos lados del historial. Play/Stop lo conservan.
+`StateToken` identifica estados lógicos y `revision` cuenta commits, incluidos
+Undo/Redo. Desde 0.4.3 el token guardado permite calcular dirty sin comparar PCM.
+
+VitaDAW 0.4.3 añade Save, Save As y Load, únicamente en Stopped. Los botones
+provisionales guardan archivos `.vitadaw`: JSON UTF-8 determinista, esquema v1,
+modelo editable completo e IDs/contadores exactos como strings decimales.
+`ProjectSession` reúne modelo, historial, ruta del documento y savedStateToken.
+Save conserva Undo; Load adopta un documento limpio con historial vacío y un
+token nuevo. Load requiere confirmar el descarte si la sesión tiene cambios.
+
+Cada Source conserva SHA-256 y tamaño de los bytes realmente decodificados.
+Load prueba ruta relativa al documento y luego fallback absoluto; medios ausentes
+o modificados hacen fallar toda la carga. El PCM candidato queda aislado del
+proyecto activo incluso cuando ambos usan SourceId=1. Save As recalcula rutas
+sin cambiar el nombre del proyecto ni recalcular hashes de medios modificados.
+
+El backend macOS guarda en un temporal exclusivo del mismo directorio,
+sincroniza, hace rename atómico y sincroniza el directorio. Un fallo anterior al
+rename conserva el archivo previo; un fallo posterior devuelve
+`durabilityUncertain`, sin afirmar rollback ni marcar clean.
+No hay autosave, backups, relink, paquetes, medios embebidos ni persistencia
+asíncrona. Detalles y pruebas: [validación 0.4.3](docs/validation-0.4.3.md).
+
+VitaDAW 0.5.0 reemplaza los botones de edición por una timeline visual funcional.
+Las pistas vacías y los clips del proyecto se dibujan como primitivas JUCE, con
+regla en segundos, playhead, zoom y scroll. Selección y preview de drag son estado
+efímero; Move y Trim emiten exactamente un comando al soltar. Split usa el
+playhead, Duplicate crea un clip contiguo y Delete conserva la fuente. Undo/Redo
+y Save/Load reconstruyen la vista desde un `TimelineSnapshot` portable.
+
+No existe Seek todavía: la regla solo observa el transporte. Tampoco hay
+waveforms, snapping musical, multiselección ni edición durante Play. Detalles y
+pruebas: [validación 0.5.0](docs/validation-0.5.0.md).
+
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
 usa `48000 Hz` como valor de reserva. No cambia automáticamente si después se
@@ -27,6 +84,8 @@ reconfigura el dispositivo.
 
 - **C++20** para el núcleo y el callback de audio.
 - **CMake** para builds reproducibles y separación por targets.
+- **nlohmann/json 3.12.0**, fijado con SHA-256 en CMake, únicamente dentro de
+  persistence; el build core-only sigue sin depender de JUCE.
 - **JUCE 9.0.2** como adaptador para ventana y dispositivo de audio. CMake lo
   descarga de su repositorio oficial si no encuentra una instalación local.
 
@@ -98,17 +157,20 @@ linearización; el índice de cola se publica después. El cierre de lifecycle
 compite sobre el mismo gate: si queda después de la aceptación, su watermark
 incluye la secuencia; si queda antes, el CAS de aceptación falla.
 
-Los cuatro botones provisionales de carga aceptan únicamente archivos `.wav`
+Los cuatro botones provisionales de importación aceptan únicamente archivos `.wav`
 que `juce::WavAudioFormat` pueda decodificar. La interfaz crea cuatro pistas al
 arrancar para el smoke test; el dominio y el motor admiten una colección
-variable. `Play` reproduce simultáneamente todas las pistas disponibles y
+variable. Cada import crea `AudioSource` + `AudioClip` en el frame cero;
+importaciones posteriores pueden solaparse en la misma pista. `Play` reproduce
+simultáneamente todas las pistas disponibles y
 `Stop` detiene y vuelve al inicio. Si ninguna pista
 tiene un WAV válido preparado, `Play` se rechaza explícitamente.
 
-Las pistas tienen un `TrackId` monotónico independiente de su posición en el
-vector y no tienen relojes propios. Un único reloj de frames de proyecto
-determina en cada muestra la posición fuente de cada WAV, incluyendo sample
-rates distintos y un futuro inicio de clip desplazado.
+Las pistas tienen un `TrackId` monotónico, layout mono/estéreo estable y no
+tienen relojes propios. Cada `AudioSource` y `AudioClip` posee identidad fuerte
+independiente del almacenamiento. Un único reloj de frames de proyecto
+determina en cada muestra la posición de cada clip, incluso con sample rates,
+inicios, offsets, gaps y solapes distintos.
 
 Cada pista conserva gain de `-100 dB` (silencio) a `+12 dB`, pan normalizado de
 `-1` a `+1`, mute y solo. La UI solo envía `SetTrackGain`, `SetTrackPan`,
@@ -369,6 +431,20 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.3.0 — Processor & Insert Core:** contrato DSP portable, cadenas de
   inserts Track/Bus/Master, GainProcessor, parámetros RT, bypass con latencia y
   metadata de latencia por rutas sin PDC.
+- **0.4.0 — Source / Clip / Track Foundation:** catálogo `AudioSource`, IDs
+  fuertes, múltiples clips por pista, PCM compartido por fuente, índice temporal
+  preparado, render random-access y suma determinista de solapes.
+- **0.4.1 — Timeline Editing Operations:** Move, Duplicate, Split, Trim
+  Left/Right y Delete no destructivos por `ClipId`, con sharing de fuente,
+  rebuild transaccional y preparación para Undo.
+- **0.4.2 — Undo / Redo Foundation:** historial acotado de operaciones de
+  clips, restauración exacta de IDs, preparación del historial antes del commit,
+  barreras, tokens de estado y Undo/Redo estructural solo en Stopped.
+- **0.4.3 — Project Persistence:** documento JSON versionado y determinista,
+  sesión/dirty, medios verificados, guardado atómico y Load transaccional aislado.
+- **0.5.0 — Timeline UI Foundation:** read model portable, tracks/clips dibujados,
+  selección por `ClipId`, gestos Move/Trim, acciones Split/Duplicate/Delete,
+  playhead, zoom/scroll y reconstrucción tras Undo/Redo/Load.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -385,4 +461,9 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.2.2.md`](docs/validation-0.2.2.md) y
 [`docs/validation-0.2.3.md`](docs/validation-0.2.3.md) y
 [`docs/validation-0.2.4.md`](docs/validation-0.2.4.md) y
-[`docs/validation-0.3.0.md`](docs/validation-0.3.0.md).
+[`docs/validation-0.3.0.md`](docs/validation-0.3.0.md) y
+[`docs/validation-0.4.0.md`](docs/validation-0.4.0.md) y
+[`docs/validation-0.4.1.md`](docs/validation-0.4.1.md) y
+[`docs/validation-0.4.2.md`](docs/validation-0.4.2.md) y
+[`docs/validation-0.4.3.md`](docs/validation-0.4.3.md) y
+[`docs/validation-0.5.0.md`](docs/validation-0.5.0.md).

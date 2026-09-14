@@ -33,14 +33,21 @@ public:
     void setStateChangedCallback(StateChangedCallback callback);
 
     [[nodiscard]] audio::AudioFilePreparationResult prepareWav(
-        const std::filesystem::path& file, tracks::TrackId track,
-        timeline::SampleRate projectSampleRate,
-        mixer::PreparedTrackMixState trackMix) override;
-    [[nodiscard]] bool commitPreparedWav(
-        audio::PreparedAudioFilePtr prepared,
-        audio::AudioFileCommitAction modelCommit) noexcept override;
+        const std::filesystem::path& file) override;
+    [[nodiscard]] audio::AudioFilePreparationResult prepareWavForProject(
+        const std::filesystem::path& file, std::size_t candidateBytes) override;
+    [[nodiscard]] audio::AudioFilePreparationResult prepareVerifiedWav(
+        const std::filesystem::path&, const media::MediaFingerprint&, std::size_t) override;
+    [[nodiscard]] std::size_t preparedAudioBytes() const noexcept override { return preparedBytes(); }
+    [[nodiscard]] audio::StructuralPlanPreparationResult prepareProjectReplacement(
+        const audio::ProcessingPlanSpecification&, std::vector<audio::PreparedSourceAudio>) override;
     [[nodiscard]] audio::StructuralPlanPreparationResult prepareProcessingPlan(
         const audio::ProcessingPlanSpecification& specification) override;
+    [[nodiscard]] audio::StructuralPlanPreparationResult
+    prepareProcessingPlanWithAudio(
+        const audio::ProcessingPlanSpecification& specification,
+        media::SourceId source,
+        audio::PreparedAudioFilePtr preparedAudio) override;
     [[nodiscard]] bool commitPreparedProcessingPlan(
         audio::PreparedProcessingPlanChangePtr prepared,
         audio::AudioFileCommitAction modelCommit) noexcept override;
@@ -70,6 +77,9 @@ public:
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
 
 private:
+    friend class PersistenceIntegrationAccess; // Hardware-free test harness only.
+    [[nodiscard]] audio::AudioFilePreparationResult decodeWav(
+        const std::filesystem::path&, std::size_t, const media::MediaFingerprint*);
     void audioDeviceIOCallbackWithContext(
         const float* const*, int, float* const*, int, int,
         const juce::AudioIODeviceCallbackContext&) noexcept override;

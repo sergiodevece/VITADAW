@@ -20,7 +20,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.3.0";
+        return "0.5.0";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -42,10 +42,13 @@ public:
             *audioDevice_, projectSampleRate);
         commandDispatcher_ =
             std::make_unique<commands::CommandDispatcher>(*dawApplication_);
-        const std::array trackNames{"Snare", "Kick", "Guitar", "Audio 4"};
-        for (const auto* name : trackNames) {
+        const std::array trackNames{"Snare", "Kick", "Guitar", "Stereo 4"};
+        for (std::size_t index = 0; index < trackNames.size(); ++index) {
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddAudioTrack{name}));
+                commands::AddAudioTrack{
+                    trackNames[index],
+                    index == 3 ? media::AudioChannelLayout::stereo
+                               : media::AudioChannelLayout::mono}));
         }
         static_cast<void>(commandDispatcher_->dispatch(
             commands::AddBus{"Drum Bus"}));
@@ -105,8 +108,7 @@ public:
                     {processors::internalGainProcessorType}}));
         }
         mainWindow_ = std::make_unique<MainWindow>(
-            audioDevice_->state(), *commandDispatcher_,
-            dawApplication_->project());
+            audioDevice_->state(), *commandDispatcher_, *dawApplication_);
         mainWindow_->setTransportState(dawApplication_->transport(),
                                        dawApplication_->project().sampleRate());
         mainWindow_->setMeterState(dawApplication_->meterSnapshot());

@@ -6,8 +6,8 @@
 
 #include <compare>
 #include <cstdint>
-#include <optional>
 #include <string>
+#include <vector>
 
 namespace vitadaw::tracks {
 
@@ -21,11 +21,12 @@ struct TrackId {
 struct AudioTrack {
     TrackId id{};
     std::string name;
-    std::optional<clips::AudioClip> clip;
+    media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
+    std::vector<clips::AudioClip> clips;
     mixer::TrackMixState mix;
     processors::InsertChain inserts;
 
-    [[nodiscard]] bool hasAudio() const noexcept { return clip.has_value(); }
+    [[nodiscard]] bool hasAudio() const noexcept { return !clips.empty(); }
 };
 
 } // namespace vitadaw::tracks

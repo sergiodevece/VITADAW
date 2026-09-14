@@ -2,6 +2,7 @@
 #include "vitadaw/commands/CommandDispatcher.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -38,10 +39,13 @@ public:
         : public vitadaw::audio::PreparedProcessingPlanChange {
     public:
         explicit PreparedPlan(
-            vitadaw::audio::ProcessingPlanSpecification candidate)
-            : specification(std::move(candidate)) {}
+            vitadaw::audio::ProcessingPlanSpecification candidate,
+            vitadaw::audio::PreparedAudioFilePtr importedSource = {})
+            : specification(std::move(candidate)),
+              imported(std::move(importedSource)) {}
 
         vitadaw::audio::ProcessingPlanSpecification specification;
+        vitadaw::audio::PreparedAudioFilePtr imported;
     };
 
     struct LiveTrack {
@@ -54,10 +58,7 @@ public:
     FakeAudioEngine() { live.reserve(32); }
 
     vitadaw::audio::AudioFilePreparationResult prepareWav(
-        const std::filesystem::path& file,
-        vitadaw::tracks::TrackId track,
-        vitadaw::timeline::SampleRate projectSampleRate,
-        vitadaw::mixer::PreparedTrackMixState trackMix) override {
+        const std::filesystem::path& file) override {
         ++loadRequests;
         if (throwNextPreparation) {
             throwNextPreparation = false;
@@ -67,9 +68,10 @@ public:
             rejectNextLoad = false;
             return {nullptr, "Invalid WAV"};
         }
+        const auto track = trackFor(file);
         const auto metadata = metadataFor(track);
         return {std::make_unique<PreparedFile>(metadata, file, track,
-                                               projectSampleRate,
+                                               vitadaw::timeline::SampleRate{48000.0},
                                                resourceCounters), {}};
     }
 
@@ -80,12 +82,28 @@ public:
             rejectNextStructuralPreparation = false;
             return {nullptr, "Injected routing preparation failure"};
         }
-        const auto validation = vitadaw::audio::prepareProcessingPlan(
-            specification, {});
-        if (!validation.success()) {
-            return {nullptr, validation.errorMessage};
+        if (specification.sources.empty()) {
+            const auto validation = vitadaw::audio::prepareProcessingPlan(
+                specification, {});
+            if (!validation.success()) {
+                return {nullptr, validation.errorMessage};
+            }
         }
         return {std::make_unique<PreparedPlan>(specification), {}};
+    }
+
+    vitadaw::audio::StructuralPlanPreparationResult
+    prepareProcessingPlanWithAudio(
+        const vitadaw::audio::ProcessingPlanSpecification& specification,
+        vitadaw::media::SourceId,
+        vitadaw::audio::PreparedAudioFilePtr preparedAudio) override {
+        ++structuralPrepareRequests;
+        if (rejectNextStructuralPreparation) {
+            rejectNextStructuralPreparation = false;
+            return {nullptr, "Injected routing preparation failure"};
+        }
+        return {std::make_unique<PreparedPlan>(specification,
+                                                std::move(preparedAudio)), {}};
     }
 
     bool commitPreparedProcessingPlan(
@@ -98,9 +116,38 @@ public:
             return false;
         }
         ++structuralCommitRequests;
+        if (candidate->imported != nullptr) {
+            auto* file = dynamic_cast<PreparedFile*>(candidate->imported.get());
+            if (file == nullptr) {
+                return false;
+            }
+            auto found = std::find_if(live.begin(), live.end(),
+                                      [id = file->track](const auto& track) {
+                                          return track.id == id;
+                                      });
+            if (found == live.end()) {
+                live.push_back({file->track, file->metadata, file->file,
+                                std::move(candidate->imported)});
+            } else {
+                found->metadata = file->metadata;
+                found->file = file->file;
+                found->resource = std::move(candidate->imported);
+            }
+            ++commitRequests;
+        }
         liveSpecification = std::move(candidate->specification);
         snapshot.playing = false;
         snapshot.position = {0};
+        snapshot.duration = {};
+        for (const auto& track : liveSpecification.tracks) {
+            for (const auto& clip : track.clips) {
+                snapshot.duration.value = std::max(
+                    snapshot.duration.value,
+                    static_cast<std::int64_t>(std::ceil(
+                        static_cast<double>(clip.projectStart.value) +
+                        clip.duration.value)));
+            }
+        }
         modelCommit.execute();
         return true;
     }
@@ -158,41 +205,6 @@ public:
         vitadaw::mixer::PreparedMasterMixState mix) noexcept override {
         ++masterMixRequests;
         return acceptMixerRequests && mix.isValid();
-    }
-
-    bool commitPreparedWav(
-        vitadaw::audio::PreparedAudioFilePtr prepared,
-        vitadaw::audio::AudioFileCommitAction modelCommit) noexcept override {
-        auto* candidate = dynamic_cast<PreparedFile*>(prepared.get());
-        if (candidate == nullptr || !modelCommit.isValid()) {
-            return false;
-        }
-        ++commitRequests;
-        auto found = std::find_if(live.begin(), live.end(),
-                                  [id = candidate->track](const auto& track) {
-                                      return track.id == id;
-                                  });
-        if (found == live.end()) {
-            live.push_back({candidate->track, candidate->metadata,
-                            candidate->file, std::move(prepared)});
-        } else {
-            found->metadata = candidate->metadata;
-            found->file = candidate->file;
-            found->resource = std::move(prepared);
-        }
-        snapshot.playing = false;
-        snapshot.position = {0};
-        snapshot.duration = {0};
-        for (const auto& track : live) {
-            snapshot.duration.value = std::max(
-                snapshot.duration.value,
-                vitadaw::timeline::sourceFramesToProjectDuration(
-                    track.metadata.sourceFrameCount,
-                    track.metadata.sourceSampleRate,
-                    candidate->projectSampleRate).value);
-        }
-        modelCommit.execute();
-        return true;
     }
 
     vitadaw::audio::AudioControlRequestResult tryRequestPlay() noexcept override {
@@ -265,6 +277,20 @@ public:
     ResourceCounters resourceCounters;
 
 private:
+    [[nodiscard]] static vitadaw::tracks::TrackId trackFor(
+        const std::filesystem::path& file) {
+        const auto name = file.filename().string();
+        if (name.find("first") != std::string::npos ||
+            name.find("throws") != std::string::npos) {
+            return {1};
+        }
+        if (name.find("third") != std::string::npos ||
+            name.find("broken") != std::string::npos) {
+            return {3};
+        }
+        return {4};
+    }
+
     [[nodiscard]] static vitadaw::audio::AudioFileMetadata metadataFor(
         vitadaw::tracks::TrackId track) {
         if (track.value == 1) {
@@ -304,7 +330,9 @@ int main() {
 
     for (int index = 1; index <= 4; ++index) {
         check(dispatcher.dispatch(commands::AddAudioTrack{
-                  "Audio " + std::to_string(index)}).status ==
+                  "Audio " + std::to_string(index),
+                  index == 1 ? media::AudioChannelLayout::mono
+                             : media::AudioChannelLayout::stereo}).status ==
                   commands::CommandStatus::accepted,
               "adding an audio track should succeed");
     }
@@ -643,6 +671,70 @@ int main() {
               commands::CommandStatus::accepted &&
               app.transport().position.value == 0,
           "Stop should rewind the master clock");
+    const auto sharedSource = app.project().findTrack(first)->clips.front().source;
+    const auto clipsBeforeFailure = app.project().findTrack(first)->clips.size();
+    audio.rejectNextStructuralPreparation = true;
+    check(dispatcher.dispatch(commands::AddClip{
+              first, sharedSource, {0}, {100.0}, {0.0}}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findTrack(first)->clips.size() == clipsBeforeFailure,
+          "failed AddClip preparation must preserve model and active plan");
+    check(dispatcher.dispatch(commands::AddClip{
+              first, sharedSource, {0}, {100.0}, {0.0}}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().findTrack(first)->clips.size() ==
+                  clipsBeforeFailure + 1,
+          "AddClip must reuse a prepared Source without decoding media");
+    const auto addedClip = app.project().findTrack(first)->clips.back().id;
+    check(dispatcher.dispatch(commands::RemoveClip{addedClip}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().findSource(sharedSource) != nullptr,
+          "RemoveClip must retain its AudioSource");
+    const auto editedOriginal = app.project().findTrack(first)->clips.front().id;
+    const auto loadsBeforeEditing = audio.loadRequests;
+    const auto sourcesBeforeEditing = app.project().sources().size();
+    check(dispatcher.dispatch(commands::DuplicateClip{
+              editedOriginal, {96000}}).status ==
+              commands::CommandStatus::accepted,
+          "DuplicateClip must flow through dispatcher and structural commit");
+    const auto duplicatedClip =
+        std::max_element(app.project().findTrack(first)->clips.begin(),
+                         app.project().findTrack(first)->clips.end(),
+                         [](const auto& left, const auto& right) {
+                             return left.id < right.id;
+                         })->id;
+    check(dispatcher.dispatch(commands::MoveClip{
+              duplicatedClip, {72000}}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SplitClip{
+                  duplicatedClip, {96000}}).status ==
+                  commands::CommandStatus::accepted,
+          "MoveClip and SplitClip must rebuild and commit stopped timelines");
+    const auto splitRight =
+        std::max_element(app.project().findTrack(first)->clips.begin(),
+                         app.project().findTrack(first)->clips.end(),
+                         [](const auto& left, const auto& right) {
+                             return left.id < right.id;
+                         })->id;
+    check(dispatcher.dispatch(commands::TrimClipLeft{
+              splitRight, {108000}}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::TrimClipRight{
+                  editedOriginal, {24000}}).status ==
+                  commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::DeleteClip{splitRight}).status ==
+                  commands::CommandStatus::accepted &&
+              audio.loadRequests == loadsBeforeEditing &&
+              app.project().sources().size() == sourcesBeforeEditing,
+          "trim/delete edits must preserve Source cache and never decode again");
+    const auto originalBeforeFailedMove = *app.project().findClip(editedOriginal);
+    audio.rejectNextStructuralPreparation = true;
+    const auto failedMove = dispatcher.dispatch(commands::MoveClip{
+        editedOriginal, {1000}});
+    check(failedMove.status == commands::CommandStatus::rejected &&
+              failedMove.error == commands::CommandError::preparationFailed &&
+              *app.project().findClip(editedOriginal) == originalBeforeFailedMove,
+          "failed edit preparation must preserve model and active plan");
     check(dispatcher.dispatch(commands::SetTrackOutputDestination{
               first, routing::TrackOutputDestination::master()}).status ==
               commands::CommandStatus::accepted,
@@ -668,6 +760,15 @@ int main() {
     check(dispatcher.dispatch(commands::Play{}).status ==
               commands::CommandStatus::accepted,
           "Play should restart after Stop");
+    const auto clipCountWhilePlaying = app.project().findTrack(first)->clips.size();
+    const auto editWhilePlaying = dispatcher.dispatch(commands::DuplicateClip{
+        editedOriginal, {120000}});
+    check(editWhilePlaying.status == commands::CommandStatus::rejected &&
+              editWhilePlaying.error ==
+                  commands::CommandError::transportMustBeStopped &&
+              app.project().findTrack(first)->clips.size() ==
+                  clipCountWhilePlaying,
+          "timeline edits must be rejected before preparation while Playing");
 
     audio.publishProgress(192000, false);
     app.synchroniseTransport();

@@ -157,6 +157,7 @@ private:
     processors::ProcessingFormat processingFormat_;
     std::size_t blockCapacity_{defaultProcessingBlockCapacity};
     ProcessingPlanRuntime* runtime_{};
+    const PreparedProcessingPlan* plan_{};
     std::array<PreparedTrackRoute, maximumTrackCount> legacyTracks_{};
     std::array<ProcessingStep, maximumTrackCount + 1> legacyOrder_{};
     std::array<float, defaultProcessingBlockCapacity> legacyMasterLeft_{};

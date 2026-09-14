@@ -3,6 +3,7 @@
 #include "vitadaw/tracks/AudioTrack.h"
 #include "vitadaw/routing/RoutingState.h"
 #include "vitadaw/processors/InsertTarget.h"
+#include "vitadaw/persistence/PersistenceResult.h"
 
 #include <filesystem>
 #include <string>
@@ -12,6 +13,7 @@ namespace vitadaw::commands {
 
 struct AddAudioTrack {
     std::string name;
+    media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
 };
 
 struct AddBus {
@@ -23,8 +25,51 @@ struct LoadAudioFile {
     tracks::TrackId track;
 };
 
+struct ImportAudioToTrack {
+    std::filesystem::path file;
+    tracks::TrackId track;
+    timeline::ProjectFramePosition projectStart{0};
+};
+
+struct AddClip {
+    tracks::TrackId track;
+    media::SourceId source;
+    timeline::ProjectFramePosition projectStart;
+    timeline::ProjectFrameDuration duration;
+    timeline::SourceFramePosition sourceOffset{0.0};
+};
+
+struct RemoveClip { clips::ClipId clip; };
+struct RemoveSource { media::SourceId source; };
+struct MoveClip {
+    clips::ClipId clip;
+    timeline::ProjectFramePosition projectStart;
+};
+struct DuplicateClip {
+    clips::ClipId clip;
+    timeline::ProjectFramePosition projectStart;
+};
+struct SplitClip {
+    clips::ClipId clip;
+    timeline::ProjectFramePosition splitPosition;
+};
+struct TrimClipLeft {
+    clips::ClipId clip;
+    timeline::ProjectFramePosition projectStart;
+};
+struct TrimClipRight {
+    clips::ClipId clip;
+    timeline::ProjectFramePosition projectEnd;
+};
+struct DeleteClip { clips::ClipId clip; };
+
 struct Play {};
 struct Stop {};
+struct Undo {};
+struct Redo {};
+struct SaveProject {};
+struct SaveProjectAs { std::filesystem::path path; };
+struct LoadProject { std::filesystem::path path; bool discardUnsaved{}; };
 struct SetTrackGain { tracks::TrackId track; mixer::GainDb gain; };
 struct SetTrackPan { tracks::TrackId track; mixer::Pan pan; };
 struct SetTrackMute { tracks::TrackId track; bool muted{}; };
@@ -81,7 +126,11 @@ struct SetProcessorParameter {
     float value{};
 };
 
-using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile, Play, Stop,
+using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile,
+                             ImportAudioToTrack, AddClip, RemoveClip,
+                             RemoveSource, MoveClip, DuplicateClip, SplitClip,
+                             TrimClipLeft, TrimClipRight, DeleteClip,
+                             Play, Stop, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
                              SetTrackGain, SetTrackPan, SetTrackMute,
                              SetTrackSolo, SetMasterGain,
                              SetBusGain, SetBusPan, SetBusMute, SetBusSolo,
@@ -97,9 +146,30 @@ enum class CommandStatus {
     rejected,
 };
 
+enum class CommandError {
+    none,
+    nothingToUndo,
+    nothingToRedo,
+    validationFailed,
+    historyInvalid,
+    historyCapacityExceeded,
+    clipNotFound,
+    invalidPosition,
+    zeroLengthClip,
+    sourceBoundsExceeded,
+    transportMustBeStopped,
+    preparationFailed,
+    capacityExceeded,
+};
+
 struct CommandResult {
+    CommandResult(CommandStatus s = CommandStatus::accepted, std::string text = {},
+        CommandError e = CommandError::none, persistence::PersistenceResult p = {}) noexcept
+        : status(s), message(std::move(text)), error(e), persistence(std::move(p)) {}
     CommandStatus status{CommandStatus::accepted};
     std::string message;
+    CommandError error{CommandError::none};
+    persistence::PersistenceResult persistence;
 };
 
 class ICommandHandler {

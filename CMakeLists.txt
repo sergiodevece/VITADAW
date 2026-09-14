@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.3.0 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.5.0 LANGUAGES C CXX)
+
+include(FetchContent)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+    URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
 
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
@@ -8,18 +16,25 @@ option(VITADAW_FETCH_JUCE "Download the pinned JUCE version when it is not insta
 
 add_library(vitadaw_core
     src/vitadaw/application/DawApplication.cpp
+    src/vitadaw/application/ProjectPersistenceCommands.cpp
     src/vitadaw/audio/AudioDeviceState.cpp
     src/vitadaw/audio/PreparedProcessingPlan.cpp
     src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
+    src/vitadaw/history/UndoManager.cpp
     src/vitadaw/project/ProjectState.cpp
+    src/vitadaw/project/ProjectDocumentData.cpp
+    src/vitadaw/persistence/ProjectPersistence.cpp
+    src/vitadaw/platform/files/ProjectFileIO.cpp
     src/vitadaw/processors/GainProcessor.cpp
     src/vitadaw/routing/RoutingState.cpp
     src/vitadaw/timeline/Time.cpp
+    src/vitadaw/ui/timeline/TimelineModel.cpp
 )
 
 target_include_directories(vitadaw_core PUBLIC src)
 target_compile_features(vitadaw_core PUBLIC cxx_std_20)
+target_link_libraries(vitadaw_core PRIVATE nlohmann_json::nlohmann_json)
 
 if(MSVC)
     target_compile_options(vitadaw_core PRIVATE /W4 /permissive-)
@@ -57,6 +72,8 @@ if(VITADAW_BUILD_APP)
         src/vitadaw/platform/juce/JuceAudioDeviceAdapter.h
         src/vitadaw/platform/juce/MainWindow.cpp
         src/vitadaw/platform/juce/MainWindow.h
+        src/vitadaw/platform/juce/TimelineComponent.cpp
+        src/vitadaw/platform/juce/TimelineComponent.h
     )
 
     target_compile_features(vitadaw_app PRIVATE cxx_std_20)
@@ -83,6 +100,24 @@ endif()
 
 if(VITADAW_BUILD_TESTS)
     enable_testing()
+    add_executable(vitadaw_project_persistence_tests tests/ProjectPersistenceTests.cpp)
+    target_link_libraries(vitadaw_project_persistence_tests PRIVATE vitadaw_core)
+    target_compile_definitions(vitadaw_project_persistence_tests PRIVATE
+        VITADAW_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/persistence")
+    add_test(NAME vitadaw_project_persistence_tests COMMAND vitadaw_project_persistence_tests)
+    if(VITADAW_BUILD_APP)
+        add_executable(vitadaw_project_media_integration_tests
+            tests/ProjectMediaIntegrationTests.cpp
+            src/vitadaw/platform/juce/JuceAudioDeviceAdapter.cpp)
+        target_link_libraries(vitadaw_project_media_integration_tests PRIVATE vitadaw_core
+            juce::juce_audio_devices juce::juce_audio_formats)
+        target_compile_definitions(vitadaw_project_media_integration_tests PRIVATE
+            JUCE_USE_FLAC=0 JUCE_USE_MP3AUDIOFORMAT=0 JUCE_USE_OGGVORBIS=0 JUCE_USE_CURL=0)
+        add_test(NAME vitadaw_project_media_integration_tests COMMAND vitadaw_project_media_integration_tests)
+    endif()
+    add_executable(vitadaw_undo_redo_tests tests/UndoRedoTests.cpp)
+    target_link_libraries(vitadaw_undo_redo_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_undo_redo_tests COMMAND vitadaw_undo_redo_tests)
 
     add_executable(vitadaw_core_tests tests/CommandFlowTests.cpp)
     target_link_libraries(vitadaw_core_tests PRIVATE vitadaw_core)
@@ -177,4 +212,22 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_processor_command_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_processor_command_tests
         COMMAND vitadaw_processor_command_tests)
+
+    add_executable(vitadaw_source_clip_track_foundation_tests
+        tests/SourceClipTrackFoundationTests.cpp)
+    target_link_libraries(vitadaw_source_clip_track_foundation_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_source_clip_track_foundation_tests
+        COMMAND vitadaw_source_clip_track_foundation_tests)
+
+    add_executable(vitadaw_timeline_editing_operations_tests
+        tests/TimelineEditingOperationsTests.cpp)
+    target_link_libraries(vitadaw_timeline_editing_operations_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_timeline_editing_operations_tests
+        COMMAND vitadaw_timeline_editing_operations_tests)
+
+    add_executable(vitadaw_timeline_ui_foundation_tests
+        tests/TimelineUiFoundationTests.cpp)
+    target_link_libraries(vitadaw_timeline_ui_foundation_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_timeline_ui_foundation_tests
+        COMMAND vitadaw_timeline_ui_foundation_tests)
 endif()

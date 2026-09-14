@@ -1,0 +1,28 @@
+{
+  "buses": [],
+  "format": "VitaDAWProject",
+  "master": {
+    "gainDb": 0.0,
+    "inserts": []
+  },
+  "nextIds": {
+    "bus": "1",
+    "clip": "1",
+    "processorInstance": "1",
+    "send": "1",
+    "source": "1",
+    "track": "1"
+  },
+  "projectSettings": {
+    "name": "Untitled",
+    "sampleRateHz": 48000.0
+  },
+  "routing": {
+    "trackOutputs": []
+  },
+  "schemaVersion": 1,
+  "sends": [],
+  "sources": [],
+  "tracks": [],
+  "writerAppVersion": "0.5.0"
+}

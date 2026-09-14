@@ -15,8 +15,14 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     projectDuration_ = project.duration;
     trackMixCount_ = std::min(project.tracks.size(), maximumTrackCount);
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
-        legacyTracks_[index] = {project.tracks[index], masterDestinationIndex,
-                                {}, {}, {}, {}, {}, {}};
+        legacyTracks_[index] = {};
+        legacyTracks_[index].source = project.tracks[index];
+        legacyTracks_[index].id = project.tracks[index].id;
+        legacyTracks_[index].layout =
+            project.tracks[index].channelCount == 2
+                ? media::AudioChannelLayout::stereo
+                : media::AudioChannelLayout::mono;
+        legacyTracks_[index].destinationBusIndex = masterDestinationIndex;
         legacyOrder_[index] = {ProcessingStepKind::track, index};
         trackMix_[index].reset(project.tracks[index].mix.isValid()
                                    ? project.tracks[index].mix
@@ -37,6 +43,7 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
                          processors::ChannelLayout::stereo,
                          processors::ProcessingMode::realtime};
     runtime_ = nullptr;
+    plan_ = nullptr;
     blockCapacity_ = defaultProcessingBlockCapacity;
     masterMix_.reset(project.masterMix.isValid()
                          ? project.masterMix
@@ -74,13 +81,14 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
     masterInserts_ = plan.masterInserts;
     processingFormat_ = plan.stereoProcessingFormat;
     runtime_ = &runtime;
+    plan_ = &plan;
     blockCapacity_ = plan.blockCapacity;
     trackMixCount_ = std::min(tracks_.size(), maximumTrackCount);
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
         trackMix_[index].reset(tracks_[index].source.mix.isValid()
                                    ? tracks_[index].source.mix
                                    : mixer::PreparedTrackMixState{});
-        meterTrackIds_[index] = tracks_[index].source.id;
+        meterTrackIds_[index] = tracks_[index].id;
     }
     for (std::size_t index = 0;
          index < std::min(buses_.size(), maximumBusCount); ++index) {
@@ -164,13 +172,13 @@ bool RealtimeAudioEngine::tryUpdateTrackMix(
     PreparedAudibilityState audibility) noexcept {
     const auto exists = std::any_of(
         tracks_.begin(), tracks_.begin() + trackMixCount_,
-        [track](const auto& candidate) { return candidate.source.id == track; });
+        [track](const auto& candidate) { return candidate.id == track; });
     if (!track.isValid() || !exists || !mix.isValid()) {
         return false;
     }
     const auto found = std::find_if(
         tracks_.begin(), tracks_.begin() + trackMixCount_,
-        [track](const auto& candidate) { return candidate.source.id == track; });
+        [track](const auto& candidate) { return candidate.id == track; });
     return enqueueParameter(TrackMixCommand{
         static_cast<std::size_t>(found - tracks_.begin()), mix, audibility});
 }
@@ -445,11 +453,35 @@ void RealtimeAudioEngine::processSubBlock(
             const auto& route = tracks_[step.index];
             auto& scratch =
                 runtime_->processorScratch[route.inserts.scratchIndex];
-            for (std::size_t frame = 0; frame < validFrames; ++frame) {
-                const auto rendered = renderTrackAtProjectPosition(
-                    route.source, {positions[frame]}, projectSampleRate_);
-                scratch.first.left[frame] = rendered.left;
-                scratch.first.right[frame] = rendered.right;
+            std::fill_n(scratch.first.left.data(), validFrames, 0.0F);
+            std::fill_n(scratch.first.right.data(), validFrames, 0.0F);
+            if (route.clips.count != 0) {
+                const auto blockEnd = positions[validFrames - 1] +
+                                      projectFramesPerDeviceFrame.value;
+                const auto candidates = findPreparedClipCandidates(
+                    *plan_, route, positions[0], blockEnd);
+                for (std::size_t candidate = 0;
+                     candidate < candidates.count; ++candidate) {
+                    const auto& clip =
+                        plan_->clips[candidates.first + candidate];
+                    for (std::size_t frame = 0; frame < validFrames; ++frame) {
+                        if (positions[frame] < clip.projectStart ||
+                            positions[frame] >= clip.projectEnd) {
+                            continue;
+                        }
+                        const auto rendered = renderPreparedClipAtProjectPosition(
+                            *plan_, clip, {positions[frame]});
+                        scratch.first.left[frame] += rendered.left;
+                        scratch.first.right[frame] += rendered.right;
+                    }
+                }
+            } else {
+                for (std::size_t frame = 0; frame < validFrames; ++frame) {
+                    const auto rendered = renderTrackAtProjectPosition(
+                        route.source, {positions[frame]}, projectSampleRate_);
+                    scratch.first.left[frame] = rendered.left;
+                    scratch.first.right[frame] = rendered.right;
+                }
             }
             const auto processed = processInsertChain(route.inserts, context);
             for (std::size_t frame = 0; frame < validFrames; ++frame) {
@@ -775,8 +807,9 @@ void RealtimeAudioEngine::resolveCommandsThrough(
 
 bool RealtimeAudioEngine::hasPreparedAudio() const noexcept {
     return std::any_of(tracks_.begin(), tracks_.begin() + trackMixCount_,
-                       [](const auto& track) {
-                           return track.source.isAvailable();
+                       [this](const auto& track) {
+                           return track.source.isAvailable() ||
+                                  (plan_ != nullptr && track.clips.count != 0);
                        });
 }
 

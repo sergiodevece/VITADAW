@@ -1,5 +1,6 @@
 #include "vitadaw/platform/juce/JuceAudioDeviceAdapter.h"
 #include "vitadaw/audio/AudioPreparationPolicy.h"
+#include "vitadaw/platform/files/ProjectFileIO.h"
 
 #include <juce_audio_formats/juce_audio_formats.h>
 
@@ -21,9 +22,8 @@ struct JuceAudioDeviceAdapter::PreparedAudio {
 
 struct JuceAudioDeviceAdapter::PreparedProject {
     struct TrackResource {
-        tracks::TrackId id;
+        media::SourceId id;
         std::shared_ptr<const PreparedAudio> audio;
-        mixer::PreparedTrackMixState mix;
     };
 
     std::vector<TrackResource> resources;
@@ -34,15 +34,10 @@ struct JuceAudioDeviceAdapter::PreparedProject {
 struct JuceAudioDeviceAdapter::PreparedJuceAudioFile final
     : audio::PreparedAudioFile {
     PreparedJuceAudioFile(audio::AudioFileMetadata metadata,
-                          tracks::TrackId destination,
-                          timeline::SampleRate projectRate,
-                          std::unique_ptr<PreparedProject> project) noexcept
-        : audio::PreparedAudioFile(metadata), track(destination),
-          projectSampleRate(projectRate), preparedProject(std::move(project)) {}
+                          std::shared_ptr<const PreparedAudio> resource) noexcept
+        : audio::PreparedAudioFile(metadata), audio(std::move(resource)) {}
 
-    tracks::TrackId track;
-    timeline::SampleRate projectSampleRate;
-    std::unique_ptr<PreparedProject> preparedProject;
+    std::shared_ptr<const PreparedAudio> audio;
 };
 
 struct JuceAudioDeviceAdapter::PreparedJuceProcessingPlan final
@@ -133,33 +128,38 @@ void JuceAudioDeviceAdapter::setStateChangedCallback(StateChangedCallback callba
 }
 
 audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
-    const std::filesystem::path& filePath, tracks::TrackId track,
-    timeline::SampleRate projectSampleRate,
-    mixer::PreparedTrackMixState trackMix) {
-    try {
-        if (!track.isValid()) {
-            return {nullptr, "Invalid audio track identity"};
-        }
-        if (!projectSampleRate.isValid()) {
-            return {nullptr, "Project sample rate must be finite and positive"};
-        }
-        if (!trackMix.isValid()) {
-            return {nullptr, "Invalid prepared track mixer state"};
-        }
+    const std::filesystem::path& filePath) {
+    return prepareWavForProject(filePath, 0);
+}
 
+audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWavForProject(
+    const std::filesystem::path& filePath, std::size_t candidateBytes) {
+    return decodeWav(filePath, candidateBytes, nullptr);
+}
+audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareVerifiedWav(
+    const std::filesystem::path& filePath, const media::MediaFingerprint& expected, std::size_t candidateBytes) {
+    return decodeWav(filePath, candidateBytes, &expected);
+}
+audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
+    const std::filesystem::path& filePath, std::size_t candidateBytes, const media::MediaFingerprint* expected) {
+    using namespace persistence;
+    try {
         const auto nativePath = filePath.wstring();
         const juce::File file{juce::String(nativePath.c_str())};
         if (!file.hasFileExtension("wav")) {
             return {nullptr, "Only WAV files are supported"};
         }
-        if (!file.existsAsFile()) {
-            return {nullptr, "WAV file does not exist"};
-        }
+        const auto activeBytes = preparedBytes();
+        if (activeBytes > preparationMemoryBudgetBytes || candidateBytes > preparationMemoryBudgetBytes - activeBytes)
+            return {nullptr, {}, {PersistenceCode::capacityExceeded, PersistencePhase::prepare}};
+        const auto retainedBytes = activeBytes + candidateBytes;
+        auto encoded = files::nativeProjectFileIO().read(filePath, preparationMemoryBudgetBytes - retainedBytes);
+        if (!encoded.result.success()) return {nullptr, {}, std::move(encoded.result)};
+        const auto fingerprint = files::fingerprint(encoded.bytes);
+        if (expected && *expected != fingerprint)
+            return {nullptr, {}, {PersistenceCode::mediaChanged, PersistencePhase::media}};
         juce::WavAudioFormat wavFormat;
-        auto inputStream = file.createInputStream();
-        if (inputStream == nullptr) {
-            return {nullptr, "WAV file could not be opened"};
-        }
+        auto inputStream = std::make_unique<juce::MemoryInputStream>(encoded.bytes.data(), encoded.bytes.size(), false);
         std::unique_ptr<juce::AudioFormatReader> reader{
             wavFormat.createReaderFor(inputStream.release(), true)};
         if (reader == nullptr || reader->lengthInSamples <= 0) {
@@ -173,7 +173,7 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
         const auto channelCount = static_cast<std::uint64_t>(reader->numChannels);
         const auto validation = audio::validatePreparationShape(
             timeline::SampleRate{reader->sampleRate}, channelCount, frameCount,
-            preparedBytes(), preparationMemoryBudgetBytes);
+            retainedBytes + encoded.bytes.size(), preparationMemoryBudgetBytes);
         if (!validation.isValid()) {
             if (validation.error ==
                 audio::PreparationValidationError::memoryBudgetExceeded) {
@@ -211,42 +211,13 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
             prepared->sourceSampleRate, static_cast<std::uint32_t>(channelCount),
             {frameCount}, {static_cast<double>(frameCount) / reader->sampleRate}};
 
-        if (preparedProject_ == nullptr) {
-            return {nullptr, "Project routing must be prepared before loading WAV"};
-        }
-        if (preparedProject_->specification.projectSampleRate !=
-            projectSampleRate) {
-            return {nullptr, "WAV project sample rate does not match routing"};
-        }
-        auto candidateProject = std::make_unique<PreparedProject>();
-        if (preparedProject_ != nullptr) {
-            candidateProject->resources = preparedProject_->resources;
-        }
-        const auto existing = std::find_if(
-            candidateProject->resources.begin(), candidateProject->resources.end(),
-            [track](const auto& resource) { return resource.id == track; });
-        if (existing == candidateProject->resources.end()) {
-            if (candidateProject->resources.size() >=
-                audio::RealtimeAudioEngine::maximumTrackCount) {
-                return {nullptr, "Realtime prepared track capacity exceeded"};
-            }
-            candidateProject->resources.push_back(
-                {track, std::move(prepared), trackMix});
-        } else {
-            existing->audio = std::move(prepared);
-            existing->mix = trackMix;
-        }
-
-        std::string planError;
-        if (!prepareProjectPlan(*candidateProject,
-                                preparedProject_->specification, planError)) {
-            return {nullptr, std::move(planError)};
-        }
-
-        return {std::make_unique<PreparedJuceAudioFile>(
-                    metadata, track, projectSampleRate,
-                    std::move(candidateProject)),
-                {}};
+        // Verify once more by streaming. PCM and fingerprint came from the same
+        // immutable byte snapshot; replacing/changing the media during decode fails.
+        auto verification = files::verifyFingerprint(filePath, fingerprint, &encoded.identity);
+        if (!verification.success()) return {nullptr, {}, std::move(verification)};
+        auto result = std::make_unique<PreparedJuceAudioFile>(metadata, std::move(prepared));
+        result->media = {std::filesystem::absolute(filePath).lexically_normal(), {}, fingerprint};
+        return {std::move(result), {}};
     } catch (const std::bad_alloc&) {
         return {nullptr, "Not enough memory to prepare WAV"};
     } catch (const std::exception&) {
@@ -269,12 +240,6 @@ bool JuceAudioDeviceAdapter::tryUpdateTrackMix(
     if (planTrack == preparedProject_->specification.tracks.end() ||
         !realtimeEngine_.tryUpdateTrackMix(track, mix, audibility)) {
         return false;
-    }
-    const auto resource = std::find_if(
-        preparedProject_->resources.begin(), preparedProject_->resources.end(),
-        [track](const auto& candidate) { return candidate.id == track; });
-    if (resource != preparedProject_->resources.end()) {
-        resource->mix = mix;
     }
     planTrack->mix = mix;
     return true;
@@ -398,18 +363,6 @@ bool JuceAudioDeviceAdapter::tryUpdateProcessorParameter(
     return true;
 }
 
-bool JuceAudioDeviceAdapter::commitPreparedWav(
-    audio::PreparedAudioFilePtr prepared,
-    audio::AudioFileCommitAction modelCommit) noexcept {
-    auto* candidate = dynamic_cast<PreparedJuceAudioFile*>(prepared.get());
-    if (candidate == nullptr || !modelCommit.isValid() ||
-        !candidate->track.isValid() || candidate->preparedProject == nullptr) {
-        return false;
-    }
-
-    return commitPreparedProject(candidate->preparedProject, modelCommit);
-}
-
 audio::StructuralPlanPreparationResult
 JuceAudioDeviceAdapter::prepareProcessingPlan(
     const audio::ProcessingPlanSpecification& specification) {
@@ -429,6 +382,62 @@ JuceAudioDeviceAdapter::prepareProcessingPlan(
     } catch (...) {
         return {nullptr, "Unexpected error while preparing routing"};
     }
+}
+
+audio::StructuralPlanPreparationResult
+JuceAudioDeviceAdapter::prepareProcessingPlanWithAudio(
+    const audio::ProcessingPlanSpecification& specification,
+    media::SourceId source,
+    audio::PreparedAudioFilePtr preparedAudio) {
+    try {
+        auto* decoded = dynamic_cast<PreparedJuceAudioFile*>(preparedAudio.get());
+        if (decoded == nullptr || !source.isValid() || decoded->audio == nullptr) {
+            return {nullptr, "Invalid prepared audio source"};
+        }
+        auto candidate = std::make_unique<PreparedProject>();
+        if (preparedProject_ != nullptr) {
+            candidate->resources = preparedProject_->resources;
+        }
+        if (std::any_of(candidate->resources.begin(),
+                        candidate->resources.end(),
+                        [source](const auto& resource) {
+                            return resource.id == source;
+                        })) {
+            return {nullptr, "SourceId is already prepared"};
+        }
+        candidate->resources.push_back({source, decoded->audio});
+        std::string error;
+        if (!prepareProjectPlan(*candidate, specification, error)) {
+            return {nullptr, std::move(error)};
+        }
+        return {std::make_unique<PreparedJuceProcessingPlan>(
+                    std::move(candidate)), {}};
+    } catch (const std::bad_alloc&) {
+        return {nullptr, "Not enough memory to prepare imported source"};
+    } catch (...) {
+        return {nullptr, "Unexpected error while preparing imported source"};
+    }
+}
+
+audio::StructuralPlanPreparationResult JuceAudioDeviceAdapter::prepareProjectReplacement(
+    const audio::ProcessingPlanSpecification& specification,
+    std::vector<audio::PreparedSourceAudio> resources) {
+    try {
+        auto candidate = std::make_unique<PreparedProject>();
+        candidate->resources.reserve(resources.size());
+        if (resources.size() != specification.sources.size()) return {nullptr, "Source count mismatch"};
+        for (auto& resource : resources) {
+            auto* decoded = dynamic_cast<PreparedJuceAudioFile*>(resource.audio.get());
+            if (!decoded || !decoded->audio || !resource.id.isValid() ||
+                std::any_of(candidate->resources.begin(), candidate->resources.end(),
+                    [&](const auto& r) { return r.id == resource.id; }))
+                return {nullptr, "Invalid replacement source"};
+            candidate->resources.push_back({resource.id, std::move(decoded->audio)});
+        }
+        std::string error;
+        if (!prepareProjectPlan(*candidate, specification, error)) return {nullptr, std::move(error)};
+        return {std::make_unique<PreparedJuceProcessingPlan>(std::move(candidate)), {}};
+    } catch (...) { return {nullptr, "Cannot prepare isolated project resources"}; }
 }
 
 bool JuceAudioDeviceAdapter::commitPreparedProcessingPlan(
@@ -587,42 +596,46 @@ bool JuceAudioDeviceAdapter::prepareProjectPlan(
                                     : specification.projectSampleRate;
     effectiveSpecification.processingMode =
         processors::ProcessingMode::realtime;
-    std::vector<audio::PreparedTrackView> sources;
-    sources.reserve(candidate.resources.size());
-    for (auto& resource : candidate.resources) {
-        const auto track = std::find_if(
-            effectiveSpecification.tracks.begin(),
-            effectiveSpecification.tracks.end(),
-            [id = resource.id](const auto& candidateTrack) {
-                return candidateTrack.id == id;
+    candidate.resources.erase(
+        std::remove_if(candidate.resources.begin(), candidate.resources.end(),
+                       [&effectiveSpecification](const auto& resource) {
+                           return std::none_of(
+                               effectiveSpecification.sources.begin(),
+                               effectiveSpecification.sources.end(),
+                               [&resource](const auto& source) {
+                                   return source.id == resource.id;
+                               });
+                       }),
+        candidate.resources.end());
+    std::vector<audio::PreparedSourceView> sources;
+    sources.reserve(effectiveSpecification.sources.size());
+    for (const auto& sourceSpecification : effectiveSpecification.sources) {
+        const auto resource = std::find_if(
+            candidate.resources.begin(), candidate.resources.end(),
+            [id = sourceSpecification.id](const auto& candidateResource) {
+                return candidateResource.id == id;
             });
-        if (track == effectiveSpecification.tracks.end()) {
-            errorMessage = "Prepared audio resource has no routing track";
+        if (resource == candidate.resources.end() || resource->audio == nullptr) {
+            errorMessage = "Project source has no prepared PCM resource";
             return false;
         }
-        resource.mix = track->mix;
-        const auto& source = *resource.audio;
-        audio::PreparedTrackView view;
-        view.id = resource.id;
+        const auto& source = *resource->audio;
+        audio::PreparedSourceView view;
+        view.id = sourceSpecification.id;
         view.channelCount = static_cast<std::uint32_t>(
             source.samples.getNumChannels());
         view.frameCount = {static_cast<std::uint64_t>(
             source.samples.getNumSamples())};
-        view.sourceSampleRate = source.sourceSampleRate;
-        view.clipStart = {0};
-        view.clipDuration = timeline::sourceFramesToProjectDuration(
-            view.frameCount, view.sourceSampleRate,
-            effectiveSpecification.projectSampleRate);
-        view.sourceOffset = {0};
-        view.mix = track->mix;
+        view.sampleRate = source.sourceSampleRate;
+        view.layout = sourceSpecification.layout;
         for (std::size_t channel = 0; channel < view.channelCount; ++channel) {
             view.channels[channel] =
                 source.samples.getReadPointer(static_cast<int>(channel));
         }
         sources.push_back(view);
     }
-    auto prepared = audio::prepareProcessingPlan(effectiveSpecification,
-                                                 sources);
+    auto prepared = audio::prepareProcessingPlanFromSources(
+        effectiveSpecification, sources);
     if (!prepared.success()) {
         errorMessage = std::move(prepared.errorMessage);
         return false;

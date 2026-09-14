@@ -9,6 +9,7 @@
 #include <variant>
 #include <vector>
 
+namespace vitadaw::project { class ProjectState; }
 namespace vitadaw::routing {
 
 struct BusId {
@@ -84,6 +85,16 @@ struct SendRoute {
 
 class RoutingState {
 public:
+    struct DocumentData {
+        std::vector<AudioBus> buses;
+        std::vector<TrackRoute> trackRoutes;
+        std::vector<SendRoute> sends;
+        BusId nextBusId{1};
+        SendId nextSendId{1};
+    };
+    [[nodiscard]] DocumentData documentData() const {
+        return {buses_, trackRoutes_, sends_, nextBusId_, nextSendId_};
+    }
     [[nodiscard]] const std::vector<AudioBus>& buses() const noexcept;
     [[nodiscard]] const std::vector<TrackRoute>& trackRoutes() const noexcept;
     [[nodiscard]] const std::vector<SendRoute>& sends() const noexcept;
@@ -111,6 +122,7 @@ public:
                                   mixer::SendMixState mix) noexcept;
 
 private:
+    friend class vitadaw::project::ProjectState;
     std::vector<AudioBus> buses_;
     std::vector<TrackRoute> trackRoutes_;
     std::vector<SendRoute> sends_;

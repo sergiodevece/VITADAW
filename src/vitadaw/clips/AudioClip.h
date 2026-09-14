@@ -1,22 +1,29 @@
 #pragma once
 
-#include "vitadaw/timeline/Timeline.h"
+#include "vitadaw/media/AudioSource.h"
+#include "vitadaw/timeline/Time.h"
 
+#include <compare>
 #include <cstdint>
-#include <filesystem>
 
 namespace vitadaw::clips {
 
-using ClipId = std::uint64_t;
+struct ClipId {
+    std::uint64_t value{};
+
+    [[nodiscard]] constexpr bool isValid() const noexcept { return value != 0; }
+    auto operator<=>(const ClipId&) const = default;
+};
 
 // Editable project data. This object must never be read directly by the RT thread.
 struct AudioClip {
-    ClipId id{};
-    std::filesystem::path sourceFile;
-    timeline::FrameRange timelineRange;
-    timeline::SourceFrameCount sourceOffset;
-    timeline::SourceFrameCount sourceFrameCount;
-    timeline::SampleRate sourceSampleRate;
+    ClipId id;
+    media::SourceId source;
+    timeline::ProjectFramePosition projectStart;
+    timeline::ProjectFrameDuration duration;
+    timeline::SourceFramePosition sourceOffset;
+
+    bool operator==(const AudioClip&) const = default;
 };
 
 } // namespace vitadaw::clips

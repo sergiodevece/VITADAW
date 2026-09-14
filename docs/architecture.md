@@ -34,9 +34,9 @@ al motor.
 - `processors`: configuración editable, contrato DSP portable, factory e
   implementación interna de procesadores.
 - `transport`: estado lógico de reproducción y posición.
-- `tracks`: colección variable de pistas, cada una con identidad estable y un
-  único clip opcional en este incremento.
-- `clips`: referencia a un archivo y región colocada en el timeline.
+- `media`: catálogo portable de fuentes y referencias de medio; nunca posee PCM.
+- `tracks`: pistas mono/estéreo de layout estable con clips ordenados.
+- `clips`: colocaciones no destructivas por `SourceId` en el timeline.
 - `timeline`: unidades temporales fuertes y conversiones entre archivo,
   proyecto, dispositivo y segundos.
 - `ui`: frontera de UI; se implementará con JUCE sin acceder a `audio`.
@@ -85,14 +85,14 @@ su lista de callbacks con un mutex y ajusta un buffer temporal en la ruta de
 callback. VitaDAW no añade sus propios bloqueos o reservas dentro de
 `processBlock`.
 
-## Reproducción mínima 0.0.4 — First Sound
+## Reproducción mínima 0.0.4 — First Sound (histórico)
 
 `LoadAudioFile` recorre `ICommandDispatcher` y `DawApplication` antes de llamar
 al puerto neutral `IAudioEngineControl::prepareWav`. El adaptador valida la
 extensión y usa directamente `juce::WavAudioFormat`; no registra MP3, AIFF,
 FLAC ni otros formatos. Decodifica el archivo completo a un `AudioBuffer<float>`
-fuera del callback. Solo después se invoca `commitPreparedWav` con un recurso
-opaco y una acción portable de commit ya preparada.
+fuera del callback. En 0.4.0 ese recurso se publica junto al plan completo por
+`SourceId`; la antigua operación separada de commit quedó eliminada.
 
 Play y Stop viajan por una cola SPSC fija de ocho posiciones. El callback vacía
 primero la salida, consume esos comandos y lee únicamente el buffer preparado y
@@ -199,7 +199,11 @@ hilo de aplicación converge así a `Stopped` en el final. Esta política distin
 el final natural de `Stop`, que conserva su semántica de `Stopped` en cero. Un
 Play posterior al final reinicia el reloj en cero.
 
-## Motor N-track 0.1.0
+## Motor N-track 0.1.0 (histórico)
+
+Esta sección documenta el hito original. Su `optional<AudioClip>` y ownership
+por `TrackId` quedaron sustituidos por la arquitectura Source/Clip/Track de
+0.4.0 descrita más adelante.
 
 `ProjectState` conserva un `vector<AudioTrack>` editable solo desde aplicación.
 Cada pista recibe un `TrackId` monotónico de 64 bits que no depende de su índice;
@@ -857,7 +861,344 @@ de bloque y eventos produce el mismo resultado.
 - La cadena completa se recrea en cada cambio estructural; el future state
   externo podrá reconstruir únicamente los valores aceptados.
 
-## Evolución hasta 0.3.0
+## Source / Clip / Track Foundation 0.4.0
+
+El modelo editable separa tres responsabilidades:
+
+```text
+AudioSource (medio original y metadata)
+    <- SourceId - AudioClip (projectStart, duration, sourceOffset)
+                      <- colección ordenada - AudioTrack (layout estable)
+```
+
+`SourceId` y `ClipId` son tipos fuertes de 64 bits, con cero inválido y
+contadores monotónicos que forman parte del proyecto. La ruta nunca es la
+identidad: cada importación explícita crea otra fuente. `MediaReference` guarda
+la ruta original y reserva una ruta relativa preferida para un futuro proyecto
+portable, media folder, missing media y relink. `ProjectState` contiene solo
+metadata serializable; no contiene PCM, índices densos, smoothers ni objetos
+DSP.
+
+Un `AudioClip` conserva exclusivamente `SourceId`, inicio entero en frames de
+proyecto, duración precisa `double` en frames de proyecto y offset preciso en
+frames fuente. Los finales se derivan. La preparación valida finitud, signo,
+overflow, límites fuente y compatibilidad del layout fijo mono/estéreo de la
+pista. El final preciso gobierna el renderer; el transporte publica
+`ceil(max(clipStart + duration))`, por lo que nunca se pierde una fracción final
+ni suena contenido fuera del clip.
+
+El adaptador JUCE decodifica WAV una vez y conserva un owner PCM inmutable por
+`SourceId`. El plan contiene un array denso de `PreparedSourceView`; cada
+`PreparedClipView` guarda directamente su índice fuente, límites precisos,
+offset y ratio `sourceRate/projectRate`. Diez clips de una fuente comparten un
+único buffer. Quitar clips no elimina la fuente; quitar una fuente referenciada
+se rechaza. No existe cleanup automático.
+
+Por pista, los clips preparados mantienen orden `(projectStart, ClipId)` y un
+array paralelo `prefixMaximumEnd`. Para cada subbloque RT se hacen búsquedas
+binarias de los posibles intersectores y solo se recorren candidatos vivos. El
+render recalcula cada posición fuente desde el reloj maestro global; no existe
+cursor ni reloj por clip. El scratch de entrada se limpia, suma todos los clips
+activos en orden canónico y después atraviesa exactamente una vez la cadena de
+inserts, mixer, sends, meter y routing de la pista.
+
+Import, alta, eliminación y movimiento mínimo de clips son cambios
+estructurales y se rechazan durante Play. La aplicación construye un
+`ProjectState` candidato, valida/prepara o reutiliza las fuentes, compila clips,
+índice y plan, retira el callback y publica modelo/owners/plan en un único commit
+`noexcept`. Un fallo deja intacto el bundle activo. El bundle retirado se
+destruye después de la quiescencia, nunca desde el callback.
+
+El modelo queda preparado para persistencia con versión de esquema futura y
+para Undo/Redo por IDs y valores: no se persistirán PCM, ratios, scratch,
+generaciones ni posiciones RT. Split, trim y duplicate futuros podrán conservar
+`SourceId` y ajustar únicamente nuevos valores de clip, sin mutar la fuente.
+Gain/fades de clip pertenecerán entre render de fuente y suma de pista, pero no
+se incluyen en 0.4.0.
+
+Límites de preparación: 256 pistas, 2.048 fuentes, 32.768 clips totales y 4.096
+clips por pista. El presupuesto PCM JUCE de 512 MiB permanece separado del
+presupuesto portable de plan/runtime de 32 MiB. Continúan pendientes timeline
+visual, edición avanzada, recording, stretch, MIDI y hosting de
+plugins externos.
+
+## Timeline Editing Operations 0.4.1
+
+Las operaciones `MoveClip`, `DuplicateClip`, `SplitClip`, `TrimClipLeft`,
+`TrimClipRight` y `DeleteClip` entran exclusivamente como comandos portables.
+`ClipId` es único en el proyecto, por lo que la API pública no expone índices
+de almacenamiento ni exige `TrackId` para editar. Cada operación produce un
+`ClipEditResult` explícito (`success`, `clipNotFound`, `invalidPosition`,
+`zeroLengthClip`, `sourceBoundsExceeded` o `capacityExceeded`); las excepciones
+quedan reservadas a fallos extraordinarios como memoria agotada.
+
+Move conserva todo salvo `projectStart`. Duplicate crea un `ClipId` monotónico
+y conserva pista, fuente, offset y duración. Split conserva el ID izquierdo y
+crea el derecho; el punto debe ser estrictamente interior y el offset derecho
+se calcula como `oldOffset + deltaProject * sourceRate / projectRate`, sin
+redondear a source frames enteros. Trim Left avanza conjuntamente inicio y
+offset y reduce duración; repetir el mismo inicio es un no-op válido. Trim Right
+solo reduce duración y repetir el mismo final también es un no-op. Delete no
+retira la fuente ni su PCM.
+
+Tras cambiar un inicio se restaura el orden `(projectStart, ClipId)`. Overlaps
+continúan sumándose y gaps producen silencio. El final lógico sigue derivándose
+como el máximo final preciso de los clips. `findClip`, `clipsForTrack`,
+`clipsIntersectingRange` y `projectContentDuration` forman la consulta portable
+mínima para una futura UI.
+
+Cada comando copia el modelo activo, edita el candidato, prepara de nuevo clips
+e índice temporal reutilizando la caché PCM por `SourceId`, espera quiescencia y
+publica modelo/owners/plan con commit `noexcept`. Un rechazo o fallo de
+preparación no consume estado activo. No hay edición durante Play.
+
+Para un Undo futuro deben capturarse valores, no punteros: Move necesita el
+inicio anterior; Trim Left, inicio/offset/duración; Trim Right, duración;
+Split, el clip original y el nuevo ID derecho; Duplicate, el ID creado; Delete,
+el clip completo y su pista. Los contadores monotónicos nunca retrocederán.
+0.4.1 no implementa el stack de Undo.
+
+La ventana contiene controles de prueba para IDs iniciales y posiciones fijas.
+No representan una interfaz de timeline ni forman parte del dominio.
+
+## Undo / Redo Foundation 0.4.2
+
+`Command` sigue representando intención. `UndoableOperation` representa el
+cambio reversible confirmado; el dispatcher no registra historial. Undo y Redo
+son comandos y `DawApplication` coordina el modelo candidato, la preparación del
+plan y el historial. `UndoManager` es portable, pertenece a la aplicación y solo
+se consulta/muta en su hilo serializado. No hay lógica de historial en RT ni
+dependencia de JUCE. Una futura `ProjectSession` podrá asumir este ownership.
+
+El payload es una variante cerrada: Move/TrimLeft/TrimRight guardan TrackId y
+AudioClip before/after; Duplicate guarda el clip creado; Delete el eliminado;
+Split guarda original, izquierdo y derecho como una entrada atómica. Guardar
+el AudioClip completo también para Move conserva todos sus invariantes por un
+coste pequeño. Tipo y label key `history.*` se derivan de la variante. Todos los
+payloads son valores fijos: no contienen PCM, pointers, índices densos, planes,
+processors runtime, transporte, smoothers, meters ni scratch.
+
+`ProjectState` ofrece restauración/reemplazo privados, accesibles únicamente
+desde `UndoableOperation`. Restaurar exige ID válido, ausente y menor que el
+high-water mark, track/source existentes, layout compatible y límites válidos.
+Reemplazar exige la identidad existente en la pista. Undo/Redo comprueba primero
+el estado esperado de las entidades afectadas. Una aplicación fallida puede
+haber alterado su candidato desechable, nunca el estado activo. Los contadores
+no retroceden: Undo de Duplicate/Split consume definitivamente el ID y Redo lo
+restaura; abandonar Redo no permite reciclarlo.
+
+El almacenamiento es `vector<HistoryEntry> + cursor`: `[0,cursor)` aplicado,
+`[cursor,size)` Redo. Antes de preparar el plan se construye un `PendingAppend`
+con las entradas aplicadas retenidas y la nueva operación. Allí se calcula la
+expulsión y se reserva/copía la memoria; la rama Redo activa sigue intacta.
+El commit bajo quiescencia intercambia modelo y vector mediante `swap noexcept`
+y fija duración, cursor, token y revision. El vector sustituido se destruye al
+salir del comando, en el hilo de aplicación. Para Undo/Redo no se copia el
+historial: se mantiene cursor/entrada, se aplica al candidato, se prepara un
+plan nuevo y solo dentro del commit exitoso se mueve el cursor.
+
+Cada append cuesta O(historial retenido), acotado a 512 entradas pequeñas.
+Esto simplifica la garantía fuerte sin guardar snapshots completos de proyecto.
+Durante staging coexisten temporalmente los dos vectores. El presupuesto del
+historial confirmado es 8 MiB, con estimate `sizeof(HistoryEntry)` por entrada y
+capacidad real del vector para informar memoria. El límite de 512 se alcanza
+antes que el de bytes con los payloads actuales. Las pruebas reducen el límite
+de bytes para ejercitar esa misma rama sin introducir payloads artificiales de
+varios MiB. Se expulsan solo entradas aplicadas antiguas; una entrada que no cabe
+se rechaza antes de tocar proyecto o historial.
+
+Una nueva edición solo descarta Redo cuando hace commit. Cualquier mutación
+persistente no soportada por Undo actúa como barrera al hacer commit, incluyendo
+el comando legado RemoveClip; DeleteClip es la operación undoable. Import,
+AddClip, RemoveSource, mixer, routing, sends e inserts son barreras. Para los
+parámetros ligeros se preparan los mensajes antes de publicar a la cola, y la
+barrera se confirma tras actualizar el modelo sin allocations posteriores.
+Fallos y Play/Stop no limpian historial. Los no-ops de Move/Trim no generan
+entrada, token ni invalidación de Redo.
+
+Los errores incluyen `nothingToUndo`, `nothingToRedo`,
+`transportMustBeStopped`, `historyInvalid`, `historyCapacityExceeded` y
+`preparationFailed`; `validationFailed` queda definido en el contrato común.
+Las validaciones de edición conservan sus errores precisos existentes. Una
+divergencia de payload/entidades durante recorrido produce `historyInvalid`;
+un fallo preparando o publicando el plan deja operación y cursor disponibles.
+Las excepciones de memoria se capturan fuera de RT. No se salta una operación
+fallida ni se detiene automáticamente Play para permitir Undo.
+
+Cada commit persistente nuevo/barrera recibe un StateToken nuevo. Undo restaura
+beforeStateToken y Redo afterStateToken. `revision` aumenta en todos esos
+commits. Un cliente futuro podrá conservar `savedStateToken` y comparar tokens
+para dirty state; comparar solo revision sería incorrecto. Tokens/revision no
+se publican hacia RT y su agotamiento se rechaza sin wrap-around. `clearHistory`
+solo elimina entradas, sin cambiar la identidad del documento. La historia no
+se guarda en 0.4.2; 0.4.3 añade la persistencia descrita debajo. No hay gestures/coalescing, composites genéricos,
+Undo de parámetros/routing/processors ni Undo durante Play. En el futuro,
+composites y snapshots de submodelos reutilizarán el mismo límite de commit.
+
+## Project Persistence 0.4.3
+
+### Documento y sesión
+
+`ProjectSession` contiene ProjectState, UndoManager, projectFilePath y
+savedStateToken. UndoManager sigue siendo la única autoridad de token/revision;
+`dirty = currentStateToken != savedStateToken`. No posee dispositivo, planes ni
+DSP. DawApplication coordina SaveProject, SaveProjectAs(path) y
+LoadProject(path, discardUnsaved). La UI proporciona paths portables, muestra
+errores y solicita consentimiento de descarte; no accede a audio ni JSON.
+
+`.vitadaw` es JSON UTF-8, `format=VitaDAWProject`, `schemaVersion=1` y
+writerAppVersion opcional. ProjectDocument contiene un DTO explícito; el codec
+enumera campos, no serializa automáticamente structs. Incluye settings, todos
+los IDs/counters, fuentes, pistas/clips/layout/mix/inserts, routing editable,
+buses, sends y master. Excluye PCM, índices densos, orden topológico, scratch,
+smoothers/meters/queues, historial, dispositivo, posición de transporte y UI.
+
+IDs y nextIds uint64 son strings decimales canónicos, sin signo ni ceros a la
+izquierda. Cero no es ID válido; nextId debe superar todos los IDs existentes.
+No se genera ningún ID durante Load ni se reconstruye nextId con max+1.
+ProjectState::fromDocumentData valida el conjunto completo antes de adoptar
+privadamente los valores. RoutingState no expone mutación privada al parser.
+Se validan referencias, bounds/layouts, parámetros y DAG incluyendo sends.
+
+Los enums son strings estables; floats/doubles finitos conservan round-trip.
+Los keys se ordenan lexicográficamente; fuentes/rutas/sends por ID; clips por
+(projectStart, ClipId). Orden de pistas, buses y cadenas se conserva por ser
+semántico; parámetros se ordenan por ParameterId. Dump usa dos espacios,
+newline final y conversión independiente de locale, sin timestamps.
+El mismo estado/destino/versión produce bytes idénticos.
+
+El registro de migraciones sobre DOM está vacío: v1 es el único esquema. No se
+inventan migraciones, no se abre parcialmente un esquema futuro y se rechazan
+campos desconocidos. `internal.gain` guarda parámetros por ID, bypass y estado
+serializado vacío. Un tipo desconocido devuelve processorUnavailable.
+
+### Medios y aislamiento
+
+MediaReference guarda kind localFile, relativePath opcional, absoluteFallback
+opcional y fingerprint SHA-256 completo/tamaño decimal. Al menos una ruta es
+obligatoria. Las rutas no expanden variables, comandos, home ni URLs. Se resuelven
+contra el directorio del documento, nunca contra cwd. No equivalen a identidad.
+
+JUCE decodifica un MemoryInputStream sobre los mismos bytes inmutables que se
+hashean con CommonCrypto, fuera de RT. La lectura es acotada y rechaza crecimiento,
+truncado o cambios de metadata durante lectura. En Load el fingerprint esperado
+se comprueba antes de decodificar. Tras decode se verifica de nuevo mediante
+lectura/hash por bloques, sin retener otra copia del archivo. Si no coincide,
+el candidato falla. Esta segunda pasada protege frente a sustitución durante la
+preparación. Es trabajo por Source, no por Clip. Save reutiliza la identidad ya
+asociada al PCM y no vuelve a hashear el archivo que podría haber cambiado.
+
+Load prueba primero la ruta relativa y luego el fallback, ambos verificados.
+Si ninguna sirve, devuelve missingMedia/mediaChanged u otro fallo explícito de
+preparación/I/O. No hay proyecto parcialmente offline. El path resuelto se guarda
+en la referencia de sesión/modelo; Save As proyecta rutas desde ese medio hacia
+el nuevo destino, mantiene fingerprint e IDs y no cambia ProjectSettings.name.
+
+`prepareProjectReplacement` está separado de prepareProcessingPlanWithAudio:
+parte de una colección de recursos vacía, completamente independiente del
+proyecto abierto. Solo después crea el plan. Un SourceId tiene alcance de
+documento; coincidencias A/B nunca autorizan reutilizar PCM. Las ediciones y Undo
+dentro del mismo proyecto siguen compartiendo sus fuentes existentes.
+
+### Save, Load y commit
+
+Save requiere Stopped y destino; captura token/modelo en el único hilo de
+aplicación, valida, proyecta rutas, serializa y limita bytes. La ruta futura queda
+preparada antes de I/O. NativeProjectFileIO crea temporal exclusivo con mkstemp
+en el mismo directorio, write completo con EINTR, fsync + F_FULLFSYNC, rename y
+fsync del directorio. Solo después intercambia path y savedToken sin allocations.
+Antes del rename, cualquier fallo conserva archivo/sesión. Después del rename,
+un fallo de confirmación devuelve durabilityUncertain; bytes nuevos pueden estar
+visibles, no se afirma rollback ni se marca clean ni se intenta otro replace.
+El temporal fallido se elimina; no hay .bak ni backups visibles.
+
+Load requiere Stopped y autorización explícita si dirty. Hace bounded read, SAX,
+DOM/migración, validación, factory exacta, resolución/hash/decode de todas las
+fuentes, plan aislado y staging de metadata. El commit existente retira callback
+y espera quiescencia, intercambia recursos/plan, adopta modelo/path/historial/token
+con función noexcept y reconfigura RT. Destruye el estado sustituido fuera de RT.
+Un fallo anterior conserva todo A, incluidos PCM, plan, historial y tokens.
+Si falla reconectar después del commit, B permanece cargado y el dispositivo
+entra en error: no se describe como rollback del Load.
+
+ProjectSession::adopt ejecuta una barrera específica de documento: historial
+vacío, token nuevo, revision monotónica en esta sesión, savedToken=current y
+dirty=false. Transporte Stopped/posición cero. Save no modifica historial:
+Move→Save→Undo queda dirty; Load→Move→Undo vuelve a clean. Los cambios no
+undoables continúan siendo barreras. Ninguna de estas autoridades se persiste.
+
+### Límites y errores
+
+El backend de archivos y fingerprint validado oficialmente es macOS. El codec,
+DTO y comandos son portables; no se declara atomicidad/durabilidad equivalente
+en Windows/Linux. IProjectFileIO permite dobles/fallos por fases. El SHA-256 no
+es una implementación criptográfica propia.
+
+Archivo 16 MiB (stat y lectura real), depth 32, path/name 4 KiB UTF-8, key 128 B.
+SAX rechaza claves duplicadas, tamaños, nesting y cardinalidades antes del DOM;
+además limita nodos a 500000, strings de valores agregadas a 8 MiB y keys por
+objeto a 64. Contenedores JSON tienen allocator de 32 MiB; se reserva el resto
+del sobre de 128 MiB para texto de entrada/salida, strings, DTOs y limpieza.
+Estas cotas conservadoras pueden rechazar antes del máximo nominal de entidades.
+El owner del DOM vacía recursivamente hijos con profundidad acotada antes de
+destruirlo: evita la allocation del stack dinámico del destructor general JSON.
+
+Modelo: 256 tracks, 2048 sources, 32768 clips/4096 por track, 64 buses,
+1024 sends/64 por origen, 512 processors/16 por cadena. El presupuesto PCM
+continúa en 512 MiB y durante Load cuenta PCM activo + PCM candidato + bytes WAV
+retenidos; scratch/DSP mantiene su presupuesto preparado independiente.
+Todo parsing/hash/decode/I/O ocurre fuera de RT; callback/clock/mixer no cambian.
+
+PersistenceResult es code + phase + contexto opcional (path, campo/pointer,
+entidad/ID, error de sistema), sin mensajes UX traducidos. La UI muestra códigos
+estables; excepciones recuperables de preparación/capacidad se convierten en
+resultados. El guardado solo se confirma después de la confirmación del backend.
+
+## Timeline UI Foundation 0.5.0
+
+La capa portable `ui/timeline` construye un `TimelineSnapshot` por valor desde
+el estado confirmado de aplicación. Incluye sample rate lógico, duración de
+contenido, posición/estado del transporte, revisión, pistas, clips, IDs y labels
+derivados; excluye PCM, planes RT y referencias mutables. `TimelineComponent`
+depende del dispatcher y de consultas const de `DawApplication`, nunca muta
+`ProjectState` ni controla JUCE audio.
+
+La única conversión geométrica es:
+
+```
+seconds = projectFrame / projectSampleRate
+x = (seconds - visibleStartSeconds) * pixelsPerSecond
+```
+
+`CoordinateTransform` limita el zoom a 20–600 px/s, limita scroll a tiempo no
+negativo y convierte de vuelta a project frames con redondeo al frame más
+cercano. El zoom conserva el instante bajo cursor; el scroll puede extender el
+viewport diez segundos más allá del contenido, con un mínimo visual de treinta.
+
+`TimelineInteraction` contiene únicamente selección por `ClipId` y un preview
+de Move/Trim. Captura el clip confirmado al mouseDown, calcula el preview durante
+mouseDrag y produce cero o un `Command` en mouseUp. No toca el modelo y no genera
+historial intermedio. Tras éxito o fallo se descarta el preview y se consulta de
+nuevo el snapshot; si desaparece el ID seleccionado, la selección se limpia.
+Durante Play los controles y gestos estructurales están deshabilitados.
+
+Los clips se pintan directamente, sin un árbol de Components por clip ni acceso
+a filesystem durante paint. El hit-test central da prioridad a handles y luego
+al cuerpo; el pintado descarta rectángulos fuera del viewport. La regla adapta
+sus intervalos al zoom. El playhead procede del `TransportState` sincronizado a
+30 Hz por la aplicación, nunca del callback ni de otro reloj.
+
+Duplicate sitúa la copia en el final exclusivo del original. Split requiere que
+el playhead esté estrictamente dentro. Delete no borra Source. Los shortcuts
+provisionales son Cmd+Z, Cmd+Shift+Z, Cmd+D, Delete/Backspace y S. No son aún un
+sistema configurable. Load reconstruye el componente, limpia selección y vuelve
+el viewport al origen; Save/Save As no alteran geometría.
+
+No hay Seek formal, waveform, snapping musical, multiselección, context menu,
+fades, clip gain, tempo grid ni edición durante Play. El culling sigue siendo
+lineal sobre clips ordenados, suficiente para el objetivo probado de 1000 clips.
+
+## Evolución hasta 0.5.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -898,6 +1239,21 @@ de bloque y eventos produce el mismo resultado.
 18. **Completado en 0.3.0:** introducir contrato DSP portable, cadenas de
     inserts Track/Bus/Master, ejecución por subbloques, parámetros y bypass
     generation-safe, y metadata completa de latencia sin implementar PDC.
+19. **Completado en 0.4.0:** separar fuentes, clips y pistas, compartir PCM por
+    `SourceId`, compilar índices temporales y sumar solapes antes de inserts.
+20. **Completado en 0.4.1:** editar clips de forma no destructiva mediante
+    Move/Duplicate/Split/Trim/Delete, consultas por ID y rebuild transaccional
+    sin decodificar de nuevo las fuentes.
+
+21. **Completado en 0.4.2:** Undo/Redo transaccional de las seis operaciones de
+    clips, historial acotado, IDs exactos, barreras y tokens lógicos de estado.
+
+22. **Completado en 0.4.3:** persistencia versionada, medios verificados,
+    guardado atómico, sesión/dirty y adopción transaccional de proyecto aislado.
+
+23. **Completado en 0.5.0:** timeline JUCE sobre un snapshot portable, geometría
+    derivada del reloj lógico, edición por gestos/comandos, playhead, zoom/scroll
+    y refresh por revisión sin introducir estado musical duplicado.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

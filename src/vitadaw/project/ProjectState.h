@@ -1,33 +1,84 @@
 #pragma once
 
 #include "vitadaw/tracks/AudioTrack.h"
+#include "vitadaw/media/AudioSource.h"
 #include "vitadaw/routing/RoutingState.h"
 #include "vitadaw/processors/InsertTarget.h"
 
 #include <cstddef>
 #include <filesystem>
-#include <optional>
+#include <span>
 #include <string>
 #include <vector>
+#include <memory>
 
+namespace vitadaw::history { class UndoableOperation; }
 namespace vitadaw::project {
 
 // Mutable only from the application thread.
 class ProjectState {
 public:
-    struct PreparedAudioClipUpdate {
-        tracks::TrackId track;
-        std::size_t trackIndex{};
-        std::optional<clips::AudioClip> replacement;
-        clips::ClipId nextClipId{};
+    static constexpr std::size_t maximumTracks = 256;
+    static constexpr std::size_t maximumSources = 2048;
+    static constexpr std::size_t maximumClips = 32768;
+    static constexpr std::size_t maximumClipsPerTrack = 4096;
+
+    struct ProjectSettings {
+        std::string name{"Untitled"};
+        timeline::SampleRate sampleRate;
+    };
+    struct DocumentData {
+        ProjectSettings settings;
+        std::vector<tracks::AudioTrack> tracks;
+        std::vector<media::AudioSource> sources;
+        routing::RoutingState::DocumentData routing;
+        tracks::TrackId nextTrackId{1};
+        media::SourceId nextSourceId{1};
+        clips::ClipId nextClipId{1};
+        processors::ProcessorInstanceId nextProcessorId{1};
+        mixer::MasterMixState masterMix;
+        processors::InsertChain masterInserts;
+    };
+    [[nodiscard]] DocumentData documentData() const;
+    // Validates a complete detached model. IDs/counters are adopted, never generated.
+    [[nodiscard]] static std::unique_ptr<ProjectState> fromDocumentData(DocumentData data);
+
+    struct ImportedAudio {
+        media::SourceId source;
+        clips::ClipId clip;
     };
 
-    explicit ProjectState(timeline::SampleRate projectSampleRate);
+    enum class ClipEditStatus {
+        success,
+        clipNotFound,
+        invalidPosition,
+        zeroLengthClip,
+        sourceBoundsExceeded,
+        capacityExceeded,
+    };
 
+    struct ClipEditResult {
+        ClipEditStatus status{ClipEditStatus::success};
+        clips::ClipId clip{};
+        clips::ClipId createdClip{};
+
+        [[nodiscard]] constexpr bool succeeded() const noexcept {
+            return status == ClipEditStatus::success;
+        }
+        constexpr explicit operator bool() const noexcept { return succeeded(); }
+    };
+
+    explicit ProjectState(timeline::SampleRate projectSampleRate,
+                          std::string name = "Untitled");
+
+    [[nodiscard]] const ProjectSettings& settings() const noexcept;
     [[nodiscard]] timeline::SampleRate sampleRate() const noexcept;
     [[nodiscard]] const std::vector<tracks::AudioTrack>& tracks() const noexcept;
+    [[nodiscard]] const std::vector<media::AudioSource>& sources() const noexcept;
     [[nodiscard]] const routing::RoutingState& routing() const noexcept;
-    [[nodiscard]] tracks::TrackId addAudioTrack(std::string name);
+    [[nodiscard]] tracks::TrackId addAudioTrack(
+        std::string name,
+        media::AudioChannelLayout layout = media::AudioChannelLayout::mono);
     [[nodiscard]] routing::BusId addBus(std::string name);
     [[nodiscard]] bool setTrackOutputDestination(
         tracks::TrackId track,
@@ -52,6 +103,15 @@ public:
         routing::SendId send) const noexcept;
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
+    [[nodiscard]] const media::AudioSource* findSource(
+        media::SourceId source) const noexcept;
+    [[nodiscard]] const clips::AudioClip* findClip(
+        clips::ClipId clip) const noexcept;
+    [[nodiscard]] std::span<const clips::AudioClip> clipsForTrack(
+        tracks::TrackId track) const noexcept;
+    [[nodiscard]] std::vector<clips::ClipId> clipsIntersectingRange(
+        tracks::TrackId track, timeline::ProjectFramePosition rangeStart,
+        timeline::ProjectFramePosition rangeEnd) const;
     [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;
     [[nodiscard]] const processors::InsertChain& masterInserts() const noexcept;
     [[nodiscard]] const processors::ProcessorState* findProcessor(
@@ -72,24 +132,66 @@ public:
                                    mixer::TrackMixState state) noexcept;
     [[nodiscard]] bool setMasterMix(mixer::MasterMixState state) noexcept;
     [[nodiscard]] timeline::ProjectFrameCount duration() const noexcept;
-    [[nodiscard]] PreparedAudioClipUpdate prepareAudioClipUpdate(
-        tracks::TrackId track,
-        const std::filesystem::path& sourceFile,
+    [[nodiscard]] ImportedAudio importAudioToTrack(
+        tracks::TrackId track, media::MediaReference mediaReference,
         timeline::SourceFrameCount sourceFrameCount,
-        timeline::SampleRate sourceSampleRate) const;
-    void commitAudioClipUpdate(PreparedAudioClipUpdate& update) noexcept;
+        timeline::SampleRate sourceSampleRate,
+        media::AudioChannelLayout sourceLayout,
+        timeline::ProjectFramePosition projectStart = {0});
+    [[nodiscard]] clips::ClipId addClip(
+        tracks::TrackId track, media::SourceId source,
+        timeline::ProjectFramePosition projectStart,
+        timeline::ProjectFrameDuration duration,
+        timeline::SourceFramePosition sourceOffset = {0.0});
+    [[nodiscard]] ClipEditResult removeClip(clips::ClipId clip) noexcept;
+    [[nodiscard]] ClipEditResult deleteClip(clips::ClipId clip) noexcept;
+    [[nodiscard]] ClipEditResult moveClip(
+        clips::ClipId clip,
+        timeline::ProjectFramePosition projectStart) noexcept;
+    [[nodiscard]] ClipEditResult duplicateClip(
+        clips::ClipId clip,
+        timeline::ProjectFramePosition projectStart);
+    [[nodiscard]] ClipEditResult splitClip(
+        clips::ClipId clip,
+        timeline::ProjectFramePosition splitPosition);
+    [[nodiscard]] ClipEditResult trimClipLeft(
+        clips::ClipId clip,
+        timeline::ProjectFramePosition projectStart) noexcept;
+    [[nodiscard]] ClipEditResult trimClipRight(
+        clips::ClipId clip,
+        timeline::ProjectFramePosition projectEnd) noexcept;
+    [[nodiscard]] bool removeSource(media::SourceId source) noexcept;
+    [[nodiscard]] timeline::ProjectFrameCount projectContentDuration() const noexcept;
     void swap(ProjectState& other) noexcept;
 
 private:
+    friend class history::UndoableOperation;
+    [[nodiscard]] bool restoreHistoryClip(tracks::TrackId track,
+                                          const clips::AudioClip& clip);
+    [[nodiscard]] bool replaceHistoryClip(tracks::TrackId track,
+                                          const clips::AudioClip& clip) noexcept;
     [[nodiscard]] processors::InsertChain* findProcessorChain(
         processors::ProcessorInstanceId processor) noexcept;
     [[nodiscard]] const processors::InsertChain* findProcessorChain(
         processors::ProcessorInstanceId processor) const noexcept;
 
-    timeline::SampleRate projectSampleRate_;
+    [[nodiscard]] tracks::AudioTrack* findTrackMutable(
+        tracks::TrackId track) noexcept;
+    [[nodiscard]] tracks::AudioTrack* findTrackContainingClip(
+        clips::ClipId clip) noexcept;
+    [[nodiscard]] bool validateClip(
+        const tracks::AudioTrack& track, const media::AudioSource& source,
+        timeline::ProjectFramePosition projectStart,
+        timeline::ProjectFrameDuration duration,
+        timeline::SourceFramePosition sourceOffset) const noexcept;
+    void sortTrackClips(tracks::AudioTrack& track) noexcept;
+
+    ProjectSettings settings_;
     std::vector<tracks::AudioTrack> tracks_;
+    std::vector<media::AudioSource> sources_;
     routing::RoutingState routing_;
     tracks::TrackId nextTrackId_{1};
+    media::SourceId nextSourceId_{1};
     clips::ClipId nextClipId_{1};
     mixer::MasterMixState masterMix_;
     processors::InsertChain masterInserts_;

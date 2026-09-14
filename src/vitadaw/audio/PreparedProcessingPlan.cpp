@@ -146,9 +146,10 @@ struct PendingProcessorRuntime {
 
 } // namespace
 
-ProcessingPlanPreparationResult prepareProcessingPlan(
+static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
     const ProcessingPlanSpecification& specification,
-    std::span<const PreparedTrackView> sources,
+    std::span<const PreparedTrackView> legacySources,
+    std::span<const PreparedSourceView> preparedSources,
     std::size_t blockCapacity,
     std::size_t memoryBudgetBytes,
     const processors::IAudioProcessorFactory* processorFactory) noexcept {
@@ -175,6 +176,19 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         }
         if (specification.sends.size() > maximumPreparedSends) {
             return {nullptr, "Prepared send capacity exceeded"};
+        }
+        if (specification.sources.size() > maximumPreparedSources) {
+            return {nullptr, "Prepared source capacity exceeded"};
+        }
+        std::size_t totalClipCount{};
+        for (const auto& track : specification.tracks) {
+            if (track.clips.size() > maximumPreparedClipsPerTrack ||
+                !checkedAdd(totalClipCount, track.clips.size(), totalClipCount)) {
+                return {nullptr, "Prepared per-track clip capacity exceeded"};
+            }
+        }
+        if (totalClipCount > maximumPreparedClips) {
+            return {nullptr, "Prepared clip capacity exceeded"};
         }
 
         std::size_t processorCount = specification.masterInserts.processors.size();
@@ -243,6 +257,10 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                               sizeof(PreparedSendIndex)) ||
             !addPreparedArray(specification.sends.size(),
                               sizeof(SendMixSmoother)) ||
+            !addPreparedArray(specification.sources.size(),
+                              sizeof(PreparedSourceView)) ||
+            !addPreparedArray(totalClipCount, sizeof(PreparedClipView)) ||
+            !addPreparedArray(totalClipCount, sizeof(double)) ||
             !addPreparedArray(processorCount,
                               sizeof(PreparedProcessorDescriptor)) ||
             !addPreparedArray(processorCount,
@@ -283,14 +301,35 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
         }
         std::unordered_set<std::uint64_t> sourceIds;
-        sourceIds.reserve(sources.size());
-        for (const auto& source : sources) {
+        sourceIds.reserve(legacySources.size());
+        for (const auto& source : legacySources) {
             const auto known = std::any_of(
                 specification.tracks.begin(), specification.tracks.end(),
                 [id = source.id](const auto& track) { return track.id == id; });
             if (!known || !source.isAvailable() ||
                 !sourceIds.insert(source.id.value).second) {
                 return {nullptr, "Invalid, duplicate, or unknown audio source"};
+            }
+        }
+        std::unordered_set<std::uint64_t> catalogSourceIds;
+        catalogSourceIds.reserve(specification.sources.size());
+        if (preparedSources.size() != specification.sources.size()) {
+            return {nullptr, "Prepared PCM source catalog is incomplete"};
+        }
+        for (const auto& source : specification.sources) {
+            const auto prepared = std::find_if(
+                preparedSources.begin(), preparedSources.end(),
+                [id = source.id](const auto& candidate) {
+                    return candidate.id == id;
+                });
+            if (!source.id.isValid() || source.frameCount.value == 0 ||
+                !source.sampleRate.isValid() ||
+                !catalogSourceIds.insert(source.id.value).second ||
+                prepared == preparedSources.end() || !prepared->isAvailable() ||
+                prepared->frameCount != source.frameCount ||
+                prepared->sampleRate != source.sampleRate ||
+                prepared->layout != source.layout) {
+                return {nullptr, "Invalid, duplicate, or missing prepared source"};
             }
         }
 
@@ -330,12 +369,37 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             processors::ChannelLayout::stereo, specification.processingMode};
         plan.masterMix = specification.masterMix;
         plan.tracks.reserve(specification.tracks.size());
+        plan.sources.reserve(specification.sources.size());
+        plan.clips.reserve(totalClipCount);
+        plan.clipPrefixMaximumEnd.reserve(totalClipCount);
         plan.buses.reserve(specification.buses.size());
         plan.sends.reserve(specification.sends.size());
         plan.sendIndexById.reserve(specification.sends.size());
         plan.processors.reserve(processorCount);
         plan.processorIndexById.reserve(processorCount);
         plan.order.reserve(stepCount);
+
+        std::vector<std::size_t> sourceSpecificationOrder(
+            specification.sources.size());
+        for (std::size_t index = 0; index < sourceSpecificationOrder.size();
+             ++index) {
+            sourceSpecificationOrder[index] = index;
+        }
+        std::sort(sourceSpecificationOrder.begin(),
+                  sourceSpecificationOrder.end(),
+                  [&specification](const auto left, const auto right) {
+                      return specification.sources[left].id <
+                             specification.sources[right].id;
+                  });
+        for (const auto index : sourceSpecificationOrder) {
+            const auto id = specification.sources[index].id;
+            const auto prepared = std::find_if(
+                preparedSources.begin(), preparedSources.end(),
+                [id](const auto& candidate) { return candidate.id == id; });
+            if (prepared != preparedSources.end()) {
+                plan.sources.push_back(*prepared);
+            }
+        }
 
         std::vector<PendingProcessorRuntime> pendingProcessors;
         pendingProcessors.reserve(processorCount);
@@ -548,6 +612,8 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                       return specification.tracks[left].id <
                              specification.tracks[right].id;
                   });
+        std::unordered_set<std::uint64_t> clipIds;
+        clipIds.reserve(totalClipCount);
         for (const auto specificationIndex : trackSpecificationOrder) {
             const auto& track = specification.tracks[specificationIndex];
             std::size_t destination = masterDestinationIndex;
@@ -558,11 +624,11 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             source.id = track.id;
             source.mix = track.mix;
             const auto preparedSource = std::find_if(
-                sources.begin(), sources.end(),
+                legacySources.begin(), legacySources.end(),
                 [id = track.id](const auto& candidate) {
                     return candidate.id == id;
                 });
-            if (preparedSource != sources.end()) {
+            if (preparedSource != legacySources.end()) {
                 source = *preparedSource;
                 source.mix = track.mix;
                 if (source.clipDuration.value >
@@ -576,10 +642,75 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
             PreparedTrackRoute route;
             route.source = source;
+            route.id = track.id;
+            route.layout = track.clips.empty() && preparedSource != legacySources.end() &&
+                                   preparedSource->channelCount == 2
+                               ? media::AudioChannelLayout::stereo
+                               : track.layout;
+            route.clips.first = plan.clips.size();
             route.destinationBusIndex = destination;
+            double prefixMaximumEnd{};
+            for (const auto& clip : track.clips) {
+                const auto sourceFound = std::lower_bound(
+                    plan.sources.begin(), plan.sources.end(), clip.source,
+                    [](const auto& candidate, const auto id) {
+                        return candidate.id < id;
+                    });
+                if (!clip.id.isValid() ||
+                    !clipIds.insert(clip.id.value).second ||
+                    sourceFound == plan.sources.end() ||
+                    sourceFound->id != clip.source ||
+                    sourceFound->layout != track.layout ||
+                    clip.projectStart.value < 0 ||
+                    !std::isfinite(clip.duration.value) ||
+                    clip.duration.value <= 0.0 ||
+                    !std::isfinite(clip.sourceOffset.value) ||
+                    clip.sourceOffset.value < 0.0) {
+                    return {nullptr, "Invalid clip or track/source layout mismatch"};
+                }
+                const auto projectStart =
+                    static_cast<double>(clip.projectStart.value);
+                const auto projectEnd = projectStart + clip.duration.value;
+                const auto sourceEnd =
+                    static_cast<long double>(clip.sourceOffset.value) +
+                    static_cast<long double>(clip.duration.value) *
+                        static_cast<long double>(sourceFound->sampleRate.hertz()) /
+                        static_cast<long double>(
+                            specification.projectSampleRate.hertz());
+                if (!std::isfinite(projectEnd) ||
+                    projectEnd > static_cast<double>(
+                                     std::numeric_limits<std::int64_t>::max()) ||
+                    !std::isfinite(sourceEnd) ||
+                    sourceEnd > static_cast<long double>(
+                                    sourceFound->frameCount.value)) {
+                    return {nullptr, "Prepared clip exceeds project/source bounds"};
+                }
+                if (!plan.clips.empty() &&
+                    plan.clips.size() > route.clips.first) {
+                    const auto& previous = plan.clips.back();
+                    if (projectStart < previous.projectStart ||
+                        (projectStart == previous.projectStart &&
+                         clip.id < previous.id)) {
+                        return {nullptr, "Track clips are not in canonical order"};
+                    }
+                }
+                plan.clips.push_back(
+                    {clip.id,
+                     static_cast<std::size_t>(sourceFound - plan.sources.begin()),
+                     projectStart, projectEnd, clip.sourceOffset.value,
+                     sourceFound->sampleRate.hertz() /
+                         specification.projectSampleRate.hertz()});
+                prefixMaximumEnd = std::max(prefixMaximumEnd, projectEnd);
+                plan.clipPrefixMaximumEnd.push_back(prefixMaximumEnd);
+                ++route.clips.count;
+                const auto exclusiveEnd = static_cast<std::int64_t>(
+                    std::ceil(projectEnd));
+                plan.duration.value = std::max(plan.duration.value,
+                                               exclusiveEnd);
+            }
             plan.tracks.push_back(std::move(route));
             auto& preparedRoute = plan.tracks.back();
-            const auto layout = preparedRoute.source.channelCount == 2
+            const auto layout = preparedRoute.layout == media::AudioChannelLayout::stereo
                                     ? processors::ChannelLayout::stereo
                                     : processors::ChannelLayout::mono;
             const auto error = prepareChain(
@@ -602,9 +733,9 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             const auto found = std::lower_bound(
                 plan.tracks.begin(), plan.tracks.end(), id,
                 [](const auto& track, const auto value) {
-                    return track.source.id < value;
+                    return track.id < value;
                 });
-            return found != plan.tracks.end() && found->source.id == id
+            return found != plan.tracks.end() && found->id == id
                        ? static_cast<std::size_t>(found - plan.tracks.begin())
                        : maximumPreparedTracks;
         };
@@ -808,6 +939,26 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
     } catch (...) {
         return {nullptr, "Unexpected error while preparing processing plan"};
     }
+}
+
+ProcessingPlanPreparationResult prepareProcessingPlan(
+    const ProcessingPlanSpecification& specification,
+    std::span<const PreparedTrackView> sources,
+    std::size_t blockCapacity,
+    std::size_t memoryBudgetBytes,
+    const processors::IAudioProcessorFactory* processorFactory) noexcept {
+    return prepareProcessingPlanImpl(specification, sources, {}, blockCapacity,
+                                     memoryBudgetBytes, processorFactory);
+}
+
+ProcessingPlanPreparationResult prepareProcessingPlanFromSources(
+    const ProcessingPlanSpecification& specification,
+    std::span<const PreparedSourceView> sources,
+    std::size_t blockCapacity,
+    std::size_t memoryBudgetBytes,
+    const processors::IAudioProcessorFactory* processorFactory) noexcept {
+    return prepareProcessingPlanImpl(specification, {}, sources, blockCapacity,
+                                     memoryBudgetBytes, processorFactory);
 }
 
 } // namespace vitadaw::audio

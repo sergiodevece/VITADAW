@@ -31,14 +31,8 @@ public:
     };
 
     audio::AudioFilePreparationResult prepareWav(
-        const std::filesystem::path&, tracks::TrackId,
-        timeline::SampleRate,
-        mixer::PreparedTrackMixState) override {
+        const std::filesystem::path&) override {
         return {nullptr, "not used"};
-    }
-    bool commitPreparedWav(audio::PreparedAudioFilePtr,
-                           audio::AudioFileCommitAction) noexcept override {
-        return false;
     }
     audio::StructuralPlanPreparationResult prepareProcessingPlan(
         const audio::ProcessingPlanSpecification& specification) override {

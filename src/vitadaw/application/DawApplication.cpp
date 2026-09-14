@@ -13,18 +13,170 @@
 
 namespace vitadaw::application {
 
+namespace {
+
+const char* clipEditError(project::ProjectState::ClipEditStatus status) noexcept {
+    using Status = project::ProjectState::ClipEditStatus;
+    switch (status) {
+    case Status::clipNotFound:
+        return "Clip not found";
+    case Status::invalidPosition:
+        return "Invalid timeline position";
+    case Status::zeroLengthClip:
+        return "Edit would create a zero-length clip";
+    case Status::sourceBoundsExceeded:
+        return "Edit exceeds source bounds";
+    case Status::capacityExceeded:
+        return "Clip capacity exceeded";
+    case Status::success:
+        return "";
+    }
+    return "Clip edit failed";
+}
+
+commands::CommandError clipCommandError(
+    project::ProjectState::ClipEditStatus status) noexcept {
+    using Edit = project::ProjectState::ClipEditStatus;
+    using Error = commands::CommandError;
+    switch (status) {
+    case Edit::clipNotFound:
+        return Error::clipNotFound;
+    case Edit::invalidPosition:
+        return Error::invalidPosition;
+    case Edit::zeroLengthClip:
+        return Error::zeroLengthClip;
+    case Edit::sourceBoundsExceeded:
+        return Error::sourceBoundsExceeded;
+    case Edit::capacityExceeded:
+        return Error::capacityExceeded;
+    case Edit::success:
+        return Error::none;
+    }
+    return Error::preparationFailed;
+}
+
+} // namespace
+
 DawApplication::DawApplication(audio::IAudioEngineControl& audioEngine,
-                               timeline::SampleRate projectSampleRate)
-    : audioEngine_(audioEngine), project_(projectSampleRate) {}
+                               timeline::SampleRate projectSampleRate,
+                               platform::files::IProjectFileIO& files)
+    : audioEngine_(audioEngine), session_(projectSampleRate), files_(files) {}
 
 commands::CommandResult DawApplication::handle(const commands::Command& command) {
+    using namespace commands;
+    // Serialized application-thread entry point; RT never reads the history.
+    try {
+        return std::visit([&](const auto& value) -> CommandResult {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, SaveProject> || std::is_same_v<T, SaveProjectAs> ||
+                          std::is_same_v<T, LoadProject>) {
+                return persistenceCommand(command);
+            } else if constexpr (std::is_same_v<T, Undo> || std::is_same_v<T, Redo>) {
+                return traverseHistory(std::is_same_v<T, Redo>);
+            } else if constexpr (std::is_same_v<T, MoveClip> ||
+                                 std::is_same_v<T, DuplicateClip> ||
+                                 std::is_same_v<T, SplitClip> ||
+                                 std::is_same_v<T, TrimClipLeft> ||
+                                 std::is_same_v<T, TrimClipRight> ||
+                                 std::is_same_v<T, DeleteClip>) {
+                if (transport_.playback == transport::PlaybackState::playing)
+                    return {CommandStatus::rejected, "Stop before editing history",
+                            CommandError::transportMustBeStopped};
+                const auto* original = session_.project.findClip(value.clip);
+                if (!original)
+                    return {CommandStatus::rejected, "Clip not found", CommandError::clipNotFound};
+                const auto before = *original;
+                tracks::TrackId trackId;
+                for (const auto& track : session_.project.tracks())
+                    for (const auto& clip : track.clips)
+                        if (clip.id == value.clip) trackId = track.id;
+                auto candidate = session_.project;
+                project::ProjectState::ClipEditResult edit;
+                history::UndoableOperation operation;
+                if constexpr (std::is_same_v<T, MoveClip>)
+                    edit = candidate.moveClip(value.clip, value.projectStart);
+                else if constexpr (std::is_same_v<T, DuplicateClip>)
+                    edit = candidate.duplicateClip(value.clip, value.projectStart);
+                else if constexpr (std::is_same_v<T, SplitClip>)
+                    edit = candidate.splitClip(value.clip, value.splitPosition);
+                else if constexpr (std::is_same_v<T, TrimClipLeft>)
+                    edit = candidate.trimClipLeft(value.clip, value.projectStart);
+                else if constexpr (std::is_same_v<T, TrimClipRight>)
+                    edit = candidate.trimClipRight(value.clip, value.projectEnd);
+                else edit = candidate.deleteClip(value.clip);
+                if (!edit)
+                    return {CommandStatus::rejected, clipEditError(edit.status),
+                            clipCommandError(edit.status)};
+                if constexpr (std::is_same_v<T, DuplicateClip>)
+                    operation.payload = history::DuplicateClip{trackId, *candidate.findClip(edit.createdClip)};
+                else if constexpr (std::is_same_v<T, SplitClip>)
+                    operation.payload = history::SplitClip{trackId, before,
+                        *candidate.findClip(value.clip), *candidate.findClip(edit.createdClip)};
+                else if constexpr (std::is_same_v<T, DeleteClip>)
+                    operation.payload = history::DeleteClip{trackId, before};
+                else {
+                    const auto after = *candidate.findClip(value.clip);
+                    if (before == after) return {CommandStatus::accepted, "Clip unchanged"};
+                    if constexpr (std::is_same_v<T, MoveClip>)
+                        operation.payload = history::MoveClip{trackId, before, after};
+                    else if constexpr (std::is_same_v<T, TrimClipLeft>)
+                        operation.payload = history::TrimClipLeft{trackId, before, after};
+                    else operation.payload = history::TrimClipRight{trackId, before, after};
+                }
+                auto pending = session_.history.stage(std::move(operation));
+                if (!pending)
+                    return {CommandStatus::rejected, "History capacity exceeded",
+                            CommandError::historyCapacityExceeded};
+                return commitStructuralProject(std::move(candidate), "Clip edit committed",
+                                               &*pending);
+            } else {
+                constexpr bool persistent = !std::is_same_v<T, Play> && !std::is_same_v<T, Stop>;
+                if constexpr (persistent) {
+                    if (!session_.history.canCreateState())
+                        return {CommandStatus::rejected, "History token capacity exceeded",
+                                CommandError::historyCapacityExceeded};
+                }
+                return execute(command);
+            }
+        }, command);
+    } catch (const std::bad_alloc&) {
+        return {CommandStatus::rejected, {}, CommandError::historyCapacityExceeded};
+    } catch (...) {
+        return {CommandStatus::rejected, {}, CommandError::preparationFailed};
+    }
+}
+
+commands::CommandResult DawApplication::traverseHistory(bool forward) {
+    using namespace commands;
+    if (transport_.playback == transport::PlaybackState::playing)
+        return {CommandStatus::rejected, "Stop before Undo/Redo", CommandError::transportMustBeStopped};
+    const auto* entry = forward ? session_.history.redoEntry() : session_.history.undoEntry();
+    if (!entry) return {CommandStatus::rejected, "No history entry",
+        forward ? CommandError::nothingToRedo : CommandError::nothingToUndo};
+    if (!session_.history.canCreateState())
+        return {CommandStatus::rejected, "Revision capacity exceeded", CommandError::historyCapacityExceeded};
+    const auto expectedToken = forward ? entry->beforeStateToken : entry->afterStateToken;
+    if (session_.history.currentStateToken() != expectedToken)
+        return {CommandStatus::rejected, "History state diverged", CommandError::historyInvalid};
+    auto candidate = session_.project;
+    if (!entry->operation.apply(candidate, forward))
+        return {CommandStatus::rejected, "History entities diverged", CommandError::historyInvalid};
+    return commitStructuralProject(std::move(candidate), forward ? "Redo committed" : "Undo committed",
+                                   nullptr, forward ? 1 : -1);
+}
+
+commands::CommandResult DawApplication::execute(const commands::Command& command) {
+    // Allocate diagnostics before any lightweight parameter publication.
+    commands::CommandResult parameterSuccess{commands::CommandStatus::accepted,
+                                               "Parameter updated"};
     return std::visit(
-        [this](const auto& value) -> commands::CommandResult {
+        [this, &parameterSuccess](const auto& value) -> commands::CommandResult {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, commands::AddAudioTrack>) {
                 try {
-                    auto candidate = project_;
-                    const auto id = candidate.addAudioTrack(value.name);
+                    auto candidate = session_.project;
+                    const auto id = candidate.addAudioTrack(value.name,
+                                                             value.layout);
                     return commitStructuralProject(
                         std::move(candidate),
                         "Added audio track " + std::to_string(id.value));
@@ -41,7 +193,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Routing cannot change during playback"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     const auto id = candidate.addBus(value.name);
                     return commitStructuralProject(
                         std::move(candidate),
@@ -64,7 +216,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Invalid send level or tap point"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     const auto id = candidate.addSend(
                         value.track, value.destination, value.tapPoint,
                         mixer::SendMixState{value.level, false});
@@ -89,7 +241,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Invalid send level or tap point"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     const auto id = candidate.addSend(
                         value.bus, value.destination, value.tapPoint,
                         mixer::SendMixState{value.level, false});
@@ -109,7 +261,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Routing cannot change during playback"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     if (!candidate.setSendRoute(
                             value.send, value.destination, value.tapPoint)) {
                         return {commands::CommandStatus::rejected,
@@ -130,7 +282,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Routing cannot change during playback"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     if (!candidate.removeSend(value.send)) {
                         return {commands::CommandStatus::rejected,
                                 "Send does not exist"};
@@ -144,17 +296,21 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Send could not be removed"};
                 }
-            } else if constexpr (std::is_same_v<T, commands::LoadAudioFile>) {
-                const auto* destination = project_.findTrack(value.track);
+            } else if constexpr (std::is_same_v<T, commands::LoadAudioFile> ||
+                                 std::is_same_v<T, commands::ImportAudioToTrack>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Clips cannot change during playback",
+                            commands::CommandError::transportMustBeStopped};
+                }
+                const auto* destination = session_.project.findTrack(value.track);
                 if (destination == nullptr) {
                     return {commands::CommandStatus::rejected,
                             "Audio track does not exist"};
                 }
                 audio::AudioFilePreparationResult preparation;
                 try {
-                    preparation = audioEngine_.prepareWav(
-                        value.file, value.track, project_.sampleRate(),
-                        mixer::prepare(destination->mix));
+                    preparation = audioEngine_.prepareWav(value.file);
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
                             "Not enough memory to prepare WAV"};
@@ -170,14 +326,27 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             std::move(preparation.errorMessage)};
                 }
 
-                std::optional<project::ProjectState::PreparedAudioClipUpdate>
-                    projectUpdate;
+                std::optional<project::ProjectState> candidate;
+                project::ProjectState::ImportedAudio imported;
                 std::string successMessage;
                 try {
                     const auto metadata = preparation.prepared->metadata;
-                    projectUpdate.emplace(project_.prepareAudioClipUpdate(
-                        value.track, value.file, metadata.sourceFrameCount,
-                        metadata.sourceSampleRate));
+                    const auto layout = metadata.channelCount == 1
+                                            ? media::AudioChannelLayout::mono
+                                            : media::AudioChannelLayout::stereo;
+                    candidate.emplace(session_.project);
+                    imported = candidate->importAudioToTrack(
+                        value.track, preparation.prepared->media.isValid() ? preparation.prepared->media
+                            : media::MediaReference{value.file, {}, {}},
+                        metadata.sourceFrameCount, metadata.sourceSampleRate,
+                        layout,
+                        [&]() {
+                            if constexpr (std::is_same_v<
+                                              T, commands::ImportAudioToTrack>) {
+                                return value.projectStart;
+                            }
+                            return timeline::ProjectFramePosition{0};
+                        }());
 
                     std::ostringstream message;
                     message << "Loaded track " << value.track.value
@@ -199,22 +368,42 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Unknown error while preparing project state"};
                 }
 
+                audio::StructuralPlanPreparationResult planPreparation;
+                try {
+                    planPreparation = audioEngine_.prepareProcessingPlanWithAudio(
+                        makePlanSpecification(*candidate), imported.source,
+                        std::move(preparation.prepared));
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to prepare imported project"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Imported project could not be prepared"};
+                }
+                if (!planPreparation.success()) {
+                    return {commands::CommandStatus::rejected,
+                            std::move(planPreparation.errorMessage)};
+                }
                 struct CommitContext {
                     DawApplication* application;
-                    project::ProjectState::PreparedAudioClipUpdate* update;
-                } commitContext{this, &*projectUpdate};
+                    project::ProjectState* candidate;
+                    audio::PreparedAudibilityState audibility;
+                } commitContext{this, &*candidate,
+                                resolveAudibility(*candidate)};
                 const audio::AudioFileCommitAction modelCommit{
                     &commitContext,
                     [](void* rawContext) noexcept {
                         auto& context = *static_cast<CommitContext*>(rawContext);
-                        context.application->project_.commitAudioClipUpdate(
-                            *context.update);
+                        context.application->session_.project.swap(*context.candidate);
+                        context.application->audibility_ = context.audibility;
+                        context.application->transport_.stopAndRewind();
                         context.application->transport_.setDuration(
-                            context.application->project_.duration());
+                            context.application->session_.project.duration());
+                        context.application->session_.history.commitBarrier();
                     }};
 
-                if (!audioEngine_.commitPreparedWav(
-                        std::move(preparation.prepared), modelCommit)) {
+                if (!audioEngine_.commitPreparedProcessingPlan(
+                        std::move(planPreparation.prepared), modelCommit)) {
                     return {commands::CommandStatus::rejected,
                             "Prepared WAV could not be committed"};
                 }
@@ -223,6 +412,45 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     audioEngine_.transportSnapshot().lastProcessedCommandSequence;
                 return {commands::CommandStatus::accepted,
                         std::move(successMessage)};
+            } else if constexpr (std::is_same_v<T, commands::AddClip> ||
+                                 std::is_same_v<T, commands::RemoveClip> ||
+                                 std::is_same_v<T, commands::RemoveSource>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Clips cannot change during playback",
+                            commands::CommandError::transportMustBeStopped};
+                }
+                try {
+                    auto candidate = session_.project;
+                    if constexpr (std::is_same_v<T, commands::AddClip>) {
+                        static_cast<void>(candidate.addClip(
+                            value.track, value.source, value.projectStart,
+                            value.duration, value.sourceOffset));
+                    } else if constexpr (std::is_same_v<
+                                             T, commands::RemoveSource>) {
+                        if (!candidate.removeSource(value.source)) {
+                            return {commands::CommandStatus::rejected,
+                                    "Source does not exist or remains referenced"};
+                        }
+                    } else {
+                        const auto edit = candidate.deleteClip(value.clip);
+                        if (!edit) {
+                            return {commands::CommandStatus::rejected,
+                                    clipEditError(edit.status),
+                                    clipCommandError(edit.status)};
+                        }
+                    }
+                    return commitStructuralProject(
+                        std::move(candidate), "Clip structure updated");
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to prepare clips"};
+                } catch (const std::exception& error) {
+                    return {commands::CommandStatus::rejected, error.what()};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Clip update could not be prepared"};
+                }
             } else if constexpr (std::is_same_v<T, commands::Play>) {
                 const auto request = audioEngine_.tryRequestPlay();
                 if (!request.accepted) {
@@ -245,7 +473,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 std::is_same_v<T, commands::SetTrackPan> ||
                 std::is_same_v<T, commands::SetTrackMute> ||
                 std::is_same_v<T, commands::SetTrackSolo>) {
-                const auto* track = project_.findTrack(value.track);
+                const auto* track = session_.project.findTrack(value.track);
                 if (track == nullptr) {
                     return {commands::CommandStatus::rejected,
                             "Audio track does not exist"};
@@ -269,17 +497,17 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     updated.solo = value.solo;
                 }
                 const auto audibility = resolveAudibility(
-                    project_, value.track, &updated);
+                    session_.project, value.track, &updated);
                 const auto published = audioEngine_.tryUpdateTrackMix(
                     value.track, mixer::prepare(updated), audibility);
                 if (!published) {
                     return {commands::CommandStatus::rejected,
                             "Mixer parameter queue is full"};
                 }
-                static_cast<void>(project_.setTrackMix(value.track, updated));
+                static_cast<void>(session_.project.setTrackMix(value.track, updated));
                 audibility_ = audibility;
-                return {commands::CommandStatus::accepted,
-                        "Track mixer state updated"};
+                session_.history.commitBarrier();
+                return std::move(parameterSuccess);
             } else if constexpr (std::is_same_v<T, commands::SetMasterGain>) {
                 if (!value.gain.isValid()) {
                     return {commands::CommandStatus::rejected,
@@ -290,13 +518,13 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Mixer parameter queue is full"};
                 }
-                static_cast<void>(project_.setMasterMix(updated));
-                return {commands::CommandStatus::accepted,
-                        "Master mixer state updated"};
+                static_cast<void>(session_.project.setMasterMix(updated));
+                session_.history.commitBarrier();
+                return std::move(parameterSuccess);
             } else if constexpr (
                 std::is_same_v<T, commands::SetSendLevel> ||
                 std::is_same_v<T, commands::SetSendMute>) {
-                const auto* send = project_.findSend(value.send);
+                const auto* send = session_.project.findSend(value.send);
                 if (send == nullptr) {
                     return {commands::CommandStatus::rejected,
                             "Send does not exist"};
@@ -316,15 +544,15 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Mixer parameter queue is full"};
                 }
-                static_cast<void>(project_.setSendMix(value.send, updated));
-                return {commands::CommandStatus::accepted,
-                        "Send mixer state updated"};
+                static_cast<void>(session_.project.setSendMix(value.send, updated));
+                session_.history.commitBarrier();
+                return std::move(parameterSuccess);
             } else if constexpr (
                 std::is_same_v<T, commands::SetBusGain> ||
                 std::is_same_v<T, commands::SetBusPan> ||
                 std::is_same_v<T, commands::SetBusMute> ||
                 std::is_same_v<T, commands::SetBusSolo>) {
-                const auto* bus = project_.findBus(value.bus);
+                const auto* bus = session_.project.findBus(value.bus);
                 if (bus == nullptr) {
                     return {commands::CommandStatus::rejected,
                             "Audio bus does not exist"};
@@ -348,16 +576,16 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     updated.solo = value.solo;
                 }
                 const auto audibility = resolveAudibility(
-                    project_, {}, nullptr, value.bus, &updated);
+                    session_.project, {}, nullptr, value.bus, &updated);
                 if (!audioEngine_.tryUpdateBusMix(
                         value.bus, mixer::prepare(updated), audibility)) {
                     return {commands::CommandStatus::rejected,
                             "Mixer parameter queue is full"};
                 }
-                static_cast<void>(project_.setBusMix(value.bus, updated));
+                static_cast<void>(session_.project.setBusMix(value.bus, updated));
                 audibility_ = audibility;
-                return {commands::CommandStatus::accepted,
-                        "Bus mixer state updated"};
+                session_.history.commitBarrier();
+                return std::move(parameterSuccess);
             } else if constexpr (
                 std::is_same_v<T, commands::AddProcessor> ||
                 std::is_same_v<T, commands::RemoveProcessor> ||
@@ -367,7 +595,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Insert structure cannot change during playback"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     std::string message;
                     if constexpr (std::is_same_v<T,
                                                  commands::AddProcessor>) {
@@ -404,7 +632,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 }
             } else if constexpr (
                 std::is_same_v<T, commands::SetProcessorBypass>) {
-                if (project_.findProcessor(value.processor) == nullptr) {
+                if (session_.project.findProcessor(value.processor) == nullptr) {
                     return {commands::CommandStatus::rejected,
                             "Processor does not exist"};
                 }
@@ -413,13 +641,13 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Processor parameter queue is full"};
                 }
-                static_cast<void>(project_.setProcessorBypass(
+                static_cast<void>(session_.project.setProcessorBypass(
                     value.processor, value.bypassed));
-                return {commands::CommandStatus::accepted,
-                        "Processor bypass updated"};
+                session_.history.commitBarrier();
+                return std::move(parameterSuccess);
             } else if constexpr (
                 std::is_same_v<T, commands::SetProcessorParameter>) {
-                const auto* processor = project_.findProcessor(value.processor);
+                const auto* processor = session_.project.findProcessor(value.processor);
                 if (processor == nullptr) {
                     return {commands::CommandStatus::rejected,
                             "Processor does not exist"};
@@ -442,10 +670,10 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Processor parameter queue is full"};
                 }
-                static_cast<void>(project_.setProcessorParameter(
+                static_cast<void>(session_.project.setProcessorParameter(
                     value.processor, value.parameter, value.value));
-                return {commands::CommandStatus::accepted,
-                        "Processor parameter updated"};
+                session_.history.commitBarrier();
+                return std::move(parameterSuccess);
             } else if constexpr (
                 std::is_same_v<T, commands::SetTrackOutputDestination> ||
                 std::is_same_v<T, commands::SetBusOutputDestination>) {
@@ -454,7 +682,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             "Routing cannot change during playback"};
                 }
                 try {
-                    auto candidate = project_;
+                    auto candidate = session_.project;
                     if constexpr (std::is_same_v<
                                       T, commands::SetTrackOutputDestination>) {
                         if (!candidate.setTrackOutputDestination(
@@ -491,6 +719,11 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
     const project::ProjectState& project) const {
     audio::ProcessingPlanSpecification result;
     result.projectSampleRate = project.sampleRate();
+    result.sources.reserve(project.sources().size());
+    for (const auto& source : project.sources()) {
+        result.sources.push_back({source.id, source.frameCount,
+                                  source.sampleRate, source.layout});
+    }
     result.buses.reserve(project.routing().buses().size());
     for (const auto& bus : project.routing().buses()) {
         result.buses.push_back(
@@ -505,9 +738,14 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
         if (route == nullptr) {
             throw std::logic_error{"Audio track has no output routing"};
         }
-        result.tracks.push_back(
-            {track.id, mixer::prepare(track.mix), route->destination,
-             track.inserts});
+        audio::ProcessingPlanTrackSpecification specification;
+        specification.id = track.id;
+        specification.mix = mixer::prepare(track.mix);
+        specification.destination = route->destination;
+        specification.inserts = track.inserts;
+        specification.layout = track.layout;
+        specification.clips = track.clips;
+        result.tracks.push_back(std::move(specification));
     }
     result.sends.reserve(project.routing().sends().size());
     for (const auto& send : project.routing().sends()) {
@@ -518,36 +756,49 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
 }
 
 commands::CommandResult DawApplication::commitStructuralProject(
-    project::ProjectState candidate, std::string successMessage) {
+    project::ProjectState candidate, std::string successMessage,
+    history::UndoManager::PendingAppend* pending, int historyDirection) {
     if (transport_.playback == transport::PlaybackState::playing) {
         return {commands::CommandStatus::rejected,
-                "Routing cannot change during playback"};
+                "Routing cannot change during playback",
+                commands::CommandError::transportMustBeStopped};
     }
     auto preparation = audioEngine_.prepareProcessingPlan(
         makePlanSpecification(candidate));
     if (!preparation.success()) {
         return {commands::CommandStatus::rejected,
-                std::move(preparation.errorMessage)};
+                std::move(preparation.errorMessage),
+                commands::CommandError::preparationFailed};
     }
     struct CommitContext {
         DawApplication* application;
         project::ProjectState* candidate;
         audio::PreparedAudibilityState audibility;
-    } context{this, &candidate, resolveAudibility(candidate)};
+        history::UndoManager::PendingAppend* pending;
+        int historyDirection;
+    } context{this, &candidate, resolveAudibility(candidate), pending, historyDirection};
     const audio::AudioFileCommitAction commit{
         &context,
         [](void* raw) noexcept {
             auto& value = *static_cast<CommitContext*>(raw);
-            value.application->project_.swap(*value.candidate);
+            value.application->session_.project.swap(*value.candidate);
             value.application->audibility_ = value.audibility;
             value.application->transport_.stopAndRewind();
             value.application->transport_.setDuration(
-                value.application->project_.duration());
+                value.application->session_.project.duration());
+            if (value.pending)
+                value.application->session_.history.commit(std::move(*value.pending));
+            else if (value.historyDirection > 0)
+                value.application->session_.history.commitRedo();
+            else if (value.historyDirection < 0)
+                value.application->session_.history.commitUndo();
+            else value.application->session_.history.commitBarrier();
         }};
     if (!audioEngine_.commitPreparedProcessingPlan(
             std::move(preparation.prepared), commit)) {
         return {commands::CommandStatus::rejected,
-                "Prepared routing could not be committed"};
+                "Prepared routing could not be committed",
+                commands::CommandError::preparationFailed};
     }
     pendingAudioCommandSequence_ =
         audioEngine_.transportSnapshot().lastProcessedCommandSequence;
@@ -690,7 +941,7 @@ void DawApplication::synchroniseTransport() noexcept {
 }
 
 const project::ProjectState& DawApplication::project() const noexcept {
-    return project_;
+    return session_.project;
 }
 
 const transport::TransportState& DawApplication::transport() const noexcept {
@@ -699,6 +950,12 @@ const transport::TransportState& DawApplication::transport() const noexcept {
 
 mixer::MeterSnapshot DawApplication::meterSnapshot() const noexcept {
     return audioEngine_.meterSnapshot();
+}
+
+ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
+    return ui::timeline::makeTimelineSnapshot(session_.project,
+                                               session_.history.revision(),
+                                               transport_);
 }
 
 } // namespace vitadaw::application

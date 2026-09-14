@@ -17,6 +17,9 @@
 namespace vitadaw::audio {
 
 inline constexpr std::size_t maximumPreparedTracks = 256;
+inline constexpr std::size_t maximumPreparedSources = 2048;
+inline constexpr std::size_t maximumPreparedClips = 32768;
+inline constexpr std::size_t maximumPreparedClipsPerTrack = 4096;
 inline constexpr std::size_t maximumPreparedBuses = 64;
 inline constexpr std::size_t maximumPreparedSends = 1024;
 inline constexpr std::size_t maximumPreparedSendsPerTrack = 64;
@@ -37,6 +40,15 @@ struct ProcessingPlanTrackSpecification {
     mixer::PreparedTrackMixState mix;
     routing::OutputDestination destination;
     processors::InsertChain inserts;
+    media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
+    std::vector<clips::AudioClip> clips;
+};
+
+struct ProcessingPlanSourceSpecification {
+    media::SourceId id;
+    timeline::SourceFrameCount frameCount;
+    timeline::SampleRate sampleRate;
+    media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
 };
 
 struct ProcessingPlanBusSpecification {
@@ -57,6 +69,7 @@ struct ProcessingPlanSendSpecification {
 struct ProcessingPlanSpecification {
     timeline::SampleRate projectSampleRate;
     std::vector<ProcessingPlanTrackSpecification> tracks;
+    std::vector<ProcessingPlanSourceSpecification> sources;
     std::vector<ProcessingPlanBusSpecification> buses;
     std::vector<ProcessingPlanSendSpecification> sends;
     mixer::PreparedMasterMixState masterMix;
@@ -89,6 +102,9 @@ struct PreparedLatencyRange {
 
 struct PreparedTrackRoute {
     PreparedTrackView source;
+    tracks::TrackId id;
+    media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
+    PreparedClipRange clips;
     std::size_t destinationBusIndex{masterDestinationIndex};
     PreparedSendRange preFaderSends;
     PreparedSendRange postFaderSends;
@@ -159,6 +175,9 @@ struct PreparedProcessingPlan {
     timeline::SampleRate projectSampleRate;
     timeline::ProjectFrameCount duration;
     std::vector<PreparedTrackRoute> tracks;
+    std::vector<PreparedSourceView> sources;
+    std::vector<PreparedClipView> clips;
+    std::vector<double> clipPrefixMaximumEnd;
     std::vector<PreparedBusNode> buses;
     std::vector<PreparedSendDescriptor> sends;
     std::vector<PreparedSendIndex> sendIndexById;
@@ -243,6 +262,14 @@ struct ProcessingPlanPreparationResult {
 [[nodiscard]] ProcessingPlanPreparationResult prepareProcessingPlan(
     const ProcessingPlanSpecification& specification,
     std::span<const PreparedTrackView> sources,
+    std::size_t blockCapacity = defaultProcessingBlockCapacity,
+    std::size_t memoryBudgetBytes = defaultProcessingMemoryBudgetBytes,
+    const processors::IAudioProcessorFactory* processorFactory = nullptr)
+    noexcept;
+
+[[nodiscard]] ProcessingPlanPreparationResult prepareProcessingPlanFromSources(
+    const ProcessingPlanSpecification& specification,
+    std::span<const PreparedSourceView> sources,
     std::size_t blockCapacity = defaultProcessingBlockCapacity,
     std::size_t memoryBudgetBytes = defaultProcessingMemoryBudgetBytes,
     const processors::IAudioProcessorFactory* processorFactory = nullptr)

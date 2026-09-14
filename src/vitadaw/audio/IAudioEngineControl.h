@@ -5,6 +5,7 @@
 #include "vitadaw/mixer/Metering.h"
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/tracks/AudioTrack.h"
+#include "vitadaw/persistence/PersistenceResult.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -29,13 +30,21 @@ public:
     virtual ~PreparedAudioFile() = default;
 
     AudioFileMetadata metadata;
+    media::MediaReference media;
 };
 
 using PreparedAudioFilePtr = std::unique_ptr<PreparedAudioFile>;
 
 struct AudioFilePreparationResult {
+    AudioFilePreparationResult(PreparedAudioFilePtr p = {}, std::string message = {},
+        persistence::PersistenceResult r = {}) noexcept
+        : prepared(std::move(p)), errorMessage(std::move(message)), result(std::move(r)) {
+        if (!prepared && result.success()) result = {persistence::PersistenceCode::preparationFailed,
+                                                     persistence::PersistencePhase::prepare};
+    }
     PreparedAudioFilePtr prepared;
     std::string errorMessage;
+    persistence::PersistenceResult result;
 
     [[nodiscard]] bool success() const noexcept { return prepared != nullptr; }
 };
@@ -47,6 +56,8 @@ public:
 
 using PreparedProcessingPlanChangePtr =
     std::unique_ptr<PreparedProcessingPlanChange>;
+
+struct PreparedSourceAudio { media::SourceId id; PreparedAudioFilePtr audio; };
 
 struct StructuralPlanPreparationResult {
     PreparedProcessingPlanChangePtr prepared;
@@ -69,23 +80,45 @@ struct AudioFileCommitAction {
 
 // Called from the application thread. Realtime control methods must enqueue
 // bounded, non-blocking requests. prepareWav performs file I/O explicitly
-// outside the realtime thread. commitPreparedWav publishes the engine resource
-// and invokes the already-prepared model commit while render is quiescent.
+// outside the realtime thread. A decoded source is published only as part of
+// a complete prepared processing-plan transaction.
 class IAudioEngineControl {
 public:
     virtual ~IAudioEngineControl() = default;
+    [[nodiscard]] virtual std::size_t preparedAudioBytes() const noexcept { return 0; }
+    // Complete document adoption. Deliberately separate from within-project imports:
+    // IDs in this vector never resolve through the active project's source cache.
+    [[nodiscard]] virtual StructuralPlanPreparationResult prepareProjectReplacement(
+        const ProcessingPlanSpecification&, std::vector<PreparedSourceAudio>) {
+        return {nullptr, "Project replacement is not supported"};
+    }
     // File I/O and decoding are allowed here because this method is never called
     // by the realtime thread.
     [[nodiscard]] virtual AudioFilePreparationResult prepareWav(
-        const std::filesystem::path& file,
-        tracks::TrackId track,
-        timeline::SampleRate projectSampleRate,
-        mixer::PreparedTrackMixState trackMix) = 0;
-    [[nodiscard]] virtual bool commitPreparedWav(
-        PreparedAudioFilePtr prepared,
-        AudioFileCommitAction modelCommit) noexcept = 0;
+        const std::filesystem::path& file) = 0;
+    [[nodiscard]] virtual AudioFilePreparationResult prepareWavForProject(
+        const std::filesystem::path& file, std::size_t /* candidateBytes */) {
+        return prepareWav(file);
+    }
+    [[nodiscard]] virtual AudioFilePreparationResult prepareVerifiedWav(
+        const std::filesystem::path& file, const media::MediaFingerprint& expected,
+        std::size_t candidateBytes) {
+        auto result = prepareWavForProject(file, candidateBytes);
+        if (result.success() && result.prepared->media.fingerprint != expected)
+            return {nullptr, {}, {persistence::PersistenceCode::mediaChanged, persistence::PersistencePhase::media}};
+        return result;
+    }
     [[nodiscard]] virtual StructuralPlanPreparationResult prepareProcessingPlan(
         const ProcessingPlanSpecification& specification) = 0;
+    // Consumes a fully decoded source and prepares it together with a complete
+    // candidate project. No partial publication is allowed.
+    [[nodiscard]] virtual StructuralPlanPreparationResult
+    prepareProcessingPlanWithAudio(
+        const ProcessingPlanSpecification&,
+        media::SourceId,
+        PreparedAudioFilePtr) {
+        return {nullptr, "Prepared source import is not supported"};
+    }
     [[nodiscard]] virtual bool commitPreparedProcessingPlan(
         PreparedProcessingPlanChangePtr prepared,
         AudioFileCommitAction modelCommit) noexcept = 0;

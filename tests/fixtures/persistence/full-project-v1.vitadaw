@@ -1,0 +1,22 @@
+{
+  "format": "VitaDAWProject", "schemaVersion": 1, "writerAppVersion": "0.5.0",
+  "projectSettings": {"name": "Fixture", "sampleRateHz": 48000.0},
+  "nextIds": {"track":"3", "source":"2", "clip":"4", "bus":"3", "send":"3", "processorInstance":"4"},
+  "sources": [{"id":"1", "frameCount":"44100", "sampleRateHz":44100.0, "layout":"mono",
+    "media":{"kind":"localFile", "relativePath":"audio/a.wav", "absoluteFallback":"/fixture/audio/a.wav",
+      "fingerprint":{"algorithm":"sha256", "digest":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "fileSizeBytes":"3"}}}],
+  "tracks": [
+    {"id":"1", "name":"Voice", "layout":"mono", "mix":{"gainDb":-3.0,"pan":0.25,"muted":false,"solo":false},
+     "clips":[{"id":"1","sourceId":"1","projectStartFrames":"0","durationProjectFrames":24000.5,"sourceOffsetFrames":12.25},
+              {"id":"3","sourceId":"1","projectStartFrames":"12000","durationProjectFrames":24000.0,"sourceOffsetFrames":0.0}],
+     "inserts":[{"id":"1","typeId":"internal.gain","bypassed":false,"parameters":[{"id":"1","value":-6.0}],"serializedState":""}]},
+    {"id":"2","name":"Stereo","layout":"stereo","mix":{"gainDb":0.0,"pan":0.0,"muted":true,"solo":false},"clips":[],"inserts":[]}],
+  "routing":{"trackOutputs":[{"trackId":"1","output":{"kind":"bus","id":"1"}},{"trackId":"2","output":{"kind":"master"}}]},
+  "buses":[
+    {"id":"1","name":"Music","mix":{"gainDb":-1.0,"balance":-0.2,"muted":false,"solo":false},"output":{"kind":"master"},
+     "inserts":[{"id":"2","typeId":"internal.gain","bypassed":true,"parameters":[{"id":"1","value":3.0}],"serializedState":""}]},
+    {"id":"2","name":"Aux","mix":{"gainDb":-4.0,"balance":0.0,"muted":false,"solo":false},"output":{"kind":"master"},"inserts":[]}],
+  "sends":[{"id":"1","source":{"kind":"track","id":"1"},"destinationBusId":"2","tap":"preFaderPrePan","levelDb":-12.0,"muted":false},
+           {"id":"2","source":{"kind":"bus","id":"1"},"destinationBusId":"2","tap":"postFaderPostPan","levelDb":-9.0,"muted":true}],
+  "master":{"gainDb":-3.0,"inserts":[{"id":"3","typeId":"internal.gain","bypassed":false,"parameters":[{"id":"1","value":0.0}],"serializedState":""}]}
+}

@@ -1,0 +1,83 @@
+#pragma once
+
+#include "vitadaw/project/ProjectState.h"
+
+#include <cstdint>
+#include <optional>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+namespace vitadaw::history {
+
+struct StateToken {
+    std::uint64_t value{};
+    bool operator==(const StateToken&) const = default;
+};
+struct MoveClip { tracks::TrackId track; clips::AudioClip before, after; };
+struct TrimClipLeft { tracks::TrackId track; clips::AudioClip before, after; };
+struct TrimClipRight { tracks::TrackId track; clips::AudioClip before, after; };
+struct DuplicateClip { tracks::TrackId track; clips::AudioClip created; };
+struct DeleteClip { tracks::TrackId track; clips::AudioClip removed; };
+struct SplitClip { tracks::TrackId track; clips::AudioClip original, left, right; };
+
+// Model values only. No borrowed views or prepared/runtime ownership.
+class UndoableOperation {
+public:
+    using Payload = std::variant<MoveClip, DuplicateClip, SplitClip,
+                                 TrimClipLeft, TrimClipRight, DeleteClip>;
+    Payload payload;
+    [[nodiscard]] std::string_view label() const noexcept;
+    // Operates on a disposable application-thread candidate, never active state.
+    [[nodiscard]] bool apply(project::ProjectState& candidate, bool forward) const;
+};
+
+struct HistoryEntry {
+    UndoableOperation operation;
+    StateToken beforeStateToken, afterStateToken;
+    [[nodiscard]] constexpr std::size_t approximateMemoryBytes() const noexcept {
+        return sizeof(HistoryEntry); // All payloads are fixed-size model values.
+    }
+};
+
+// Application-thread only. A staged append owns all storage before model commit.
+class UndoManager {
+public:
+    static constexpr std::size_t maximumEntries = 512;
+    static constexpr std::size_t memoryBudget = 8 * 1024 * 1024;
+    struct Limits { std::size_t entries{maximumEntries}, bytes{memoryBudget}; };
+    struct PendingAppend {
+        std::vector<HistoryEntry> entries;
+        StateToken token;
+    };
+    UndoManager() = default;
+    explicit UndoManager(Limits limits) : limits_(limits) {}
+    [[nodiscard]] bool canUndo() const noexcept { return cursor_ != 0; }
+    [[nodiscard]] bool canRedo() const noexcept { return cursor_ < entries_.size(); }
+    [[nodiscard]] const HistoryEntry* undoEntry() const noexcept;
+    [[nodiscard]] const HistoryEntry* redoEntry() const noexcept;
+    [[nodiscard]] std::string_view undoLabel() const noexcept;
+    [[nodiscard]] std::string_view redoLabel() const noexcept;
+    [[nodiscard]] std::optional<PendingAppend> stage(UndoableOperation operation) const;
+    void commit(PendingAppend&& pending) noexcept;
+    void commitUndo() noexcept;
+    void commitRedo() noexcept;
+    void clearHistory() noexcept;
+    void commitBarrier() noexcept;
+    [[nodiscard]] bool canCreateState() const noexcept;
+    [[nodiscard]] StateToken currentStateToken() const noexcept { return current_; }
+    [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
+    [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+    [[nodiscard]] std::size_t cursor() const noexcept { return cursor_; }
+    [[nodiscard]] std::size_t memoryBytes() const noexcept {
+        return entries_.capacity() * sizeof(HistoryEntry);
+    }
+private:
+    Limits limits_;
+    std::vector<HistoryEntry> entries_;
+    std::size_t cursor_{};
+    StateToken current_{1};
+    std::uint64_t nextToken_{2}, revision_{};
+};
+
+} // namespace vitadaw::history
