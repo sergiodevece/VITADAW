@@ -103,12 +103,43 @@ ctest --test-dir build-tsan --output-on-failure
 
 Resultados en esta máquina:
 
-- build completo: 25/25 tests;
-- build core-only: 24/24 tests;
-- ASan + UBSan: 24/24, sin diagnósticos;
-- UBSan independiente: 24/24, sin diagnósticos;
-- TSan: 24/24, sin carreras detectadas;
+- build completo: 26/26 tests;
+- build core-only: 25/25 tests;
+- ASan + UBSan: 25/25, sin diagnósticos;
+- UBSan independiente: 25/25, sin diagnósticos;
+- TSan: 25/25, sin carreras detectadas;
 - `git diff --check`: limpio.
+
+## Corrección release blocker de lifecycle
+
+Los tres crash reports originales, generados antes de recompilar la corrección,
+mostraban procesos de unos 140 ms, acceso a `0x420` y el recorrido
+`shutdown -> setStateChangedCallback -> std::function::operator=`. No había un
+adapter destruido: el receptor de la llamada era nulo. Con una instancia ya
+activa, JUCE rechazaba la segunda antes de invocar nuestro `initialise()`, pero
+llamaba después a `shutdown()`. El código anterior desreferenciaba
+incondicionalmente `audioDevice_` tras resetear los demás owners.
+
+La corrección mantiene VitaDAW en 0.5.0. El cierre portable se basa en owners
+presentes y cubre inicialización completa, fallo antes/después del adapter,
+adapter sin ventana, ventana con adapter activo, retirada de callback antes de
+destruir el receptor, doble shutdown y fallo de startup. La secuencia validada
+es: timer fuera, callback retirado, dispositivo/RT aquietado, ventana,
+dispatcher, aplicación y adapter. Excepciones de construcción se diagnostican
+con la fase alcanzada, fijan retorno de error y convergen en el mismo cierre.
+Un fallo normal al abrir el dispositivo no aborta la UI: queda diagnosticado y
+se muestra el aviso existente fuera de RT.
+
+Se reprodujo además el camino original ejecutando una segunda copia mientras la
+primera permanecía abierta. La salida fue:
+
+```text
+Another instance is running - quitting...
+[VitaDAW lifecycle] shutdown entered from phase: not started
+[VitaDAW lifecycle] partial/idempotent shutdown completed
+```
+
+El proceso terminó con código 0 y no apareció un crash report nuevo.
 
 ## Smoke test nativo
 
@@ -126,6 +157,14 @@ durante Play. Stop devolvió la posición a 0. Save As creó
 reapertura y Load, la vista volvió al origen, sin selección ni historial, y
 reconstruyó los dos clips en 0–3 s y 4,553–6,666 s. Replay, Stop y segundo cierre
 fueron correctos.
+
+Tras la corrección de lifecycle se abrió exactamente
+`build/vitadaw_app_artefacts/Debug/VitaDAW.app` tres veces, con cierre normal
+entre ciclos. En las tres inspecciones visuales posteriores a recompilar se
+observó la UI 0.5.0 con Timeline, `Altavoces del MacBook Air`, 48.000 Hz, buffer
+de 512 frames, 0 entradas y 2 salidas. Las tres aperturas permanecieron activas,
+los cierres finalizaron sin crash y la reapertura fue correcta. No se generó
+ningún informe `VitaDAW` posterior al binario recompilado.
 
 Split se comprobó extremo a extremo en la suite portable usando la misma acción
 `selected Clip + playhead` y el Command System. No pudo ejecutarse manualmente en

@@ -1198,6 +1198,35 @@ No hay Seek formal, waveform, snapping musical, multiselección, context menu,
 fades, clip gain, tempo grid ni edición durante Play. El culling sigue siendo
 lineal sobre clips ordenados, suficiente para el objetivo probado de 1000 clips.
 
+### Lifecycle nativo y cierre parcial
+
+`moreThanOneInstanceAllowed()` devuelve false. En JUCE 9, una segunda instancia
+puede hacer que `JUCEApplicationBase::initialiseApp()` retorne antes de invocar
+`VitaDawJuceApplication::initialise()`, pero `JUCEApplicationBase::main()` llama
+igualmente a `shutdownApp()`. Por tanto, `shutdown()` no implica que exista
+ningún owner.
+
+La fase de startup es solo diagnóstico. La autoridad de cleanup es la presencia
+de los `unique_ptr`, de modo que cualquier prefijo de construcción es un estado
+válido. `ApplicationShutdown` ejecuta esta secuencia:
+
+```
+stop Timer/event producers
+-> clear device state callback while adapter and receiver still live
+-> shutdown audio adapter and quiesce its RT callback
+-> destroy MainWindow
+-> destroy CommandDispatcher
+-> destroy DawApplication (non-owning reference to adapter)
+-> destroy JuceAudioDeviceAdapter
+```
+
+La segunda llamada solo repite el `stopTimer()` idempotente. El cierre del
+adaptador también es idempotente. El callback de estado captura la aplicación
+JUCE y consulta `mainWindow_`; se retira antes de que la ventana pueda morir.
+`MainWindow::content_` es únicamente un observador: `DocumentWindow` posee el
+componente entregado mediante `setContentOwned()` y lo sustituye de forma
+síncrona. No se añade logging al hilo de audio.
+
 ## Evolución hasta 0.5.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,

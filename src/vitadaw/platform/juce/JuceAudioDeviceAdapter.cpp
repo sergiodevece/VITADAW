@@ -127,6 +127,10 @@ void JuceAudioDeviceAdapter::setStateChangedCallback(StateChangedCallback callba
     publishState();
 }
 
+void JuceAudioDeviceAdapter::clearStateChangedCallback() noexcept {
+    stateChangedCallback_ = nullptr;
+}
+
 audio::AudioFilePreparationResult JuceAudioDeviceAdapter::prepareWav(
     const std::filesystem::path& filePath) {
     return prepareWavForProject(filePath, 0);

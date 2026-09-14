@@ -2,15 +2,58 @@
 #include "vitadaw/commands/CommandDispatcher.h"
 #include "vitadaw/platform/juce/JuceAudioDeviceAdapter.h"
 #include "vitadaw/platform/juce/MainWindow.h"
+#include "vitadaw/platform/lifecycle/ApplicationShutdown.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <array>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace vitadaw::platform::juce_adapter {
+
+namespace {
+
+enum class StartupPhase {
+    notStarted,
+    creatingAudioAdapter,
+    audioAdapterCreated,
+    applicationCreated,
+    windowCreated,
+    running,
+    failed,
+    shutDown,
+};
+
+[[nodiscard]] const char* phaseName(StartupPhase phase) noexcept {
+    switch (phase) {
+    case StartupPhase::notStarted:
+        return "not started";
+    case StartupPhase::creatingAudioAdapter:
+        return "creating audio adapter";
+    case StartupPhase::audioAdapterCreated:
+        return "audio adapter created";
+    case StartupPhase::applicationCreated:
+        return "application/session created";
+    case StartupPhase::windowCreated:
+        return "main window created";
+    case StartupPhase::running:
+        return "running";
+    case StartupPhase::failed:
+        return "startup failed";
+    case StartupPhase::shutDown:
+        return "shut down";
+    }
+    return "unknown";
+}
+
+void logLifecycle(const juce::String& message) {
+    juce::Logger::writeToLog("[VitaDAW lifecycle] " + message);
+}
+
+} // namespace
 
 class VitaDawJuceApplication final : public juce::JUCEApplication,
                                      private juce::Timer {
@@ -30,112 +73,149 @@ public:
     void initialise(const juce::String& commandLine) override {
         static_cast<void>(commandLine);
 
-        audioDevice_ = std::make_unique<JuceAudioDeviceAdapter>();
-        const auto audioInitialised = audioDevice_->initialise();
-        const auto deviceState = audioDevice_->state();
-        const auto projectSampleRate = timeline::SampleRate{
-            deviceState.status == audio::AudioDeviceStatus::active
-                ? deviceState.info.sampleRate
-                : 48000.0};
+        phase_ = StartupPhase::creatingAudioAdapter;
+        logLifecycle("startup begun");
+        try {
+            audioDevice_ = std::make_unique<JuceAudioDeviceAdapter>();
+            phase_ = StartupPhase::audioAdapterCreated;
+            const auto audioInitialised = audioDevice_->initialise();
+            const auto deviceState = audioDevice_->state();
+            if (audioInitialised) {
+                logLifecycle("audio device initialised: " +
+                             juce::String(deviceState.info.outputDeviceName));
+            } else {
+                logLifecycle("audio device unavailable: " +
+                             juce::String(deviceState.errorMessage));
+            }
+            const auto projectSampleRate = timeline::SampleRate{
+                deviceState.status == audio::AudioDeviceStatus::active
+                    ? deviceState.info.sampleRate
+                    : 48000.0};
 
-        dawApplication_ = std::make_unique<application::DawApplication>(
-            *audioDevice_, projectSampleRate);
-        commandDispatcher_ =
-            std::make_unique<commands::CommandDispatcher>(*dawApplication_);
-        const std::array trackNames{"Snare", "Kick", "Guitar", "Stereo 4"};
-        for (std::size_t index = 0; index < trackNames.size(); ++index) {
+            dawApplication_ = std::make_unique<application::DawApplication>(
+                *audioDevice_, projectSampleRate);
+            commandDispatcher_ =
+                std::make_unique<commands::CommandDispatcher>(*dawApplication_);
+            phase_ = StartupPhase::applicationCreated;
+            const std::array trackNames{"Snare", "Kick", "Guitar", "Stereo 4"};
+            for (std::size_t index = 0; index < trackNames.size(); ++index) {
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddAudioTrack{
+                        trackNames[index],
+                        index == 3 ? media::AudioChannelLayout::stereo
+                                   : media::AudioChannelLayout::mono}));
+            }
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddAudioTrack{
-                    trackNames[index],
-                    index == 3 ? media::AudioChannelLayout::stereo
-                               : media::AudioChannelLayout::mono}));
-        }
-        static_cast<void>(commandDispatcher_->dispatch(
-            commands::AddBus{"Drum Bus"}));
-        static_cast<void>(commandDispatcher_->dispatch(
-            commands::AddBus{"Music Bus"}));
-        static_cast<void>(commandDispatcher_->dispatch(
-            commands::AddBus{"Plate Bus"}));
-        static_cast<void>(commandDispatcher_->dispatch(
-            commands::AddBus{"Parallel Bus"}));
-        static_cast<void>(commandDispatcher_->dispatch(
-            commands::AddBus{"Room Bus"}));
-        const auto& tracks = dawApplication_->project().tracks();
-        const auto& buses = dawApplication_->project().routing().buses();
-        if (tracks.size() >= 3 && buses.size() >= 5) {
+                commands::AddBus{"Drum Bus"}));
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::SetTrackOutputDestination{
-                    tracks[0].id,
-                    routing::TrackOutputDestination::toBus(buses[0].id)}));
+                commands::AddBus{"Music Bus"}));
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::SetTrackOutputDestination{
-                    tracks[1].id,
-                    routing::TrackOutputDestination::toBus(buses[0].id)}));
+                commands::AddBus{"Plate Bus"}));
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::SetTrackOutputDestination{
-                    tracks[2].id,
-                    routing::TrackOutputDestination::toBus(buses[1].id)}));
+                commands::AddBus{"Parallel Bus"}));
             static_cast<void>(commandDispatcher_->dispatch(
-                commands::SetBusOutputDestination{
-                    buses[0].id,
-                    routing::OutputDestination::toBus(buses[1].id)}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddTrackSend{
-                    tracks[0].id, buses[2].id,
-                    routing::SendTapPoint::preFaderPrePan,
-                    mixer::GainDb{-6.0F}}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBusSend{
-                    buses[0].id, buses[3].id,
-                    routing::SendTapPoint::preFaderPrePan,
-                    mixer::GainDb{-6.0F}}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBusSend{
-                    buses[1].id, buses[4].id,
-                    routing::SendTapPoint::postFaderPostPan,
-                    mixer::GainDb{-6.0F}}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddProcessor{
-                    tracks[0].id,
-                    {processors::internalGainProcessorType}}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddProcessor{
-                    buses[0].id,
-                    {processors::internalGainProcessorType}}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddProcessor{
-                    processors::MasterTarget{},
-                    {processors::internalGainProcessorType}}));
-        }
-        mainWindow_ = std::make_unique<MainWindow>(
-            audioDevice_->state(), *commandDispatcher_, *dawApplication_);
-        mainWindow_->setTransportState(dawApplication_->transport(),
-                                       dawApplication_->project().sampleRate());
-        mainWindow_->setMeterState(dawApplication_->meterSnapshot());
-        audioDevice_->setStateChangedCallback(
-            [this](const audio::AudioDeviceState& state) {
-                if (mainWindow_ != nullptr) {
-                    mainWindow_->setAudioDeviceState(state);
-                }
-            });
-        startTimerHz(30);
+                commands::AddBus{"Room Bus"}));
+            const auto& tracks = dawApplication_->project().tracks();
+            const auto& buses = dawApplication_->project().routing().buses();
+            if (tracks.size() >= 3 && buses.size() >= 5) {
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::SetTrackOutputDestination{
+                        tracks[0].id,
+                        routing::TrackOutputDestination::toBus(buses[0].id)}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::SetTrackOutputDestination{
+                        tracks[1].id,
+                        routing::TrackOutputDestination::toBus(buses[0].id)}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::SetTrackOutputDestination{
+                        tracks[2].id,
+                        routing::TrackOutputDestination::toBus(buses[1].id)}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::SetBusOutputDestination{
+                        buses[0].id,
+                        routing::OutputDestination::toBus(buses[1].id)}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddTrackSend{
+                        tracks[0].id, buses[2].id,
+                        routing::SendTapPoint::preFaderPrePan,
+                        mixer::GainDb{-6.0F}}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddBusSend{
+                        buses[0].id, buses[3].id,
+                        routing::SendTapPoint::preFaderPrePan,
+                        mixer::GainDb{-6.0F}}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddBusSend{
+                        buses[1].id, buses[4].id,
+                        routing::SendTapPoint::postFaderPostPan,
+                        mixer::GainDb{-6.0F}}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddProcessor{
+                        tracks[0].id,
+                        {processors::internalGainProcessorType}}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddProcessor{
+                        buses[0].id,
+                        {processors::internalGainProcessorType}}));
+                static_cast<void>(commandDispatcher_->dispatch(
+                    commands::AddProcessor{
+                        processors::MasterTarget{},
+                        {processors::internalGainProcessorType}}));
+            }
+            mainWindow_ = std::make_unique<MainWindow>(
+                audioDevice_->state(), *commandDispatcher_, *dawApplication_);
+            phase_ = StartupPhase::windowCreated;
+            mainWindow_->setTransportState(
+                dawApplication_->transport(),
+                dawApplication_->project().sampleRate());
+            mainWindow_->setMeterState(dawApplication_->meterSnapshot());
+            audioDevice_->setStateChangedCallback(
+                [this](const audio::AudioDeviceState& state) {
+                    if (mainWindow_ != nullptr) {
+                        mainWindow_->setAudioDeviceState(state);
+                    }
+                });
+            startTimerHz(30);
+            phase_ = StartupPhase::running;
+            logLifecycle("startup completed");
 
-        if (!audioInitialised) {
-            juce::AlertWindow::showMessageBoxAsync(
-                juce::MessageBoxIconType::WarningIcon,
-                "Audio device unavailable",
-                "VitaDAW could not initialise the default audio output device:\n" +
-                    juce::String(audioDevice_->state().errorMessage));
+            if (!audioInitialised) {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::MessageBoxIconType::WarningIcon,
+                    "Audio device unavailable",
+                    "VitaDAW could not initialise the default audio output device:\n" +
+                        juce::String(audioDevice_->state().errorMessage));
+            }
+        } catch (const std::exception& exception) {
+            const auto failedDuring = phase_;
+            phase_ = StartupPhase::failed;
+            logLifecycle("startup failed during " +
+                         juce::String(phaseName(failedDuring)) + ": " +
+                         juce::String(exception.what()));
+            setApplicationReturnValue(1);
+            quit();
+        } catch (...) {
+            const auto failedDuring = phase_;
+            phase_ = StartupPhase::failed;
+            logLifecycle("startup failed during " +
+                         juce::String(phaseName(failedDuring)) +
+                         ": unknown exception");
+            setApplicationReturnValue(1);
+            quit();
         }
     }
 
     void shutdown() override {
-        stopTimer();
-        mainWindow_.reset();
-        commandDispatcher_.reset();
-        dawApplication_.reset();
-        audioDevice_->setStateChangedCallback({});
-        audioDevice_.reset();
+        const auto phaseAtEntry = phase_;
+        logLifecycle("shutdown entered from phase: " +
+                     juce::String(phaseName(phaseAtEntry)));
+        lifecycle::shutdownApplicationOwners(
+            audioDevice_, mainWindow_, commandDispatcher_, dawApplication_,
+            [this] { stopTimer(); });
+        phase_ = StartupPhase::shutDown;
+        logLifecycle(phaseAtEntry == StartupPhase::running
+                         ? "normal shutdown completed"
+                         : "partial/idempotent shutdown completed");
     }
 
     void systemRequestedQuit() override {
@@ -144,7 +224,8 @@ public:
 
 private:
     void timerCallback() override {
-        if (dawApplication_ == nullptr || mainWindow_ == nullptr) {
+        if (audioDevice_ == nullptr || dawApplication_ == nullptr ||
+            mainWindow_ == nullptr) {
             return;
         }
 
@@ -159,6 +240,7 @@ private:
     std::unique_ptr<application::DawApplication> dawApplication_;
     std::unique_ptr<commands::CommandDispatcher> commandDispatcher_;
     std::unique_ptr<MainWindow> mainWindow_;
+    StartupPhase phase_{StartupPhase::notStarted};
 };
 
 } // namespace vitadaw::platform::juce_adapter

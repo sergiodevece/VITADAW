@@ -31,6 +31,7 @@ public:
     void pollDeviceLifecycle();
     [[nodiscard]] const audio::AudioDeviceState& state() const noexcept;
     void setStateChangedCallback(StateChangedCallback callback);
+    void clearStateChangedCallback() noexcept;
 
     [[nodiscard]] audio::AudioFilePreparationResult prepareWav(
         const std::filesystem::path& file) override;

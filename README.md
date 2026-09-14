@@ -75,6 +75,15 @@ No existe Seek todavía: la regla solo observa el transporte. Tampoco hay
 waveforms, snapping musical, multiselección ni edición durante Play. Detalles y
 pruebas: [validación 0.5.0](docs/validation-0.5.0.md).
 
+El release blocker de lifecycle de la build Debug 0.5.0 está corregido sin
+cambiar de versión. JUCE puede llamar a `shutdown()` sin haber llamado antes a
+`initialise()` cuando rechaza una segunda instancia. El cierre usa ahora la
+presencia real de cada owner, es idempotente y aplica un orden explícito:
+detener productores de eventos, retirar callbacks, aquietar el dispositivo,
+destruir UI/dispatcher/aplicación y destruir finalmente el adaptador. Los
+diagnósticos distinguen arranque completo, fallo de dispositivo, fallo de
+startup y cierre parcial, siempre fuera del callback RT.
+
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
 usa `48000 Hz` como valor de reserva. No cambia automáticamente si después se

@@ -29,6 +29,8 @@ private:
     application::DawApplication& application_;
     audio::AudioDeviceState audioState_;
     bool rebuildPending_{};
+    // Non-owning observer. DocumentWindow exclusively owns the component passed
+    // to setContentOwned(); this pointer is replaced synchronously on rebuild.
     AudioStatusComponent* content_{};
 };
 

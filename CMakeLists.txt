@@ -230,4 +230,10 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_timeline_ui_foundation_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_timeline_ui_foundation_tests
         COMMAND vitadaw_timeline_ui_foundation_tests)
+
+    add_executable(vitadaw_application_lifecycle_tests
+        tests/ApplicationLifecycleTests.cpp)
+    target_link_libraries(vitadaw_application_lifecycle_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_application_lifecycle_tests
+        COMMAND vitadaw_application_lifecycle_tests)
 endif()
