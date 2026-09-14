@@ -15,7 +15,8 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     projectDuration_ = project.duration;
     trackMixCount_ = std::min(project.tracks.size(), maximumTrackCount);
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
-        legacyTracks_[index] = {project.tracks[index], masterDestinationIndex};
+        legacyTracks_[index] = {project.tracks[index], masterDestinationIndex,
+                                {}, {}};
         legacyOrder_[index] = {ProcessingStepKind::track, index};
         trackMix_[index].reset(project.tracks[index].mix.isValid()
                                    ? project.tracks[index].mix
@@ -25,6 +26,8 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     legacyOrder_[trackMixCount_] = {ProcessingStepKind::master, 0};
     tracks_ = {legacyTracks_.data(), trackMixCount_};
     buses_ = {};
+    sends_ = {};
+    sendIndexById_ = {};
     order_ = {legacyOrder_.data(), trackMixCount_ + 1};
     runtime_ = nullptr;
     blockCapacity_ = defaultProcessingBlockCapacity;
@@ -35,9 +38,11 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
         if (!project.anySolo || project.tracks[index].mix.solo) {
             audibility_.setTrack(index);
+            audibility_.setTrackMeter(index);
         }
     }
     busMixCount_ = 0;
+    sendMixCount_ = 0;
     parameterReadIndex_.store(0, std::memory_order_relaxed);
     parameterWriteIndex_.store(0, std::memory_order_relaxed);
     clock_.prepare(project.duration);
@@ -53,6 +58,8 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
     projectDuration_ = plan.duration;
     tracks_ = plan.tracks;
     buses_ = plan.buses;
+    sends_ = plan.sends;
+    sendIndexById_ = plan.sendIndexById;
     order_ = plan.order;
     runtime_ = &runtime;
     blockCapacity_ = plan.blockCapacity;
@@ -71,6 +78,11 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
                                  : mixer::PreparedBusMixState{});
     }
     busMixCount_ = std::min(buses_.size(), maximumBusCount);
+    sendMixCount_ = std::min(sends_.size(), maximumPreparedSends);
+    for (std::size_t index = 0; index < sendMixCount_ &&
+                                index < runtime.sendMix.size(); ++index) {
+        runtime.sendMix[index].reset(sends_[index].mix);
+    }
     masterMix_.reset(plan.masterMix.isValid()
                          ? plan.masterMix
                          : mixer::PreparedMasterMixState{});
@@ -162,6 +174,23 @@ bool RealtimeAudioEngine::tryUpdateBusMix(
     }
     return enqueueParameter(BusMixCommand{
         static_cast<std::size_t>(found - buses_.begin()), mix, audibility});
+}
+
+bool RealtimeAudioEngine::tryUpdateSendMix(
+    routing::SendId send, mixer::PreparedSendMixState mix) noexcept {
+    if (!send.isValid() || !mix.isValid() || runtime_ == nullptr) {
+        return false;
+    }
+    const auto found = std::lower_bound(
+        sendIndexById_.begin(), sendIndexById_.end(), send,
+        [](const auto& candidate, const auto value) {
+            return candidate.id < value;
+        });
+    if (found == sendIndexById_.end() || found->id != send ||
+        found->denseIndex >= sendMixCount_) {
+        return false;
+    }
+    return enqueueParameter(SendMixCommand{found->denseIndex, mix});
 }
 
 bool RealtimeAudioEngine::tryUpdateMasterMix(
@@ -257,6 +286,13 @@ void RealtimeAudioEngine::consumeParameterCommands(
                     }
                 } else if constexpr (std::is_same_v<T, MasterMixCommand>) {
                     masterMix_.setTarget(value.mix, deviceSampleRate);
+                } else if constexpr (std::is_same_v<T, SendMixCommand>) {
+                    if (runtime_ != nullptr &&
+                        value.sendIndex < sendMixCount_ &&
+                        value.sendIndex < runtime_->sendMix.size()) {
+                        runtime_->sendMix[value.sendIndex].setTarget(
+                            value.mix, deviceSampleRate);
+                    }
                 }
             },
             command);
@@ -314,14 +350,22 @@ void RealtimeAudioEngine::processSubBlock(
             for (std::size_t frame = 0; frame < validFrames; ++frame) {
                 const auto rendered = renderTrackAtProjectPosition(
                     route.source, {positions[frame]}, projectSampleRate_);
-                const auto contribution = applyTrackMixResolved(
-                    rendered, route.source.channelCount,
-                    trackMix_[step.index].next(),
-                    audibility_.trackIsAudible(step.index));
+                const auto mix = trackMix_[step.index].next();
+                const auto preTap = makeTrackPreFaderPrePanTap(
+                    rendered, route.source.channelCount);
+                const auto postTap = makeTrackPostFaderPostPanTap(
+                    rendered, route.source.channelCount, mix);
+                const auto contribution = audibility_.trackIsAudible(step.index)
+                                              ? postTap
+                                              : StereoSample{};
+                const auto meterSample =
+                    audibility_.trackMeterIsAudible(step.index)
+                        ? postTap
+                        : StereoSample{};
                 trackPeaks_[step.index].left = std::max(
-                    trackPeaks_[step.index].left, std::abs(contribution.left));
+                    trackPeaks_[step.index].left, std::abs(meterSample.left));
                 trackPeaks_[step.index].right = std::max(
-                    trackPeaks_[step.index].right, std::abs(contribution.right));
+                    trackPeaks_[step.index].right, std::abs(meterSample.right));
                 if (route.destinationBusIndex == masterDestinationIndex) {
                     masterLeft[frame] += contribution.left;
                     masterRight[frame] += contribution.right;
@@ -330,6 +374,29 @@ void RealtimeAudioEngine::processSubBlock(
                     destination.left[frame] += contribution.left;
                     destination.right[frame] += contribution.right;
                 }
+                const auto distributeSends =
+                    [this, frame](PreparedSendRange range,
+                                  StereoSample tap) noexcept {
+                        for (std::size_t offset = 0; offset < range.count;
+                             ++offset) {
+                            const auto sendIndex = range.first + offset;
+                            const auto& send = sends_[sendIndex];
+                            const auto sendMix =
+                                runtime_->sendMix[send.runtimeIndex].next();
+                            if (sendMix.muted ||
+                                !audibility_.sendIsAudible(sendIndex)) {
+                                continue;
+                            }
+                            auto& destination =
+                                runtime_->buses[send.destinationBusIndex];
+                            destination.left[frame] +=
+                                tap.left * sendMix.linearGain;
+                            destination.right[frame] +=
+                                tap.right * sendMix.linearGain;
+                        }
+                    };
+                distributeSends(route.preFaderSends, preTap);
+                distributeSends(route.postFaderSends, postTap);
             }
         } else if (step.kind == ProcessingStepKind::bus) {
             const auto bufferIndex = buses_[step.index].bufferIndex;
@@ -382,6 +449,11 @@ void RealtimeAudioEngine::advanceSmoothers(std::size_t frameCount) noexcept {
         }
         for (std::size_t index = 0; index < busMixCount_; ++index) {
             static_cast<void>(busMix_[index].next());
+        }
+        if (runtime_ != nullptr) {
+            for (std::size_t index = 0; index < sendMixCount_; ++index) {
+                static_cast<void>(runtime_->sendMix[index].next());
+            }
         }
         static_cast<void>(masterMix_.next());
     }

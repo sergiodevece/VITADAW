@@ -139,6 +139,21 @@ public:
         return true;
     }
 
+    bool tryUpdateSendMix(
+        vitadaw::routing::SendId send,
+        vitadaw::mixer::PreparedSendMixState mix) noexcept override {
+        ++sendMixRequests;
+        const auto found = std::find_if(
+            liveSpecification.sends.begin(), liveSpecification.sends.end(),
+            [send](const auto& candidate) { return candidate.id == send; });
+        if (!acceptMixerRequests || found == liveSpecification.sends.end() ||
+            !mix.isValid()) {
+            return false;
+        }
+        found->mix = mix;
+        return true;
+    }
+
     bool tryUpdateMasterMix(
         vitadaw::mixer::PreparedMasterMixState mix) noexcept override {
         ++masterMixRequests;
@@ -239,6 +254,7 @@ public:
     bool acceptMixerRequests{true};
     int trackMixRequests{};
     int busMixRequests{};
+    int sendMixRequests{};
     int masterMixRequests{};
     vitadaw::audio::PreparedAudibilityState lastAudibility;
     int structuralPrepareRequests{};
@@ -354,6 +370,55 @@ int main() {
               third, routing::OutputDestination::toBus(busB)}).status ==
               commands::CommandStatus::accepted,
           "a sibling source should route directly to the downstream bus");
+
+    check(dispatcher.dispatch(commands::AddTrackSend{
+              {999}, busB, routing::SendTapPoint::preFaderPrePan, {}}).status ==
+              commands::CommandStatus::rejected &&
+              dispatcher.dispatch(commands::AddTrackSend{
+                  first, {999}, routing::SendTapPoint::preFaderPrePan, {}}).status ==
+                  commands::CommandStatus::rejected,
+          "Track Send creation must validate source and destination before commit");
+    check(dispatcher.dispatch(commands::AddTrackSend{
+              first, busB, routing::SendTapPoint::preFaderPrePan,
+              mixer::GainDb{-6.0F}}).status == commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::AddTrackSend{
+                  first, busB, routing::SendTapPoint::postFaderPostPan,
+                  mixer::GainDb{-3.0F}}).status == commands::CommandStatus::accepted &&
+              app.project().routing().sends().size() == 2 &&
+              app.project().routing().sends()[0].id == routing::SendId{1} &&
+              app.project().routing().sends()[1].id == routing::SendId{2} &&
+              audio.liveSpecification.sends.size() == 2,
+          "parallel Track Sends must commit with stable monotonic identities");
+    const auto structuralBeforeSendParameters = audio.structuralPrepareRequests;
+    check(dispatcher.dispatch(commands::SetSendLevel{
+              {1}, mixer::GainDb{-9.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SetSendMute{{1}, true}).status ==
+              commands::CommandStatus::accepted &&
+              audio.sendMixRequests == 2 &&
+              audio.structuralPrepareRequests == structuralBeforeSendParameters &&
+              app.project().findSend({1})->mix ==
+                  mixer::SendMixState{{-9.0F}, true} &&
+              audio.liveSpecification.sends[0].mix ==
+                  mixer::prepare(mixer::SendMixState{{-9.0F}, true}),
+          "send parameters must update RT, persisted specification and model without rebuilding");
+    check(dispatcher.dispatch(commands::SetSendLevel{
+              {1}, mixer::GainDb{std::numeric_limits<float>::infinity()}}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findSend({1})->mix.level == mixer::GainDb{-9.0F},
+          "invalid send level must preserve model and RT state");
+    audio.acceptMixerRequests = false;
+    check(dispatcher.dispatch(commands::SetSendMute{{1}, false}).status ==
+              commands::CommandStatus::rejected &&
+              app.project().findSend({1})->mix.muted,
+          "a rejected send parameter publication must preserve the model");
+    audio.acceptMixerRequests = true;
+    check(dispatcher.dispatch(commands::RemoveSend{{2}}).status ==
+              commands::CommandStatus::accepted &&
+              app.project().routing().sends().size() == 1 &&
+              app.project().routing().sends()[0].id == routing::SendId{1} &&
+              audio.liveSpecification.sends.size() == 1,
+          "removing a send must commit model and prepared specification together");
 
     const auto structuralBeforeBusMix = audio.structuralPrepareRequests;
     check(dispatcher.dispatch(commands::SetBusGain{
@@ -492,6 +557,18 @@ int main() {
               commands::CommandStatus::accepted &&
               audio.structuralPrepareRequests == preparationsWhilePlaying,
           "bus parameters must remain available during playback without a graph rebuild");
+    check(dispatcher.dispatch(commands::SetSendLevel{
+              {1}, mixer::GainDb{-12.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              audio.structuralPrepareRequests == preparationsWhilePlaying,
+          "send level must remain available during playback without rebuilding");
+    check(dispatcher.dispatch(commands::AddTrackSend{
+              first, busA, routing::SendTapPoint::preFaderPrePan, {}}).status ==
+              commands::CommandStatus::rejected &&
+              dispatcher.dispatch(commands::RemoveSend{{1}}).status ==
+                  commands::CommandStatus::rejected &&
+              app.project().routing().sends().size() == 1,
+          "send topology changes must be rejected during playback");
     check(dispatcher.dispatch(commands::SetTrackOutputDestination{
               first, routing::TrackOutputDestination::master()}).status ==
               commands::CommandStatus::rejected &&

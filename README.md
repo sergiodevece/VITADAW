@@ -1,4 +1,4 @@
-# VitaDAW 0.2.2 — Bus-to-Bus Routing DAG
+# VitaDAW 0.2.3 — Track Sends & Auxes
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -8,7 +8,9 @@ plan portable preparado con buses estéreo, destinos de pista y metering de bus.
 El incremento 0.2.1 convierte esos buses en canales funcionales con gain,
 balance, mute, solo y smoothing sample-accurate. VitaDAW 0.2.2 permite que la
 salida principal de un bus alimente otro bus mediante un DAG validado y ordenado
-completamente fuera del hilo de audio.
+completamente fuera del hilo de audio. VitaDAW 0.2.3 añade múltiples sends por
+pista hacia buses existentes, con taps pre/post, nivel suavizado, mute propio y
+Solo resuelto por rama.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -109,9 +111,22 @@ mono usa ley equal-power con `-3 dB` al centro. Para fuentes estéreo, el contro
 actúa como balance equal-power: el centro conserva ambos canales a unity y cada
 extremo atenúa el canal opuesto.
 
-Si no hay solos, contribuyen todas las pistas no muteadas. Si existe al menos
-un solo, contribuyen únicamente pistas en solo y no muteadas; mute siempre tiene
-precedencia. El gain master usa el mismo rango y se aplica después de la suma.
+Cada pista puede conservar varios `SendRoute` además de su salida principal.
+`SendId` es monotónico y estable; el origen portable admite `TrackId` o `BusId`,
+aunque 0.2.3 rechaza explícitamente Bus Sends. Cada Track Send termina en un
+`BusId`: el mismo bus puede recibir outputs principales y sends, por lo que no
+existe una clase Aux distinta.
+
+El tap `PreFaderPrePan` se extrae tras render y antes de gain, pan y mute. Mono
+se centra una sola vez a `x/sqrt(2)` por canal y estéreo conserva L/R. El tap
+`PostFaderPostPan` incluye gain, pan y mute. Después se aplican el permiso Solo
+de la rama, el mute propio y el nivel del send. El pre-send sobrevive a Track
+Mute y al fader en silencio por política explícita de esta versión.
+
+Si no hay solos, todas las rutas quedan abiertas y cada mute actúa localmente.
+Si existe al menos un solo, la aplicación prepara los permisos de las ramas
+seleccionadas y de sus caminos necesarios; mute siempre tiene precedencia
+local. El gain master usa el mismo rango y se aplica después de la suma.
 No existe ya atenuación fija por pista, clamp ni limiter: `float` puede superar
 `[-1, 1]` internamente y una salida física puede recortar si se excede su rango.
 
@@ -129,6 +144,12 @@ alcanza silencio exactamente y no representa una velocidad perceptual constante
 en dB. El paneo interpola los coeficientes equal-power ya preparados, evitando
 trigonometría por muestra; los endpoints cumplen exactamente la pan law, aunque
 el trayecto transitorio no conserva potencia exacta.
+
+Cada Send Level usa el mismo rango de `-100 dB` a `+12 dB` y una rampa lineal
+sample-accurate de 5 ms. El smoother avanza una vez por frame aunque el send
+esté muteado, excluido por Solo o reciba silencio. `SetSendLevel` y
+`SetSendMute` se publican por el ring SPSC durante Play; alta y eliminación son
+cambios estructurales y exigen transporte detenido.
 
 El motor calcula peak absoluto por bloque para cada pista después de gain, pan y
 mute/solo, y para master después del gain master. No hace clamp, por lo que el
@@ -183,6 +204,13 @@ ramas hermanas. Varios solos forman la unión de las selecciones. Mute prevalece
 localmente. La aplicación publica las máscaras densas junto al parámetro, sin
 búsquedas de IDs ni interpretación del grafo en el callback.
 
+Con sends, la resolución prepara permisos independientes para el main output de
+cada pista y para cada send. Track Solo conserva su rama dry y sus auxiliares;
+Bus Solo abre únicamente las rutas que lo alimentan, sin abrir sends laterales;
+Aux Solo produce una escucha wet-only. Las selecciones múltiples forman una
+unión. Después de converger en un bus se procesa una mezcla común: no se intenta
+preservar la procedencia individual de las contribuciones.
+
 La carga tiene dos fases. `prepareWav` realiza y captura fuera de RT cualquier
 operación que puede fallar; `ProjectState` prepara también el nuevo clip y el
 mensaje. El commit detiene el callback, intercambia el recurso, ejecuta el
@@ -227,6 +255,8 @@ La arquitectura y las reglas de tiempo real se describen en
   smoothing y resolución portable de caminos audibles.
 - **0.2.2 — Bus-to-Bus Routing DAG:** salida principal Bus→Bus/Master,
   validación de ciclos, orden topológico y Solo resuelto a través del grafo.
+- **0.2.3 — Track Sends & Auxes:** sends múltiples Track→Bus con taps
+  pre/post, level, mute, smoothing y audibilidad preparada por aristas.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -240,4 +270,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.1.2.md`](docs/validation-0.1.2.md) y
 [`docs/validation-0.2.0.md`](docs/validation-0.2.0.md) y
 [`docs/validation-0.2.1.md`](docs/validation-0.2.1.md) y
-[`docs/validation-0.2.2.md`](docs/validation-0.2.2.md).
+[`docs/validation-0.2.2.md`](docs/validation-0.2.2.md) y
+[`docs/validation-0.2.3.md`](docs/validation-0.2.3.md).

@@ -269,6 +269,23 @@ bool JuceAudioDeviceAdapter::tryUpdateBusMix(
     return true;
 }
 
+bool JuceAudioDeviceAdapter::tryUpdateSendMix(
+    routing::SendId send, mixer::PreparedSendMixState mix) noexcept {
+    if (preparedProject_ == nullptr || !send.isValid() || !mix.isValid()) {
+        return false;
+    }
+    const auto found = std::find_if(
+        preparedProject_->specification.sends.begin(),
+        preparedProject_->specification.sends.end(),
+        [send](const auto& candidate) { return candidate.id == send; });
+    if (found == preparedProject_->specification.sends.end() ||
+        !realtimeEngine_.tryUpdateSendMix(send, mix)) {
+        return false;
+    }
+    found->mix = mix;
+    return true;
+}
+
 bool JuceAudioDeviceAdapter::tryUpdateMasterMix(
     mixer::PreparedMasterMixState mix) noexcept {
     if (!mix.isValid() || !realtimeEngine_.tryUpdateMasterMix(mix)) {

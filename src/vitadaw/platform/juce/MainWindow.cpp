@@ -23,7 +23,7 @@ public:
             auto controls = std::make_unique<TrackControls>();
             controls->track = project.tracks()[index].id;
             controls->name.setText(
-                "Track " + juce::String(static_cast<int>(index + 1)),
+                juce::String(project.tracks()[index].name),
                 juce::NotificationType::dontSendNotification);
             controls->name.setColour(juce::Label::textColourId,
                                      juce::Colours::white);
@@ -187,6 +187,46 @@ public:
             addAndMakeVisible(controls->meter);
             busControls_.push_back(std::move(controls));
         }
+        for (const auto& send : project.routing().sends()) {
+            auto controls = std::make_unique<SendControls>();
+            controls->send = send.id;
+            const auto source = std::get<tracks::TrackId>(send.source);
+            const auto* destination = project.findBus(send.destination);
+            controls->name.setText(
+                "Send " + juce::String(static_cast<int>(send.id.value)) +
+                    " T" + juce::String(static_cast<int>(source.value)) +
+                    " -> " +
+                    (destination != nullptr ? juce::String(destination->name)
+                                            : juce::String{"?"}) +
+                    (send.tapPoint == routing::SendTapPoint::preFaderPrePan
+                         ? " [Pre]"
+                         : " [Post]"),
+                juce::NotificationType::dontSendNotification);
+            controls->name.setColour(juce::Label::textColourId,
+                                     juce::Colours::white);
+            controls->level.setRange(mixer::GainDb::silence,
+                                     mixer::GainDb::maximum, 0.1);
+            controls->level.setValue(
+                send.mix.level.value,
+                juce::NotificationType::dontSendNotification);
+            controls->level.setTextValueSuffix(" dB send");
+            controls->muted.setToggleState(
+                send.mix.muted,
+                juce::NotificationType::dontSendNotification);
+            controls->level.onValueChange = [this, raw = controls.get()] {
+                dispatch(commands::SetSendLevel{
+                    raw->send,
+                    mixer::GainDb{static_cast<float>(raw->level.getValue())}});
+            };
+            controls->muted.onClick = [this, raw = controls.get()] {
+                dispatch(commands::SetSendMute{
+                    raw->send, raw->muted.getToggleState()});
+            };
+            addAndMakeVisible(controls->name);
+            addAndMakeVisible(controls->level);
+            addAndMakeVisible(controls->muted);
+            sendControls_.push_back(std::move(controls));
+        }
         masterGain_.setRange(mixer::GainDb::silence,
                              mixer::GainDb::maximum, 0.1);
         masterGain_.setValue(0.0, juce::NotificationType::dontSendNotification);
@@ -310,6 +350,12 @@ public:
             controls->solo.setBounds(row.removeFromLeft(64));
             controls->meter.setBounds(row);
         }
+        for (auto& controls : sendControls_) {
+            auto row = bounds.removeFromTop(38);
+            controls->name.setBounds(row.removeFromLeft(220));
+            controls->level.setBounds(row.removeFromLeft(220));
+            controls->muted.setBounds(row.removeFromLeft(80));
+        }
         bounds.removeFromTop(8);
         auto masterRow = bounds.removeFromTop(36);
         masterGain_.setBounds(masterRow.removeFromLeft(240));
@@ -351,6 +397,14 @@ private:
         juce::Label meter;
     };
 
+    struct SendControls {
+        routing::SendId send;
+        juce::Label name;
+        juce::Slider level{juce::Slider::LinearHorizontal,
+                           juce::Slider::TextBoxRight};
+        juce::ToggleButton muted{"Send Mute"};
+    };
+
     void chooseWav(tracks::TrackId track) {
         fileChooser_ = std::make_unique<juce::FileChooser>(
             "Select a WAV file", juce::File{}, "*.wav");
@@ -387,6 +441,7 @@ private:
     std::vector<std::unique_ptr<juce::TextButton>> loadButtons_;
     std::vector<std::unique_ptr<TrackControls>> trackControls_;
     std::vector<std::unique_ptr<BusControls>> busControls_;
+    std::vector<std::unique_ptr<SendControls>> sendControls_;
     juce::Slider masterGain_{juce::Slider::LinearHorizontal,
                              juce::Slider::TextBoxRight};
     juce::Label masterMeter_;
@@ -405,7 +460,7 @@ MainWindow::MainWindow(const audio::AudioDeviceState& initialAudioState,
     content_ = new AudioStatusComponent(commandDispatcher, project);
     content_->setAudioDeviceState(initialAudioState);
     setContentOwned(content_, true);
-    centreWithSize(1040, 740);
+    centreWithSize(1040, 900);
     setResizable(true, false);
     setVisible(true);
 }

@@ -101,4 +101,25 @@ private:
     bool solo_{};
 };
 
+class SendMixSmoother {
+public:
+    void reset(mixer::PreparedSendMixState state) noexcept {
+        gain_.reset(state.linearGain);
+        muted_ = state.muted;
+    }
+    void setTarget(mixer::PreparedSendMixState state,
+                   timeline::SampleRate deviceSampleRate) noexcept {
+        gain_.setTarget(state.linearGain, deviceSampleRate,
+                        mixerSmoothingSeconds);
+        muted_ = state.muted;
+    }
+    [[nodiscard]] mixer::PreparedSendMixState next() noexcept {
+        return {gain_.next(), muted_};
+    }
+
+private:
+    LinearSmoother gain_;
+    bool muted_{};
+};
+
 } // namespace vitadaw::audio

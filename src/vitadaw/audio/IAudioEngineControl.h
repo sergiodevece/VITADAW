@@ -97,6 +97,9 @@ public:
         routing::BusId bus,
         mixer::PreparedBusMixState mix,
         PreparedAudibilityState audibility) noexcept = 0;
+    [[nodiscard]] virtual bool tryUpdateSendMix(
+        routing::SendId send,
+        mixer::PreparedSendMixState mix) noexcept = 0;
     [[nodiscard]] virtual bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;

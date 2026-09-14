@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace vitadaw::routing {
@@ -11,6 +12,10 @@ const std::vector<AudioBus>& RoutingState::buses() const noexcept { return buses
 
 const std::vector<TrackRoute>& RoutingState::trackRoutes() const noexcept {
     return trackRoutes_;
+}
+
+const std::vector<SendRoute>& RoutingState::sends() const noexcept {
+    return sends_;
 }
 
 const TrackRoute* RoutingState::findTrackRoute(tracks::TrackId track) const noexcept {
@@ -31,6 +36,13 @@ const AudioBus* RoutingState::findBus(BusId bus) const noexcept {
         buses_.begin(), buses_.end(),
         [bus](const auto& candidate) { return candidate.id == bus; });
     return found == buses_.end() ? nullptr : &*found;
+}
+
+const SendRoute* RoutingState::findSend(SendId send) const noexcept {
+    const auto found = std::find_if(
+        sends_.begin(), sends_.end(),
+        [send](const auto& candidate) { return candidate.id == send; });
+    return found == sends_.end() ? nullptr : &*found;
 }
 
 void RoutingState::addTrack(tracks::TrackId track) {
@@ -97,6 +109,59 @@ bool RoutingState::setTrackDestination(
         return false;
     }
     found->destination = destination;
+    return true;
+}
+
+SendId RoutingState::addSend(SendSource source, BusId destination,
+                             SendTapPoint tapPoint,
+                             mixer::SendMixState mix) {
+    const auto sourceExists = std::visit(
+        [this](const auto id) {
+            using T = std::decay_t<decltype(id)>;
+            if constexpr (std::is_same_v<T, tracks::TrackId>) {
+                return findTrackRoute(id) != nullptr;
+            } else {
+                return containsBus(id);
+            }
+        },
+        source);
+    if (!sourceExists || !containsBus(destination) ||
+        !routing::isValid(tapPoint) || !mix.isValid()) {
+        throw std::invalid_argument{"Invalid send routing state"};
+    }
+    if (!nextSendId_.isValid() ||
+        nextSendId_.value == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error{"Send identity space exhausted"};
+    }
+    const auto id = nextSendId_;
+    sends_.push_back({id, source, destination, tapPoint, mix});
+    ++nextSendId_.value;
+    return id;
+}
+
+bool RoutingState::removeSend(SendId send) noexcept {
+    const auto found = std::find_if(
+        sends_.begin(), sends_.end(),
+        [send](const auto& candidate) { return candidate.id == send; });
+    if (found == sends_.end()) {
+        return false;
+    }
+    sends_.erase(found);
+    return true;
+}
+
+bool RoutingState::setSendMix(SendId send,
+                              mixer::SendMixState mix) noexcept {
+    if (!mix.isValid()) {
+        return false;
+    }
+    const auto found = std::find_if(
+        sends_.begin(), sends_.end(),
+        [send](const auto& candidate) { return candidate.id == send; });
+    if (found == sends_.end()) {
+        return false;
+    }
+    found->mix = mix;
     return true;
 }
 

@@ -52,6 +52,51 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     return {commands::CommandStatus::rejected,
                             "Stereo bus could not be added"};
                 }
+            } else if constexpr (std::is_same_v<T, commands::AddTrackSend>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing cannot change during playback"};
+                }
+                if (!value.level.isValid() ||
+                    !routing::isValid(value.tapPoint)) {
+                    return {commands::CommandStatus::rejected,
+                            "Invalid send level or tap point"};
+                }
+                try {
+                    auto candidate = project_;
+                    const auto id = candidate.addSend(
+                        value.track, value.destination, value.tapPoint,
+                        mixer::SendMixState{value.level, false});
+                    return commitStructuralProject(
+                        std::move(candidate),
+                        "Added track send " + std::to_string(id.value));
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to add send"};
+                } catch (const std::exception&) {
+                    return {commands::CommandStatus::rejected,
+                            "Track send could not be added"};
+                }
+            } else if constexpr (std::is_same_v<T, commands::RemoveSend>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Routing cannot change during playback"};
+                }
+                try {
+                    auto candidate = project_;
+                    if (!candidate.removeSend(value.send)) {
+                        return {commands::CommandStatus::rejected,
+                                "Send does not exist"};
+                    }
+                    return commitStructuralProject(std::move(candidate),
+                                                   "Removed send");
+                } catch (const std::bad_alloc&) {
+                    return {commands::CommandStatus::rejected,
+                            "Not enough memory to remove send"};
+                } catch (...) {
+                    return {commands::CommandStatus::rejected,
+                            "Send could not be removed"};
+                }
             } else if constexpr (std::is_same_v<T, commands::LoadAudioFile>) {
                 const auto* destination = project_.findTrack(value.track);
                 if (destination == nullptr) {
@@ -202,6 +247,32 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 return {commands::CommandStatus::accepted,
                         "Master mixer state updated"};
             } else if constexpr (
+                std::is_same_v<T, commands::SetSendLevel> ||
+                std::is_same_v<T, commands::SetSendMute>) {
+                const auto* send = project_.findSend(value.send);
+                if (send == nullptr) {
+                    return {commands::CommandStatus::rejected,
+                            "Send does not exist"};
+                }
+                auto updated = send->mix;
+                if constexpr (std::is_same_v<T, commands::SetSendLevel>) {
+                    if (!value.level.isValid()) {
+                        return {commands::CommandStatus::rejected,
+                                "Send level must be finite and between -100 and +12 dB"};
+                    }
+                    updated.level = value.level;
+                } else {
+                    updated.muted = value.muted;
+                }
+                if (!audioEngine_.tryUpdateSendMix(
+                        value.send, mixer::prepare(updated))) {
+                    return {commands::CommandStatus::rejected,
+                            "Mixer parameter queue is full"};
+                }
+                static_cast<void>(project_.setSendMix(value.send, updated));
+                return {commands::CommandStatus::accepted,
+                        "Send mixer state updated"};
+            } else if constexpr (
                 std::is_same_v<T, commands::SetBusGain> ||
                 std::is_same_v<T, commands::SetBusPan> ||
                 std::is_same_v<T, commands::SetBusMute> ||
@@ -300,6 +371,11 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
         result.tracks.push_back(
             {track.id, mixer::prepare(track.mix), route->destination});
     }
+    result.sends.reserve(project.routing().sends().size());
+    for (const auto& send : project.routing().sends()) {
+        result.sends.push_back({send.id, send.source, send.destination,
+                                send.tapPoint, mixer::prepare(send.mix)});
+    }
     return result;
 }
 
@@ -347,6 +423,7 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
     const mixer::BusMixState* busMix) const noexcept {
     const auto& tracks = project.tracks();
     const auto& buses = project.routing().buses();
+    const auto& sends = project.routing().sends();
     const auto effectiveTrackMix = [&](const auto& track) -> const auto& {
         return trackMix != nullptr && track.id == overriddenTrack
                    ? *trackMix
@@ -360,11 +437,16 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
         orderedTracks{};
     std::array<const routing::AudioBus*, audio::audibilityBusCapacity>
         orderedBuses{};
+    std::array<const routing::SendRoute*, audio::audibilitySendCapacity>
+        orderedSends{};
     for (std::size_t index = 0; index < tracks.size(); ++index) {
         orderedTracks[index] = &tracks[index];
     }
     for (std::size_t index = 0; index < buses.size(); ++index) {
         orderedBuses[index] = &buses[index];
+    }
+    for (std::size_t index = 0; index < sends.size(); ++index) {
+        orderedSends[index] = &sends[index];
     }
     std::sort(orderedTracks.begin(), orderedTracks.begin() + tracks.size(),
               [](const auto* left, const auto* right) {
@@ -382,10 +464,35 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
         }
         return audio::audibilityMasterDestination;
     };
+    const auto trackIndex = [&](tracks::TrackId id) noexcept {
+        for (std::size_t index = 0; index < tracks.size(); ++index) {
+            if (orderedTracks[index]->id == id) {
+                return index;
+            }
+        }
+        return audio::audibilityTrackCapacity;
+    };
+    std::sort(orderedSends.begin(), orderedSends.begin() + sends.size(),
+              [&trackIndex](const auto* left, const auto* right) {
+                  const auto leftTrack = std::get<tracks::TrackId>(left->source);
+                  const auto rightTrack = std::get<tracks::TrackId>(right->source);
+                  const auto leftIndex = trackIndex(leftTrack);
+                  const auto rightIndex = trackIndex(rightTrack);
+                  if (leftIndex != rightIndex) {
+                      return leftIndex < rightIndex;
+                  }
+                  if (left->tapPoint != right->tapPoint) {
+                      return left->tapPoint ==
+                             routing::SendTapPoint::preFaderPrePan;
+                  }
+                  return left->id < right->id;
+              });
     std::array<audio::AudibilityTrackInput, audio::audibilityTrackCapacity>
         resolvedTracks{};
     std::array<audio::AudibilityBusInput, audio::audibilityBusCapacity>
         resolvedBuses{};
+    std::array<audio::AudibilitySendInput, audio::audibilitySendCapacity>
+        resolvedSends{};
     for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
         const auto& track = *orderedTracks[trackIndex];
         resolvedTracks[trackIndex].solo =
@@ -406,9 +513,18 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
                 busIndex(bus.outputDestination.bus);
         }
     }
+    for (std::size_t index = 0; index < sends.size(); ++index) {
+        const auto& send = *orderedSends[index];
+        const auto source = std::get<tracks::TrackId>(send.source);
+        resolvedSends[index] = {
+            audio::AudibilitySendSourceKind::track,
+            trackIndex(source), busIndex(send.destination),
+            send.tapPoint == routing::SendTapPoint::postFaderPostPan};
+    }
     return audio::resolveAudibility(
         {resolvedTracks.data(), tracks.size()},
-        {resolvedBuses.data(), buses.size()});
+        {resolvedBuses.data(), buses.size()},
+        {resolvedSends.data(), sends.size()});
 }
 
 void DawApplication::synchroniseTransport() noexcept {

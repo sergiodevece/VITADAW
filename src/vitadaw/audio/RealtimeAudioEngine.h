@@ -52,6 +52,8 @@ public:
     [[nodiscard]] bool tryUpdateBusMix(
         routing::BusId bus, mixer::PreparedBusMixState mix,
         PreparedAudibilityState audibility) noexcept;
+    [[nodiscard]] bool tryUpdateSendMix(
+        routing::SendId send, mixer::PreparedSendMixState mix) noexcept;
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept;
     [[nodiscard]] RealtimeTransportSnapshot transportSnapshot() const noexcept;
@@ -83,8 +85,13 @@ private:
     struct MasterMixCommand {
         mixer::PreparedMasterMixState mix;
     };
+    struct SendMixCommand {
+        std::size_t sendIndex{};
+        mixer::PreparedSendMixState mix;
+    };
     using ParameterCommand =
-        std::variant<TrackMixCommand, BusMixCommand, MasterMixCommand>;
+        std::variant<TrackMixCommand, BusMixCommand, MasterMixCommand,
+                     SendMixCommand>;
     static_assert(std::is_trivially_copyable_v<ParameterCommand>);
 
     [[nodiscard]] AudioControlRequestResult enqueue(CommandType type) noexcept;
@@ -107,6 +114,8 @@ private:
     timeline::ProjectFrameCount projectDuration_;
     std::span<const PreparedTrackRoute> tracks_;
     std::span<const PreparedBusNode> buses_;
+    std::span<const PreparedSendDescriptor> sends_;
+    std::span<const PreparedSendIndex> sendIndexById_;
     std::span<const ProcessingStep> order_;
     std::size_t blockCapacity_{defaultProcessingBlockCapacity};
     ProcessingPlanRuntime* runtime_{};
@@ -126,6 +135,7 @@ private:
     std::size_t trackMixCount_{};
     std::array<BusMixSmoother, maximumBusCount> busMix_{};
     std::size_t busMixCount_{};
+    std::size_t sendMixCount_{};
     MasterMixSmoother masterMix_;
     PreparedAudibilityState audibility_;
     std::array<ParameterCommand, parameterCommandCapacity> parameterCommands_{};

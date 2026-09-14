@@ -570,7 +570,66 @@ cadena de buses preparada.
 - La suma no incluye limiter ni clamp y puede superar `[-1, 1]`.
 - El orden y DSP son escalares; no se introduce procesamiento paralelo.
 
-## Evolución hasta 0.2.2
+## Track Sends & Auxes 0.2.3
+
+`RoutingState` conserva `SendRoute` como una rama auxiliar distinta de la salida
+principal. `SendId` es una identidad pública monotónica; `SendSource` puede
+representar `TrackId` o `BusId`; `SendTapPoint` distingue
+`preFaderPrePan` y `postFaderPostPan`; `SendMixState` contiene level y mute.
+0.2.3 ejecuta exclusivamente Track Sends y rechaza Bus Sends con un diagnóstico
+explícito, aunque el validador ya incluye sus aristas al detectar ciclos.
+
+```text
+render original
+    |-> adaptación estéreo -> PRE-FADER/PRE-PAN TAP -> send gate/level -> Bus
+    `-> track gain/pan/mute -> POST-FADER/POST-PAN TAP
+                                  |-> main gate -> destino principal
+                                  `-> send gate/level -> Bus
+```
+
+Una fuente mono produce en el pre-tap `x/sqrt(2)` por canal. El post-path se
+calcula desde el render mono original, evitando aplicar dos veces la atenuación
+central. Track Mute y el fader en silencio no cierran el pre-send; sí cierran el
+main y los post-sends. Send Mute solo afecta a su rama.
+
+`PreparedSendDescriptor` separa `SendId`, índice denso, pista origen, bus
+destino, tap y runtime index. Los descriptors se agrupan en rangos pre/post por
+pista y `ProcessingPlanRuntime` posee un `SendMixSmoother` por send. No existe un
+buffer de audio por send: cada frame calcula los dos taps una vez y acumula cada
+rama directamente en el buffer preparado del bus destino.
+
+La topología estructural es la unión de outputs Bus→Bus y futuras aristas Send
+Bus→Bus. DFS y Kahn consideran incluso sends muteados o a -100 dB; una arista
+silenciosa no puede esconder feedback. Track Sends no cambian el orden porque
+todas las pistas preceden a los buses.
+
+`PreparedAudibilityState` contiene permisos diferentes para main outputs,
+sends, buses de transporte y Track Meter. Track Solo abre dry, sus sends y las
+rutas downstream. Bus Solo selecciona las rutas que lo alimentan sin abrir
+sends laterales; Aux Solo abre sus sends de entrada y queda wet-only. No se
+vuelve a expandir upstream desde buses abiertos solo para transporte. Tras una
+convergencia, el bus contiene una mezcla común y no conserva procedencia.
+
+Send Level y Send Mute son parámetros ligeros publicados por el ring SPSC.
+Level usa el rango -100..+12 dB y smoothing lineal de 5 ms; su smoother avanza
+una vez por frame aunque la rama no sea audible. Crear o eliminar un send es
+estructural y reutiliza preparación candidata y commit con callback quiescente.
+
+La preparación limita el proyecto a 1024 sends totales y 64 por pista. El
+presupuesto incluye descriptors, mapping `SendId`, rangos, smoothers y máscaras
+además de los buffers. Los límites vigentes siguen siendo 256 pistas, 64 buses,
+estéreo y 16 MiB para el plan/runtime portable.
+
+### Límites conscientes de 0.2.3
+
+- Bus Sends se validan estructuralmente pero no se ejecutan.
+- No existen inserts, plugins, PDC, feedback ni automatización.
+- No hay meter por send, solo-safe, PFL, AFL ni multicanal.
+- Mute/Solo y Send Mute son discretos.
+- Los buses suman una mezcla común y no conservan procedencia por rama.
+- No hay limiter ni clamp; varias ramas pueden superar `[-1, 1]`.
+
+## Evolución hasta 0.2.3
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -604,6 +663,8 @@ cadena de buses preparada.
     smoothing y resolución explícita de caminos audibles.
 15. **Completado en 0.2.2:** admitir Bus→Bus como DAG validado, preparar un
     orden topológico determinista y resolver Solo a través de rutas encadenadas.
+16. **Completado en 0.2.3:** distribuir taps pre/post de una pista hacia buses
+    auxiliares, con identidad estable, parámetros RT y Solo por aristas.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

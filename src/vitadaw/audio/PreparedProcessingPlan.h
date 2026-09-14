@@ -16,6 +16,8 @@ namespace vitadaw::audio {
 
 inline constexpr std::size_t maximumPreparedTracks = 256;
 inline constexpr std::size_t maximumPreparedBuses = 64;
+inline constexpr std::size_t maximumPreparedSends = 1024;
+inline constexpr std::size_t maximumPreparedSendsPerTrack = 64;
 inline constexpr std::size_t defaultProcessingBlockCapacity = 512;
 inline constexpr std::size_t defaultProcessingMemoryBudgetBytes =
     16U * 1024U * 1024U;
@@ -23,6 +25,7 @@ inline constexpr std::size_t masterDestinationIndex =
     std::numeric_limits<std::size_t>::max();
 static_assert(maximumPreparedTracks == audibilityTrackCapacity);
 static_assert(maximumPreparedBuses == audibilityBusCapacity);
+static_assert(maximumPreparedSends == audibilitySendCapacity);
 
 struct ProcessingPlanTrackSpecification {
     tracks::TrackId id;
@@ -36,16 +39,46 @@ struct ProcessingPlanBusSpecification {
     routing::OutputDestination destination{routing::OutputDestination::master()};
 };
 
+struct ProcessingPlanSendSpecification {
+    routing::SendId id;
+    routing::SendSource source;
+    routing::BusId destination;
+    routing::SendTapPoint tapPoint{routing::SendTapPoint::postFaderPostPan};
+    mixer::PreparedSendMixState mix;
+};
+
 struct ProcessingPlanSpecification {
     timeline::SampleRate projectSampleRate;
     std::vector<ProcessingPlanTrackSpecification> tracks;
     std::vector<ProcessingPlanBusSpecification> buses;
+    std::vector<ProcessingPlanSendSpecification> sends;
     mixer::PreparedMasterMixState masterMix;
+};
+
+struct PreparedSendRange {
+    std::size_t first{};
+    std::size_t count{};
 };
 
 struct PreparedTrackRoute {
     PreparedTrackView source;
     std::size_t destinationBusIndex{masterDestinationIndex};
+    PreparedSendRange preFaderSends;
+    PreparedSendRange postFaderSends;
+};
+
+struct PreparedSendDescriptor {
+    routing::SendId id;
+    std::size_t sourceTrackIndex{};
+    std::size_t destinationBusIndex{masterDestinationIndex};
+    routing::SendTapPoint tapPoint{routing::SendTapPoint::postFaderPostPan};
+    std::size_t runtimeIndex{};
+    mixer::PreparedSendMixState mix;
+};
+
+struct PreparedSendIndex {
+    routing::SendId id;
+    std::size_t denseIndex{};
 };
 
 struct PreparedBusNode {
@@ -67,6 +100,8 @@ struct PreparedProcessingPlan {
     timeline::ProjectFrameCount duration;
     std::vector<PreparedTrackRoute> tracks;
     std::vector<PreparedBusNode> buses;
+    std::vector<PreparedSendDescriptor> sends;
+    std::vector<PreparedSendIndex> sendIndexById;
     std::vector<ProcessingStep> order;
     std::size_t blockCapacity{};
     std::size_t runtimeMemoryBytes{};
@@ -83,10 +118,12 @@ struct StereoWorkBuffer {
 
 struct ProcessingPlanRuntime {
     std::vector<StereoWorkBuffer> buses;
+    std::vector<SendMixSmoother> sendMix;
     StereoWorkBuffer master;
     std::vector<double> projectPositions;
 
-    ProcessingPlanRuntime(std::size_t busCount, std::size_t capacity);
+    ProcessingPlanRuntime(std::size_t busCount, std::size_t sendCount,
+                          std::size_t capacity);
 };
 
 struct PreparedProcessingBundle {

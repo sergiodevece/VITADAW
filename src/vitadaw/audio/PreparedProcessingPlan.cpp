@@ -6,6 +6,7 @@
 #include <memory>
 #include <new>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -15,13 +16,36 @@ StereoWorkBuffer::StereoWorkBuffer(std::size_t capacity)
     : left(capacity), right(capacity) {}
 
 ProcessingPlanRuntime::ProcessingPlanRuntime(std::size_t busCount,
+                                             std::size_t sendCount,
                                              std::size_t capacity)
-    : master(capacity), projectPositions(capacity) {
+    : sendMix(sendCount), master(capacity), projectPositions(capacity) {
     buses.reserve(busCount);
     for (std::size_t index = 0; index < busCount; ++index) {
         buses.emplace_back(capacity);
     }
 }
+
+namespace {
+
+[[nodiscard]] bool checkedAdd(std::size_t left, std::size_t right,
+                              std::size_t& result) noexcept {
+    if (left > std::numeric_limits<std::size_t>::max() - right) {
+        return false;
+    }
+    result = left + right;
+    return true;
+}
+
+[[nodiscard]] bool checkedMultiply(std::size_t left, std::size_t right,
+                                   std::size_t& result) noexcept {
+    if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+        return false;
+    }
+    result = left * right;
+    return true;
+}
+
+} // namespace
 
 PreparedProcessingBundle::PreparedProcessingBundle(
     PreparedProcessingPlan preparedPlan, ProcessingPlanRuntime preparedRuntime)
@@ -42,24 +66,53 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         if (specification.buses.size() > maximumPreparedBuses) {
             return {nullptr, "Prepared bus capacity exceeded"};
         }
+        if (specification.sends.size() > maximumPreparedSends) {
+            return {nullptr, "Prepared send capacity exceeded"};
+        }
         if (blockCapacity == 0 || !specification.masterMix.isValid()) {
             return {nullptr, "Invalid processing format or master state"};
         }
 
         const auto bufferCount = specification.buses.size() + 1;
         constexpr auto channelCount = std::size_t{2};
-        if (bufferCount > std::numeric_limits<std::size_t>::max() /
-                              (channelCount * sizeof(float))) {
+        std::size_t bufferSampleBytes{};
+        if (!checkedMultiply(bufferCount, channelCount * sizeof(float),
+                             bufferSampleBytes)) {
             return {nullptr, "Processing buffer size overflow"};
         }
-        const auto bytesPerFrame =
-            bufferCount * channelCount * sizeof(float) + sizeof(double);
-        if (blockCapacity >
-            std::numeric_limits<std::size_t>::max() / bytesPerFrame) {
+        std::size_t bytesPerFrame{};
+        if (!checkedAdd(bufferSampleBytes, sizeof(double), bytesPerFrame)) {
             return {nullptr, "Processing buffer size overflow"};
         }
-        const auto runtimeBytes = blockCapacity * bytesPerFrame;
-        if (runtimeBytes > memoryBudgetBytes) {
+        std::size_t preparedBytes{};
+        if (!checkedMultiply(blockCapacity, bytesPerFrame, preparedBytes)) {
+            return {nullptr, "Processing buffer size overflow"};
+        }
+        const auto addPreparedArray = [&preparedBytes](std::size_t count,
+                                                       std::size_t itemSize) {
+            std::size_t bytes{};
+            std::size_t total{};
+            return checkedMultiply(count, itemSize, bytes) &&
+                   checkedAdd(preparedBytes, bytes, total) &&
+                   (preparedBytes = total, true);
+        };
+        const auto stepCount = specification.tracks.size() +
+                               specification.buses.size() + 1;
+        if (!addPreparedArray(specification.tracks.size(),
+                              sizeof(PreparedTrackRoute)) ||
+            !addPreparedArray(specification.buses.size(),
+                              sizeof(PreparedBusNode)) ||
+            !addPreparedArray(specification.sends.size(),
+                              sizeof(PreparedSendDescriptor)) ||
+            !addPreparedArray(specification.sends.size(),
+                              sizeof(PreparedSendIndex)) ||
+            !addPreparedArray(specification.sends.size(),
+                              sizeof(SendMixSmoother)) ||
+            !addPreparedArray(stepCount, sizeof(ProcessingStep)) ||
+            !addPreparedArray(1, sizeof(PreparedAudibilityState))) {
+            return {nullptr, "Prepared processing size overflow"};
+        }
+        if (preparedBytes > memoryBudgetBytes) {
             return {nullptr, "Processing buffers exceed the memory budget"};
         }
 
@@ -81,6 +134,17 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
 
         std::unordered_set<std::uint64_t> trackIds;
         trackIds.reserve(specification.tracks.size());
+        for (const auto& track : specification.tracks) {
+            if (!track.id.isValid() || !track.mix.isValid() ||
+                !track.destination.isValid() ||
+                !trackIds.insert(track.id.value).second) {
+                return {nullptr, "Invalid or duplicate track routing state"};
+            }
+            if (track.destination.kind == routing::DestinationKind::bus &&
+                !busIds.contains(track.destination.bus.value)) {
+                return {nullptr, "Track output destination does not exist"};
+            }
+        }
         std::unordered_set<std::uint64_t> sourceIds;
         sourceIds.reserve(sources.size());
         for (const auto& source : sources) {
@@ -92,13 +156,49 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                 return {nullptr, "Invalid, duplicate, or unknown audio source"};
             }
         }
+
+        std::unordered_set<std::uint64_t> sendIds;
+        sendIds.reserve(specification.sends.size());
+        std::unordered_map<std::uint64_t, std::size_t> sendsPerTrack;
+        sendsPerTrack.reserve(specification.tracks.size());
+        bool containsBusSend{};
+        for (const auto& send : specification.sends) {
+            if (!send.id.isValid() || !send.destination.isValid() ||
+                !busIds.contains(send.destination.value) ||
+                !routing::isValid(send.tapPoint) || !send.mix.isValid() ||
+                !sendIds.insert(send.id.value).second) {
+                return {nullptr, "Invalid or duplicate send routing state"};
+            }
+            if (const auto* track =
+                    std::get_if<tracks::TrackId>(&send.source)) {
+                if (!track->isValid() || !trackIds.contains(track->value)) {
+                    return {nullptr, "Track send source does not exist"};
+                }
+                auto& count = sendsPerTrack[track->value];
+                ++count;
+                if (count > maximumPreparedSendsPerTrack) {
+                    return {nullptr, "Prepared sends-per-track capacity exceeded"};
+                }
+            } else if (const auto* bus =
+                           std::get_if<routing::BusId>(&send.source)) {
+                if (!bus->isValid() || !busIds.contains(bus->value)) {
+                    return {nullptr, "Bus send source does not exist"};
+                }
+                containsBusSend = true;
+            } else {
+                return {nullptr, "Invalid send source"};
+            }
+        }
+
         PreparedProcessingPlan plan;
         plan.projectSampleRate = specification.projectSampleRate;
         plan.blockCapacity = blockCapacity;
-        plan.runtimeMemoryBytes = runtimeBytes;
+        plan.runtimeMemoryBytes = preparedBytes;
         plan.masterMix = specification.masterMix;
         plan.tracks.reserve(specification.tracks.size());
         plan.buses.reserve(specification.buses.size());
+        plan.sends.reserve(specification.sends.size());
+        plan.sendIndexById.reserve(specification.sends.size());
         plan.order.reserve(specification.tracks.size() +
                            specification.buses.size() + 1);
 
@@ -134,6 +234,26 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
         }
 
+        // The structural graph contains main outputs and future Bus Sends. Track
+        // Sends do not add bus-to-bus dependencies because tracks execute first.
+        std::vector<std::vector<std::size_t>> busEdges(plan.buses.size());
+        for (std::size_t index = 0; index < plan.buses.size(); ++index) {
+            if (plan.buses[index].destinationBusIndex != masterDestinationIndex) {
+                busEdges[index].push_back(plan.buses[index].destinationBusIndex);
+            }
+        }
+        for (const auto& send : specification.sends) {
+            if (const auto* sourceBus =
+                    std::get_if<routing::BusId>(&send.source)) {
+                busEdges[denseBusIndex(*sourceBus)].push_back(
+                    denseBusIndex(send.destination));
+            }
+        }
+        for (auto& edges : busEdges) {
+            std::sort(edges.begin(), edges.end());
+            edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        }
+
         // Validate every bus component, including disconnected and empty buses.
         std::vector<std::uint8_t> colours(plan.buses.size());
         std::vector<std::size_t> path;
@@ -142,8 +262,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         const auto visit = [&](auto&& self, std::size_t index) -> bool {
             colours[index] = 1;
             path.push_back(index);
-            const auto destination = plan.buses[index].destinationBusIndex;
-            if (destination != masterDestinationIndex) {
+            for (const auto destination : busEdges[index]) {
                 if (colours[destination] == 1) {
                     const auto beginning = std::find(path.begin(), path.end(), destination);
                     std::ostringstream message;
@@ -170,9 +289,9 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         }
 
         std::vector<std::size_t> busIndegree(plan.buses.size());
-        for (const auto& bus : plan.buses) {
-            if (bus.destinationBusIndex != masterDestinationIndex) {
-                ++busIndegree[bus.destinationBusIndex];
+        for (const auto& edges : busEdges) {
+            for (const auto destination : edges) {
+                ++busIndegree[destination];
             }
         }
         std::vector<bool> busEmitted(plan.buses.size());
@@ -191,10 +310,14 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             }
             busEmitted[selected] = true;
             topologicalBuses.push_back(selected);
-            const auto destination = plan.buses[selected].destinationBusIndex;
-            if (destination != masterDestinationIndex) {
+            for (const auto destination : busEdges[selected]) {
                 --busIndegree[destination];
             }
+        }
+
+        if (containsBusSend) {
+            return {nullptr,
+                    "Bus Sends are structurally validated but not supported in 0.2.3"};
         }
 
         std::vector<std::size_t> trackSpecificationOrder(
@@ -209,11 +332,6 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                   });
         for (const auto specificationIndex : trackSpecificationOrder) {
             const auto& track = specification.tracks[specificationIndex];
-            if (!track.id.isValid() || !track.mix.isValid() ||
-                !track.destination.isValid() ||
-                !trackIds.insert(track.id.value).second) {
-                return {nullptr, "Invalid or duplicate track routing state"};
-            }
             std::size_t destination = masterDestinationIndex;
             if (track.destination.kind == routing::DestinationKind::bus) {
                 destination = denseBusIndex(track.destination.bus);
@@ -244,10 +362,71 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
                         source.clipStart.value + source.clipDuration.value);
                 }
             }
-            plan.tracks.push_back({source, destination});
+            plan.tracks.push_back({source, destination, {}, {}});
             plan.order.push_back(
                 {ProcessingStepKind::track, plan.tracks.size() - 1});
         }
+
+
+        std::vector<std::size_t> sendSpecificationOrder(
+            specification.sends.size());
+        for (std::size_t index = 0; index < sendSpecificationOrder.size();
+             ++index) {
+            sendSpecificationOrder[index] = index;
+        }
+        const auto denseTrackIndex = [&plan](tracks::TrackId id) {
+            const auto found = std::lower_bound(
+                plan.tracks.begin(), plan.tracks.end(), id,
+                [](const auto& track, const auto value) {
+                    return track.source.id < value;
+                });
+            return found != plan.tracks.end() && found->source.id == id
+                       ? static_cast<std::size_t>(found - plan.tracks.begin())
+                       : maximumPreparedTracks;
+        };
+        std::sort(sendSpecificationOrder.begin(), sendSpecificationOrder.end(),
+                  [&specification, &denseTrackIndex](const auto left,
+                                                     const auto right) {
+                      const auto& a = specification.sends[left];
+                      const auto& b = specification.sends[right];
+                      const auto aTrack = denseTrackIndex(
+                          std::get<tracks::TrackId>(a.source));
+                      const auto bTrack = denseTrackIndex(
+                          std::get<tracks::TrackId>(b.source));
+                      if (aTrack != bTrack) {
+                          return aTrack < bTrack;
+                      }
+                      if (a.tapPoint != b.tapPoint) {
+                          return a.tapPoint ==
+                                 routing::SendTapPoint::preFaderPrePan;
+                      }
+                      return a.id < b.id;
+                  });
+        for (const auto specificationIndex : sendSpecificationOrder) {
+            const auto& send = specification.sends[specificationIndex];
+            const auto trackIndex = denseTrackIndex(
+                std::get<tracks::TrackId>(send.source));
+            auto& range = send.tapPoint ==
+                                  routing::SendTapPoint::preFaderPrePan
+                              ? plan.tracks[trackIndex].preFaderSends
+                              : plan.tracks[trackIndex].postFaderSends;
+            if (range.count == 0) {
+                range.first = plan.sends.size();
+            }
+            const auto runtimeIndex = plan.sends.size();
+            plan.sends.push_back({send.id, trackIndex,
+                                  denseBusIndex(send.destination),
+                                  send.tapPoint, runtimeIndex, send.mix});
+            ++range.count;
+        }
+        for (std::size_t index = 0; index < plan.sends.size(); ++index) {
+            plan.sendIndexById.push_back({plan.sends[index].id, index});
+        }
+        std::sort(plan.sendIndexById.begin(), plan.sendIndexById.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.id < right.id;
+                  });
+
         for (const auto index : topologicalBuses) {
             plan.order.push_back({ProcessingStepKind::bus, index});
         }
@@ -256,6 +435,7 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
         std::array<AudibilityTrackInput, maximumPreparedTracks>
             audibilityTracks{};
         std::array<AudibilityBusInput, maximumPreparedBuses> audibilityBuses{};
+        std::array<AudibilitySendInput, maximumPreparedSends> audibilitySends{};
         for (std::size_t index = 0; index < plan.tracks.size(); ++index) {
             audibilityTracks[index] = {
                 plan.tracks[index].destinationBusIndex,
@@ -265,11 +445,24 @@ ProcessingPlanPreparationResult prepareProcessingPlan(
             audibilityBuses[index] = {plan.buses[index].destinationBusIndex,
                                       plan.buses[index].mix.solo};
         }
+        for (std::size_t index = 0; index < plan.sends.size(); ++index) {
+            audibilitySends[index] = {
+                AudibilitySendSourceKind::track,
+                plan.sends[index].sourceTrackIndex,
+                plan.sends[index].destinationBusIndex,
+                plan.sends[index].tapPoint ==
+                    routing::SendTapPoint::postFaderPostPan};
+        }
         plan.audibility = resolveAudibility(
             {audibilityTracks.data(), plan.tracks.size()},
-            {audibilityBuses.data(), plan.buses.size()});
+            {audibilityBuses.data(), plan.buses.size()},
+            {audibilitySends.data(), plan.sends.size()});
 
-        ProcessingPlanRuntime runtime{plan.buses.size(), blockCapacity};
+        ProcessingPlanRuntime runtime{plan.buses.size(), plan.sends.size(),
+                                      blockCapacity};
+        for (std::size_t index = 0; index < plan.sends.size(); ++index) {
+            runtime.sendMix[index].reset(plan.sends[index].mix);
+        }
         return {std::make_unique<PreparedProcessingBundle>(
                     std::move(plan), std::move(runtime)),
                 {}};

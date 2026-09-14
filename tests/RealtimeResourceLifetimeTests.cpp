@@ -195,12 +195,17 @@ int main() {
         {{1}, {}, routing::OutputDestination::toBus({2})});
     routedSpecification.tracks.push_back(
         {{1}, {}, routing::TrackOutputDestination::toBus({1})});
+    routedSpecification.sends.push_back(
+        {{1}, tracks::TrackId{1}, {2},
+         routing::SendTapPoint::preFaderPrePan, {}});
     auto routedPreparation = audio::prepareProcessingPlan(
         routedSpecification, routedSources, 4);
     check(routedPreparation.success() &&
               routedPreparation.prepared->runtime.buses.size() == 2 &&
+              routedPreparation.prepared->runtime.sendMix.size() == 1 &&
+              routedPreparation.prepared->plan.sends.size() == 1 &&
               routedPreparation.prepared->plan.buses[0].destinationBusIndex == 1,
-          "lifetime test must prepare a routed chain and its bus buffers together");
+          "lifetime test must prepare a routed chain, send state and buffers together");
     auto routedOwner = std::make_unique<PreparedPlanOwner>(
         std::move(routedResource), std::move(routedPreparation.prepared),
         planProbe);
@@ -224,20 +229,82 @@ int main() {
         planProbe.activeRealtimeUsers.fetch_sub(1, std::memory_order_acq_rel);
     });
     routedCallbackEntered.acquire();
-    std::thread closeRoutedPlan([&] {
+    LifetimeProbe replacementPlanProbe;
+    auto replacementPlanResource =
+        std::make_unique<InstrumentedResource>(0.3F, replacementPlanProbe);
+    replacementPlanResource->published = true;
+    const std::array replacementPlanSources{view(*replacementPlanResource)};
+    auto replacementSpecification = routedSpecification;
+    replacementSpecification.sends.clear();
+    auto replacementPlanPreparation = audio::prepareProcessingPlan(
+        replacementSpecification, replacementPlanSources, 4);
+    check(replacementPlanPreparation.success() &&
+              replacementPlanPreparation.prepared->plan.sends.empty() &&
+              replacementPlanPreparation.prepared->runtime.sendMix.empty(),
+          "removing a send must prepare a self-contained replacement plan");
+    auto replacementPlanOwner = std::make_unique<PreparedPlanOwner>(
+        std::move(replacementPlanResource),
+        std::move(replacementPlanPreparation.prepared), replacementPlanProbe);
+    std::thread replaceRoutedPlan([&] {
         const std::lock_guard callbackLock{callbackSerialization};
-        engine.configure({timeline::SampleRate{100.0}, {}, {}, {}, false});
+        engine.configure(replacementPlanOwner->processing->plan,
+                         replacementPlanOwner->processing->runtime);
         routedOwner.reset();
     });
     check(planProbe.destructions.load(std::memory_order_acquire) == 0,
-          "plan, bus buffers, and resource must remain alive during RT use");
+          "plan, send runtime, bus buffers, and resource must remain alive during RT use");
     finishRoutedCallback.release();
     routedRealtimeUse.join();
-    closeRoutedPlan.join();
+    replaceRoutedPlan.join();
     check(planProbe.destructions.load(std::memory_order_acquire) == 2 &&
               planProbe.destructionsWhileRealtimeActive.load(
+                  std::memory_order_acquire) == 0 &&
+              replacementPlanProbe.destructions.load(
                   std::memory_order_acquire) == 0,
-          "plan owner and routed resource must be destroyed outside RT");
+          "a plan containing a send must be destroyed only after RT switches to its replacement");
+
+    makeOperational(engine);
+    check(engine.tryRequestPlay().accepted,
+          "replacement plan without the removed send should play");
+    std::array<float, 1> replacementPlanLeft{}, replacementPlanRight{};
+    std::array<float*, 2> replacementPlanChannels{
+        replacementPlanLeft.data(), replacementPlanRight.data()};
+    engine.processBlock(
+        {replacementPlanChannels.data(), replacementPlanChannels.size(), 1},
+        timeline::SampleRate{100.0});
+    check(std::abs(replacementPlanLeft[0] - 0.21213204F) < 1.0e-6F,
+          "the replacement plan must expose no descriptor or contribution from the removed send");
+
+    std::binary_semaphore replacementCallbackEntered{0};
+    std::binary_semaphore finishReplacementCallback{0};
+    std::thread replacementRealtimeUse([&] {
+        const std::lock_guard callbackLock{callbackSerialization};
+        replacementPlanProbe.activeRealtimeUsers.fetch_add(
+            1, std::memory_order_acq_rel);
+        replacementCallbackEntered.release();
+        finishReplacementCallback.acquire();
+        std::array<float, 1> left{}, right{};
+        std::array<float*, 2> channels{left.data(), right.data()};
+        engine.processBlock({channels.data(), channels.size(), left.size()},
+                            timeline::SampleRate{100.0});
+        replacementPlanProbe.activeRealtimeUsers.fetch_sub(
+            1, std::memory_order_acq_rel);
+    });
+    replacementCallbackEntered.acquire();
+    std::thread closeRoutedPlan([&] {
+        const std::lock_guard callbackLock{callbackSerialization};
+        engine.configure({timeline::SampleRate{100.0}, {}, {}, {}, false});
+        replacementPlanOwner.reset();
+    });
+    check(replacementPlanProbe.destructions.load(std::memory_order_acquire) == 0,
+          "closing must retain the replacement plan throughout its final RT region");
+    finishReplacementCallback.release();
+    replacementRealtimeUse.join();
+    closeRoutedPlan.join();
+    check(replacementPlanProbe.destructions.load(std::memory_order_acquire) == 2 &&
+              replacementPlanProbe.destructionsWhileRealtimeActive.load(
+                  std::memory_order_acquire) == 0,
+          "the send-free replacement plan and resource must be destroyed outside RT on close");
 
     std::cout << "All realtime resource lifetime tests passed\n";
     return EXIT_SUCCESS;

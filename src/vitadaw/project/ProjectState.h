@@ -38,6 +38,14 @@ public:
     [[nodiscard]] bool setBusOutputDestination(
         routing::BusId bus,
         routing::OutputDestination destination) noexcept;
+    [[nodiscard]] routing::SendId addSend(
+        routing::SendSource source, routing::BusId destination,
+        routing::SendTapPoint tapPoint, mixer::SendMixState mix);
+    [[nodiscard]] bool removeSend(routing::SendId send) noexcept;
+    [[nodiscard]] bool setSendMix(routing::SendId send,
+                                  mixer::SendMixState mix) noexcept;
+    [[nodiscard]] const routing::SendRoute* findSend(
+        routing::SendId send) const noexcept;
     [[nodiscard]] const tracks::AudioTrack* findTrack(
         tracks::TrackId track) const noexcept;
     [[nodiscard]] const mixer::MasterMixState& masterMix() const noexcept;

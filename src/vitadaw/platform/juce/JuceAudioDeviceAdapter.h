@@ -51,6 +51,9 @@ public:
     [[nodiscard]] bool tryUpdateBusMix(
         routing::BusId bus, mixer::PreparedBusMixState mix,
         audio::PreparedAudibilityState audibility) noexcept override;
+    [[nodiscard]] bool tryUpdateSendMix(
+        routing::SendId send,
+        mixer::PreparedSendMixState mix) noexcept override;
     [[nodiscard]] bool tryUpdateMasterMix(
         mixer::PreparedMasterMixState mix) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;

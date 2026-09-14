@@ -69,6 +69,26 @@ bool ProjectState::setBusOutputDestination(
     return routing_.setBusDestination(bus, destination);
 }
 
+routing::SendId ProjectState::addSend(
+    routing::SendSource source, routing::BusId destination,
+    routing::SendTapPoint tapPoint, mixer::SendMixState mix) {
+    return routing_.addSend(source, destination, tapPoint, mix);
+}
+
+bool ProjectState::removeSend(routing::SendId send) noexcept {
+    return routing_.removeSend(send);
+}
+
+bool ProjectState::setSendMix(routing::SendId send,
+                              mixer::SendMixState mix) noexcept {
+    return routing_.setSendMix(send, mix);
+}
+
+const routing::SendRoute* ProjectState::findSend(
+    routing::SendId send) const noexcept {
+    return routing_.findSend(send);
+}
+
 const tracks::AudioTrack* ProjectState::findTrack(
     tracks::TrackId track) const noexcept {
     const auto found = std::find_if(tracks_.begin(), tracks_.end(),

@@ -60,6 +60,13 @@ struct MasterMixState {
     bool operator==(const MasterMixState&) const = default;
 };
 
+struct SendMixState {
+    GainDb level;
+    bool muted{};
+    [[nodiscard]] bool isValid() const noexcept { return level.isValid(); }
+    bool operator==(const SendMixState&) const = default;
+};
+
 // DSP-ready values. Conversion from dB happens on the application thread.
 struct PreparedTrackMixState {
     static constexpr float maximumLinearGain = 3.981072F;
@@ -128,6 +135,18 @@ struct PreparedBusMixState {
     }
 };
 
+struct PreparedSendMixState {
+    static constexpr float maximumLinearGain =
+        PreparedTrackMixState::maximumLinearGain;
+    float linearGain{1.0F};
+    bool muted{};
+    [[nodiscard]] bool isValid() const noexcept {
+        return std::isfinite(linearGain) && linearGain >= 0.0F &&
+               linearGain <= maximumLinearGain;
+    }
+    bool operator==(const PreparedSendMixState&) const = default;
+};
+
 [[nodiscard]] inline PreparedTrackMixState prepare(
     const TrackMixState& state) noexcept {
     return prepareLinear(state.gain.linear(), state.pan, state.muted,
@@ -146,6 +165,11 @@ struct PreparedBusMixState {
     return {trackEquivalent.linearGain, trackEquivalent.stereoLeft,
             trackEquivalent.stereoRight, trackEquivalent.muted,
             trackEquivalent.solo};
+}
+
+[[nodiscard]] inline PreparedSendMixState prepare(
+    const SendMixState& state) noexcept {
+    return {state.level.linear(), state.muted};
 }
 
 } // namespace vitadaw::mixer
