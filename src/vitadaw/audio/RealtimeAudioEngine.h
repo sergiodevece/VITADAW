@@ -11,6 +11,7 @@
 #include "vitadaw/audio/RealtimeProjectClock.h"
 #include "vitadaw/audio/RealtimeTransportExchange.h"
 #include "vitadaw/audio/TrackMixerProcessing.h"
+#include "vitadaw/transport/TransportReducer.h"
 
 #include <array>
 #include <atomic>
@@ -27,27 +28,38 @@ namespace vitadaw::audio {
 // callback entry. Resources remain owned by the adapter and must outlive this
 // engine's prepared project view.
 class RealtimeAudioEngine final {
+    friend struct TransportTestAccess;
 public:
     static constexpr std::size_t commandCapacity = 8;
+    static constexpr std::size_t pendingCommandCapacity = 2 * (commandCapacity - 1);
     static constexpr std::size_t parameterCommandCapacity = 64;
     static constexpr std::size_t maximumTrackCount = maximumPreparedTracks;
     static constexpr std::size_t maximumBusCount = maximumPreparedBuses;
 
     void configure(PreparedProjectView project) noexcept;
+    // Quiescent/offline preparation for the legacy hardware-free entry point.
+    // A changed device rate must be certified before its first processBlock.
+    [[nodiscard]] bool prepareLegacyDeviceRate(timeline::SampleRate deviceRate) noexcept;
     void configure(const PreparedProcessingPlan& plan,
                    ProcessingPlanRuntime& runtime) noexcept;
     // Called only with a quiescent consumer. The supplied context remains owned
     // off RT and must outlive every callback until the next quiescent swap.
-    void configureTemporalContext(const PreparedTemporalContext* context) noexcept;
+    [[nodiscard]] bool canConfigureTemporalContext(
+        const PreparedTemporalContext* context) const noexcept;
+    bool configureTemporalContext(const PreparedTemporalContext* context) noexcept;
     struct TemporalCheckpoint {
         RealtimeProjectClock::Checkpoint clock;
         bool loopEnabled{};
         bool metronomeEnabled{};
+        bool runUntilStop{};
         MetronomeLevelDb metronomeLevel;
     };
     [[nodiscard]] TemporalCheckpoint temporalCheckpoint() const noexcept;
-    void restoreTemporalCheckpoint(TemporalCheckpoint) noexcept;
+    bool restoreTemporalCheckpoint(TemporalCheckpoint) noexcept;
     void resetTemporalSessionState() noexcept;
+    // Quiescent only. Owners must stay alive until all engine views are retired.
+    void releasePreparedReferences() noexcept;
+    void deviceErrorPreservingTransport() noexcept;
     // Lifecycle transitions may race with the application command producer.
     // Transitions away from operational are invoked only while render is
     // quiescent (JUCE serialises them against its callback).
@@ -87,6 +99,8 @@ public:
         processors::ParameterId parameter, float preparedValue,
         std::uint32_t frameOffset = 0) noexcept;
     [[nodiscard]] RealtimeTransportSnapshot transportSnapshot() const noexcept;
+    // Single application producer only. Confirmed snapshot plus bounded pure replay.
+    [[nodiscard]] RealtimeTransportSnapshot projectedTransportSnapshot() noexcept;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
 
     void processBlock(AudioBlockView output,
@@ -146,6 +160,11 @@ private:
     [[nodiscard]] AudioControlRequestResult enqueue(
         CommandType type, timeline::ProjectFramePosition target = {},
         float value = 0.0F) noexcept;
+    void refreshTransportProjection() noexcept;
+    [[nodiscard]] transport::TransportReductionPolicy
+    transportReductionPolicy() const noexcept;
+    void commitTransportProjection(
+        const transport::TransportReduction&, AudioCommandSequence) noexcept;
     void consumeCommands() noexcept;
     void consumeParameterCommands(
         timeline::SampleRate deviceSampleRate) noexcept;
@@ -157,16 +176,14 @@ private:
     void distributeSends(PreparedSendRange range, StereoSample tap,
                          std::size_t frame) noexcept;
     void processSubBlock(AudioBlockView output, std::size_t outputOffset,
-                         std::size_t frameCount,
-                         timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept;
-    void prepareMetronomeEvents(double segmentStart, double segmentEnd,
-                                std::size_t frameCount,
-                                timeline::ProjectFrameDuration increment) noexcept;
+                         std::size_t frameCount) noexcept;
+    void prepareMetronomeEvents(const DspFramePosition* positions,
+                               std::size_t frameCount) noexcept;
     [[nodiscard]] float renderMetronomeSample(std::size_t frame) noexcept;
     void clearMetronomeRuntime() noexcept;
     void processLegacySubBlock(
         AudioBlockView output, std::size_t outputOffset,
-        std::size_t validFrames, const double* positions) noexcept;
+        std::size_t validFrames, const DspFramePosition* positions) noexcept;
     struct ProcessedNodeBlock {
         float* left{};
         float* right{};
@@ -182,7 +199,6 @@ private:
 
     timeline::SampleRate projectSampleRate_;
     timeline::ProjectFrameCount projectDuration_;
-    std::atomic<std::int64_t> maximumSeekFrame_{};
     std::span<const PreparedTrackRoute> tracks_;
     std::span<const PreparedBusNode> buses_;
     std::span<const PreparedSendDescriptor> sends_;
@@ -200,14 +216,24 @@ private:
     std::array<ProcessingStep, maximumTrackCount + 1> legacyOrder_{};
     std::array<float, defaultProcessingBlockCapacity> legacyMasterLeft_{};
     std::array<float, defaultProcessingBlockCapacity> legacyMasterRight_{};
-    std::array<double, defaultProcessingBlockCapacity> legacyPositions_{};
+    std::array<DspFramePosition, defaultProcessingBlockCapacity> legacyPositions_{};
     RealtimeProjectClock clock_;
+    exact::ClockFormat baseClockFormat_;
     RealtimeTransportExchange transportExchange_;
     std::array<QueuedCommand, commandCapacity> commands_{};
     std::atomic<std::size_t> commandWriteIndex_{};
     std::atomic<std::size_t> commandReadIndex_{};
     CommandLifecycleGate lifecycleGate_;
     std::atomic<AudioCommandSequence> lastResolvedCommandSequence_{};
+    // Single-producer projection: resolved RT snapshot plus accepted commands
+    // which have not yet been observed as resolved.
+    transport::TransportState projectedTransport_;
+    AudioCommandSequence projectedTransportSequence_{};
+    transport::TransportBoundaryFacts projectedBoundaries_;
+    std::array<QueuedCommand, pendingCommandCapacity> pendingCommands_{};
+    std::size_t pendingCommandCount_{};
+    bool projectedLoopEnabled_{};
+    RealtimeTransportSnapshot projectionBase_;
     std::array<TrackMixSmoother, maximumTrackCount> trackMix_{};
     std::size_t trackMixCount_{};
     std::array<BusMixSmoother, maximumBusCount> busMix_{};
@@ -241,8 +267,7 @@ private:
     std::size_t metronomeEventCount_{};
     bool pendingMetronomeEvent_{};
     bool pendingMetronomeAccent_{};
-    std::atomic<bool> requestedLoopEnabled_{};
-    std::atomic<bool> requestedMetronomeEnabled_{};
+    bool pendingMetronomeWrap_{};
 };
 
 } // namespace vitadaw::audio

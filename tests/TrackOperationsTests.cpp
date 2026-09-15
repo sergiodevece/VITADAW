@@ -95,23 +95,27 @@ public:
     audio::AudioControlRequestResult tryRequestPlay() noexcept override {
         snapshot.playback = transport::PlaybackState::playing;
         snapshot.lastProcessedCommandSequence = ++sequence;
-        return {true, sequence};
+        return {true, sequence, audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
     audio::AudioControlRequestResult tryRequestPause() noexcept override {
         snapshot.playback = transport::PlaybackState::paused;
         snapshot.lastProcessedCommandSequence = ++sequence;
-        return {true, sequence};
+        return {true, sequence, audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
     audio::AudioControlRequestResult tryRequestStop() noexcept override {
         snapshot.playback = transport::PlaybackState::stopped;
         snapshot.lastProcessedCommandSequence = ++sequence;
-        return {true, sequence};
+        return {true, sequence, audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
     audio::AudioControlRequestResult tryRequestSeek(
         timeline::ProjectFramePosition position) noexcept override {
         snapshot.position = position;
         snapshot.lastProcessedCommandSequence = ++sequence;
-        return {true, sequence};
+        return {true, sequence, audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
     audio::AudioControlRequestResult trySetLoopEnabled(bool enabled) noexcept override {
         snapshot.loopEnabled = enabled;

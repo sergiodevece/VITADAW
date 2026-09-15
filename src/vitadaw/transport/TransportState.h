@@ -35,8 +35,10 @@ struct TransportState {
         playback = PlaybackState::stopped;
     }
 
-    void seek(timeline::ProjectFramePosition target) noexcept {
-        position = {std::clamp(target.value, std::int64_t{0}, duration.value)};
+    [[nodiscard]] bool seek(timeline::ProjectFramePosition target) noexcept {
+        if (!timeline::isSupportedProjectFramePosition(target)) return false;
+        position = target;
+        return true;
     }
 
     void synchronise(PlaybackState state,

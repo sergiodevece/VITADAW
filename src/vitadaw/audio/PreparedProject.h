@@ -4,6 +4,7 @@
 #include "vitadaw/tracks/AudioTrack.h"
 #include "vitadaw/mixer/MixerState.h"
 #include "vitadaw/media/AudioSource.h"
+#include "vitadaw/audio/ExactTemporal.h"
 
 #include <array>
 #include <cmath>
@@ -36,6 +37,10 @@ struct PreparedClipView {
     double projectEnd{};
     double sourceOffset{};
     double sourceFramesPerProjectFrame{};
+    // Exact prepared local duration; projectEnd is a conservative search bound.
+    double projectLength{};
+    exact::SourceMapping exactSource;
+    std::int64_t exactStart{};
 
     [[nodiscard]] bool isValid() const noexcept {
         return id.isValid() && std::isfinite(projectStart) &&
@@ -64,6 +69,7 @@ struct PreparedTrackView {
     timeline::ProjectFrameCount clipDuration;
     timeline::SourceFrameCount sourceOffset;
     mixer::PreparedTrackMixState mix;
+    exact::SourceMapping exactSource;
 
     [[nodiscard]] bool isAvailable() const noexcept {
         return id.isValid() && channelCount > 0 && channelCount <= channels.size() &&

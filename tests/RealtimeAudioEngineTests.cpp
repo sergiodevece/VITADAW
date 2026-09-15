@@ -41,6 +41,7 @@ void render(vitadaw::audio::RealtimeAudioEngine& engine,
 
 void enterOperational(vitadaw::audio::RealtimeAudioEngine& engine,
                       double deviceRate) {
+    check(engine.prepareLegacyDeviceRate(vitadaw::timeline::SampleRate{deviceRate}), "prepare exact device format");
     engine.deviceInitialising();
     std::array<float*, 0> noChannels{};
     engine.processBlock({noChannels.data(), 0, 0},
@@ -118,9 +119,14 @@ void transportNavigationTests() {
     render(engine, left, right, 5.0);
     check(engine.transportSnapshot().position.value == 0,
           "second Stop must rewind without a timing heuristic");
-    check(!engine.tryRequestSeek({-1}).accepted &&
-              !engine.tryRequestSeek({6}).accepted,
-          "Seek must reject negative and beyond-end positions");
+    check(!engine.tryRequestSeek({-1}).accepted,
+          "Seek must reject negative positions");
+    check(engine.tryRequestSeek({6}).accepted,
+          "Seek beyond content remains a valid timeline position");
+    render(engine, left, right, 5.0);
+    check(engine.transportSnapshot().position.value == 6 &&
+              engine.transportSnapshot().duration.value == 5,
+          "out-of-content navigation must not extend content duration");
     check(engine.tryRequestSeek({5}).accepted, "contentEnd is a valid Seek boundary");
     render(engine, left, right, 5.0);
     check(engine.tryRequestPlay().accepted, "Play at contentEnd should enqueue");
@@ -174,6 +180,7 @@ int main() {
     check(!ended.playing && ended.position.value == ended.duration.value,
           "offline production processBlock should stop at the exclusive end");
 
+    check(engine.prepareLegacyDeviceRate(timeline::SampleRate{4.0}), "changed device rate is prepared before callback");
     check(engine.tryRequestPlay().accepted,
           "Play after natural end should be accepted");
     std::vector<float> variableA(1), variableB(1);

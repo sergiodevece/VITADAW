@@ -96,6 +96,7 @@ public:
     [[nodiscard]] audio::AudioControlRequestResult trySetMetronomeLevel(
         audio::MetronomeLevelDb) noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
+    [[nodiscard]] audio::RealtimeTransportSnapshot projectedTransportSnapshot() noexcept override;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
 
 private:
@@ -117,9 +118,10 @@ private:
     struct PreparedJuceProcessingPlan;
 
     void closeDevice(bool publishClosedState) noexcept;
+    void beginDeviceReinitialisation() noexcept;
     void refreshState();
     void publishState();
-    void detachAudioCallback() noexcept;
+    void detachAudioCallback(bool preserveTransport = false) noexcept;
     void attachAudioCallback(bool preserveTransport = false);
     void configureRealtimeEngine() noexcept;
     [[nodiscard]] bool prepareProjectPlan(
@@ -127,7 +129,6 @@ private:
         const audio::ProcessingPlanSpecification& specification,
         std::string& errorMessage);
     [[nodiscard]] bool reprepareForCurrentDevice(std::string& errorMessage);
-    [[nodiscard]] bool reprepareTemporalForCurrentDevice(std::string& errorMessage);
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
         audio::AudioFileCommitAction modelCommit,

@@ -3,6 +3,7 @@
 #include "vitadaw/audio/AudibilityState.h"
 #include "vitadaw/audio/MixerSmoother.h"
 #include "vitadaw/audio/PreparedProject.h"
+#include "vitadaw/audio/DspFramePosition.h"
 #include "vitadaw/processors/IAudioProcessor.h"
 #include "vitadaw/routing/RoutingState.h"
 
@@ -172,12 +173,13 @@ struct ProcessingStep {
 };
 
 struct PreparedProcessingPlan {
+    exact::ClockFormat exactClock;
     timeline::SampleRate projectSampleRate;
     timeline::ProjectFrameCount duration;
     std::vector<PreparedTrackRoute> tracks;
     std::vector<PreparedSourceView> sources;
     std::vector<PreparedClipView> clips;
-    std::vector<double> clipPrefixMaximumEnd;
+    std::vector<std::int64_t> clipPrefixMaximumEnd;
     std::vector<PreparedBusNode> buses;
     std::vector<PreparedSendDescriptor> sends;
     std::vector<PreparedSendIndex> sendIndexById;
@@ -193,6 +195,19 @@ struct PreparedProcessingPlan {
     PreparedLatencyRange masterOutputLatency;
     PreparedAudibilityState audibility;
 };
+
+[[nodiscard]] inline bool processingPlanSupportsClock(
+    const PreparedProcessingPlan& plan, exact::ClockFormat clock) noexcept {
+    if (!clock.valid) return false;
+    for (const auto& clip : plan.clips)
+        if (!exact::sourceMappingSupportsPhaseDenominator(
+                clip.exactSource, clock.denominator)) return false;
+    for (const auto& track : plan.tracks)
+        if (track.source.isAvailable() &&
+            !exact::sourceMappingSupportsPhaseDenominator(
+                track.source.exactSource, clock.denominator)) return false;
+    return true;
+}
 
 struct StereoWorkBuffer {
     std::vector<float> left;
@@ -236,7 +251,7 @@ struct ProcessingPlanRuntime {
     std::vector<StereoWorkBuffer> buses;
     std::vector<SendMixSmoother> sendMix;
     StereoWorkBuffer master;
-    std::vector<double> projectPositions;
+    std::vector<DspFramePosition> projectPositions;
     std::vector<ProcessorNodeScratch> processorScratch;
     std::vector<ProcessorRuntime> processors;
 

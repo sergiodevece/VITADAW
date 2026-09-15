@@ -465,23 +465,15 @@ bool ProjectState::setMasterMix(mixer::MasterMixState state) noexcept {
 }
 
 timeline::ProjectFrameCount ProjectState::duration() const noexcept {
-    long double preciseEnd{};
+    std::int64_t exclusiveEnd{};
     for (const auto& track : tracks_) {
         for (const auto& clip : track.clips) {
-            preciseEnd = std::max(
-                preciseEnd,
-                static_cast<long double>(clip.projectStart.value) +
-                    static_cast<long double>(clip.duration.value));
+            const auto end = timeline::checkedExclusiveProjectEnd(clip.projectStart, clip.duration);
+            if (!end) return {std::numeric_limits<std::int64_t>::max()};
+            exclusiveEnd = std::max(exclusiveEnd, end->value);
         }
     }
-    if (!(preciseEnd > 0.0L)) {
-        return {};
-    }
-    const auto limit = static_cast<long double>(
-        std::numeric_limits<std::int64_t>::max());
-    return {preciseEnd >= limit
-                ? std::numeric_limits<std::int64_t>::max()
-                : static_cast<std::int64_t>(std::ceil(preciseEnd))};
+    return {exclusiveEnd};
 }
 
 bool ProjectState::validateClip(

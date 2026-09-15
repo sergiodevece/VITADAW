@@ -39,7 +39,10 @@ public:
     }
 
     // Called only by the single producer while it owns an active claim.
-    // Sequence zero is reserved as the failure sentinel. Rather than wrapping,
+    // This counter identifies reservations, not consecutive accepted actions.
+    // Closure may expose a rejected reservation through its watermark. Only a
+    // successful tryAccept introduces an action in the accepted history.
+    // Ticket zero is reserved as the failure sentinel. Rather than wrapping,
     // the practically inexhaustible 64-bit space closes to further commands.
     [[nodiscard]] AudioCommandSequence reserveSequence(
         const EnqueueClaim& claim) noexcept {
@@ -93,6 +96,8 @@ public:
             std::memory_order_acquire));
 
         const auto next = nextSequence_.load(std::memory_order_acquire);
+        // An accepted reservation happens-before this load. A rejected one need
+        // not: it may be included or absent, with no unresolved accepted action.
         return {generationOf(desired), next == 0 ? 0 : next - 1};
     }
 

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <cmath>
 
 namespace vitadaw::timeline {
 
@@ -63,14 +65,44 @@ private:
     double hertz_{};
 };
 
+// Compatibility ceiling retained by 0.6.0. Exact DSP preparation certifies its
+// arithmetic independently; this is not the conceptual end of the timeline.
+[[nodiscard]] constexpr ProjectFramePosition maximumSupportedProjectFrame()
+    noexcept {
+    return {(std::int64_t{1} << 53) - 1};
+}
+[[nodiscard]] constexpr bool isSupportedProjectFramePosition(
+    ProjectFramePosition position) noexcept {
+    return position.value >= 0 &&
+           position.value <= maximumSupportedProjectFrame().value;
+}
+
+// Compare without adding a small DSP residue to an absolute double locator.
+// Near a boundary the whole-part difference is small and preserves the residue;
+// far away its rounding cannot change the sign of the comparison.
+[[nodiscard]] inline double distanceToProjectBoundary(
+    ProjectFramePosition position, double phase, double boundary) noexcept {
+    if (!std::isfinite(boundary) || boundary < 0.0 ||
+        boundary > static_cast<double>(maximumSupportedProjectFrame().value))
+        return boundary - static_cast<double>(position.value) - phase;
+    const auto whole = static_cast<std::int64_t>(std::floor(boundary));
+    return static_cast<double>(whole - position.value) +
+           ((boundary - static_cast<double>(whole)) - phase);
+}
+
 [[nodiscard]] Seconds sourceFramesToSeconds(SourceFrameCount frames,
                                             SampleRate sourceSampleRate) noexcept;
+// ceil(integer start + local duration), without rounding an absolute sum.
+[[nodiscard]] std::optional<ProjectFramePosition> checkedExclusiveProjectEnd(
+    ProjectFramePosition start, ProjectFrameDuration duration) noexcept;
 [[nodiscard]] Seconds sourcePositionToSeconds(SourceFramePosition position,
                                               SampleRate sourceSampleRate) noexcept;
 [[nodiscard]] Seconds projectFramesToSeconds(ProjectFrameCount frames,
                                              SampleRate projectSampleRate) noexcept;
 [[nodiscard]] Seconds projectPositionToSeconds(ProjectFramePosition position,
                                                SampleRate projectSampleRate) noexcept;
+[[nodiscard]] std::optional<Seconds> checkedProjectPositionToSeconds(
+    ProjectFramePosition position, SampleRate projectSampleRate) noexcept;
 [[nodiscard]] ProjectFrameCount secondsToProjectFrames(
     Seconds seconds,
     SampleRate projectSampleRate) noexcept;

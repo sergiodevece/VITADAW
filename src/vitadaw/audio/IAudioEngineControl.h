@@ -208,6 +208,9 @@ public:
     [[nodiscard]] virtual bool tryUpdateProcessorParameter(
         processors::ProcessorInstanceId,
         processors::ParameterId, float, float) noexcept { return false; }
+    // An accepted transport request must include the engine-owned projected
+    // playback/position after all earlier accepted requests. Application/UI
+    // mirrors are consumers of that projection, never admission authorities.
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPause() noexcept { return {}; }
     [[nodiscard]] virtual AudioControlRequestResult tryRequestStop() noexcept = 0;
@@ -218,6 +221,9 @@ public:
     [[nodiscard]] virtual AudioControlRequestResult trySetMetronomeLevel(
         MetronomeLevelDb) noexcept { return {}; }
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;
+    [[nodiscard]] virtual RealtimeTransportSnapshot projectedTransportSnapshot() noexcept {
+        return transportSnapshot();
+    }
     [[nodiscard]] virtual mixer::MeterSnapshot meterSnapshot() const noexcept = 0;
 };
 

@@ -104,6 +104,59 @@ if(VITADAW_BUILD_APP)
 endif()
 
 if(VITADAW_BUILD_TESTS)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_executable(vitadaw_temporal_integer_oracle tests/TemporalIntegerOracleDriver.cpp)
+    target_link_libraries(vitadaw_temporal_integer_oracle PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_temporal_integer_oracle
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/TemporalIntegerOracleTests.py
+                $<TARGET_FILE:vitadaw_temporal_integer_oracle>)
+    add_executable(vitadaw_temporal_portable_oracle tests/TemporalIntegerOracleDriver.cpp)
+    target_link_libraries(vitadaw_temporal_portable_oracle PRIVATE vitadaw_core)
+    target_compile_definitions(vitadaw_temporal_portable_oracle PRIVATE VITADAW_FORCE_PORTABLE_TEMPORAL=1)
+    add_test(NAME vitadaw_temporal_portable_oracle
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/TemporalIntegerOracleTests.py
+                $<TARGET_FILE:vitadaw_temporal_portable_oracle>)
+    if(NOT MSVC)
+        add_executable(vitadaw_temporal_fastmath_oracle tests/TemporalIntegerOracleDriver.cpp)
+        target_link_libraries(vitadaw_temporal_fastmath_oracle PRIVATE vitadaw_core)
+        target_compile_options(vitadaw_temporal_fastmath_oracle PRIVATE -O2 -ffast-math -ffp-contract=fast)
+        add_test(NAME vitadaw_temporal_fastmath_oracle
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/TemporalIntegerOracleTests.py
+                    $<TARGET_FILE:vitadaw_temporal_fastmath_oracle>)
+    endif()
+    add_executable(vitadaw_musical_preparation_oracle
+        tests/MusicalPreparationOracleDriver.cpp
+        src/vitadaw/musical/MusicalTime.cpp
+        src/vitadaw/timeline/Time.cpp)
+    target_include_directories(vitadaw_musical_preparation_oracle PRIVATE src)
+    target_compile_features(vitadaw_musical_preparation_oracle PRIVATE cxx_std_20)
+    add_test(NAME vitadaw_musical_preparation_oracle
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/MusicalPreparationOracleTests.py
+                $<TARGET_FILE:vitadaw_musical_preparation_oracle>)
+    add_executable(vitadaw_musical_preparation_portable_oracle
+        tests/MusicalPreparationOracleDriver.cpp
+        src/vitadaw/musical/MusicalTime.cpp
+        src/vitadaw/timeline/Time.cpp)
+    target_include_directories(vitadaw_musical_preparation_portable_oracle PRIVATE src)
+    target_compile_features(vitadaw_musical_preparation_portable_oracle PRIVATE cxx_std_20)
+    target_compile_definitions(vitadaw_musical_preparation_portable_oracle PRIVATE
+        VITADAW_FORCE_PORTABLE_TEMPORAL=1)
+    add_test(NAME vitadaw_musical_preparation_portable_oracle
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/MusicalPreparationOracleTests.py
+                $<TARGET_FILE:vitadaw_musical_preparation_portable_oracle>)
+    if(NOT MSVC)
+        add_executable(vitadaw_musical_preparation_fastmath_oracle
+            tests/MusicalPreparationOracleDriver.cpp
+            src/vitadaw/musical/MusicalTime.cpp
+            src/vitadaw/timeline/Time.cpp)
+        target_include_directories(vitadaw_musical_preparation_fastmath_oracle PRIVATE src)
+        target_compile_features(vitadaw_musical_preparation_fastmath_oracle PRIVATE cxx_std_20)
+        target_compile_options(vitadaw_musical_preparation_fastmath_oracle PRIVATE
+            -O2 -ffast-math -ffp-contract=fast)
+        add_test(NAME vitadaw_musical_preparation_fastmath_oracle
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/MusicalPreparationOracleTests.py
+                    $<TARGET_FILE:vitadaw_musical_preparation_fastmath_oracle>)
+    endif()
     add_executable(vitadaw_loop_metronome_tests tests/LoopMetronomeTests.cpp)
     target_link_libraries(vitadaw_loop_metronome_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_loop_metronome_tests COMMAND vitadaw_loop_metronome_tests)
@@ -125,6 +178,17 @@ if(VITADAW_BUILD_TESTS)
         target_compile_definitions(vitadaw_project_media_integration_tests PRIVATE
             JUCE_USE_FLAC=0 JUCE_USE_MP3AUDIOFORMAT=0 JUCE_USE_OGGVORBIS=0 JUCE_USE_CURL=0)
         add_test(NAME vitadaw_project_media_integration_tests COMMAND vitadaw_project_media_integration_tests)
+        add_executable(vitadaw_temporal_juce_integration_tests
+            tests/TemporalJuceIntegrationTests.cpp
+            src/vitadaw/platform/juce/JuceAudioDeviceAdapter.cpp)
+        target_link_libraries(vitadaw_temporal_juce_integration_tests PRIVATE vitadaw_core
+            juce::juce_audio_devices juce::juce_audio_formats)
+        target_compile_definitions(vitadaw_temporal_juce_integration_tests PRIVATE
+            JUCE_USE_FLAC=0 JUCE_USE_MP3AUDIOFORMAT=0 JUCE_USE_OGGVORBIS=0 JUCE_USE_CURL=0)
+        foreach(case bootstrap lifetime checkpoint rollback run_until_stop)
+            add_test(NAME vitadaw_temporal_juce_${case}
+                COMMAND vitadaw_temporal_juce_integration_tests ${case})
+        endforeach()
     endif()
     add_executable(vitadaw_undo_redo_tests tests/UndoRedoTests.cpp)
     target_link_libraries(vitadaw_undo_redo_tests PRIVATE vitadaw_core)
@@ -259,6 +323,12 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_editing_transport_hardening_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_editing_transport_hardening_tests
         COMMAND vitadaw_editing_transport_hardening_tests)
+
+    add_executable(vitadaw_transport_timeline_foundation_tests
+        tests/TransportTimelineFoundationTests.cpp)
+    target_link_libraries(vitadaw_transport_timeline_foundation_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_transport_timeline_foundation_tests
+        COMMAND vitadaw_transport_timeline_foundation_tests)
 
     add_executable(vitadaw_application_lifecycle_tests
         tests/ApplicationLifecycleTests.cpp)

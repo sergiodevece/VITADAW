@@ -111,14 +111,45 @@ Result<std::unique_ptr<const PreparedMusicalTimeMap>> PreparedMusicalTimeMap::co
     if (!rate.isValid()) return {{}, Error::invalidSampleRate};
     if (auto e = map.validate(); e != Error::none) return {{}, e};
     if (map.tempo.events.size() * sizeof(PreparedTempoSegment) +
+        map.tempo.events.size() * sizeof(PreparedExactTempoSegment) +
         map.signatures.events.size() * sizeof(PreparedTimeSignatureSegment) +
         (2 * map.tempo.events.size() - 1) * sizeof(TempoLookupNode) > memoryBudget)
         return {{}, Error::capacityExceeded};
     auto out = std::unique_ptr<PreparedMusicalTimeMap>{new PreparedMusicalTimeMap};
     out->rate_ = rate; out->revision_ = revision;
-    out->tempos_.reserve(map.tempo.events.size()); out->signatures_.reserve(map.signatures.events.size());
+    out->tempos_.reserve(map.tempo.events.size());
+    out->exactTempos_.reserve(map.tempo.events.size());
+    out->signatures_.reserve(map.signatures.events.size());
     double seconds = 0, compensation = 0;
     for (const auto& e : map.tempo.events) {
+        if (out->exactDspCertified_) {
+            audio::exact::Position exactAnchor{};
+            if (!out->exactTempos_.empty()) {
+                const auto& previous = out->exactTempos_.back();
+                exactAnchor = previous.framesFromStart.at(
+                    static_cast<std::uint64_t>(e.tick.value - previous.startTick.value));
+                if (exactAnchor.frame < 0 ||
+                    static_cast<std::uint64_t>(exactAnchor.frame) > audio::exact::maximumFrame)
+                    out->exactDspCertified_ = false;
+            }
+            const auto projectPerBpm = audio::exact::rateRatioForPreparation(
+                rate.hertz(), e.bpm.value);
+            audio::exact::UInt256 tickDenominator;
+            if (!projectPerBpm.valid ||
+                audio::exact::shiftLeft(audio::exact::wide(projectPerBpm.denominator),
+                                        8, tickDenominator)) {
+                out->exactDspCertified_ = false;
+            }
+            if (out->exactDspCertified_) {
+                const auto framesPerTick = audio::exact::reduceForPreparation(
+                    audio::exact::wide(projectPerBpm.numerator), tickDenominator);
+                const auto exactSegment = audio::exact::linearMappingForPreparation(
+                    exactAnchor, framesPerTick);
+                if (!exactSegment.valid) out->exactDspCertified_ = false;
+                else out->exactTempos_.push_back({e.tick, exactSegment});
+            }
+            if (!out->exactDspCertified_) out->exactTempos_.clear();
+        }
         if (!out->tempos_.empty()) {
             const auto& p = out->tempos_.back();
             const auto delta = static_cast<double>(e.tick.value - p.startTick.value) / ppq * p.secondsPerQuarter;
@@ -129,6 +160,14 @@ Result<std::unique_ptr<const PreparedMusicalTimeMap>> PreparedMusicalTimeMap::co
             seconds = next;
         }
         out->tempos_.push_back({e.tick, {static_cast<double>(e.tick.value) / ppq}, {seconds}, e.bpm, 60.0 / e.bpm.value});
+    }
+    if (out->exactDspCertified_) {
+        const auto& last = out->exactTempos_.back();
+        if (last.framesFromStart.at(static_cast<std::uint64_t>(
+                maximumCoordinate - last.startTick.value)).frame < 0) {
+            out->exactDspCertified_ = false;
+            out->exactTempos_.clear();
+        }
     }
     out->gridTempoIndex_.reserve(2 * out->tempos_.size() - 1);
     auto buildIndex = [&](auto&& self, std::size_t begin, std::size_t end) -> std::uint32_t {
@@ -158,9 +197,32 @@ Result<std::unique_ptr<const PreparedMusicalTimeMap>> PreparedMusicalTimeMap::co
         }
         const auto beat = ppq * 4 / e.signature.denominator;
         out->signatures_.push_back({e.bar, {tick}, e.signature, beat, beat * e.signature.numerator});
-        if (!out->preciseProjectFrameAt({static_cast<double>(tick) / ppq})) return {{}, Error::conversionOverflow};
+        if (out->exactDspCertified_) {
+            if (!out->exactProjectFrameAtTick({tick}))
+                return {{}, Error::conversionOverflow};
+        } else if (!out->preciseProjectFrameAt(
+                       {static_cast<double>(tick) / ppq})) {
+            return {{}, Error::conversionOverflow};
+        }
     }
     return {std::move(out), {}};
+}
+Result<audio::exact::Position> PreparedMusicalTimeMap::exactProjectFrameAtTick(
+    MusicalTickPosition tick) const noexcept {
+    if (tick.value < 0 || tick.value > maximumCoordinate ||
+        !exactDspCertified_ || exactTempos_.empty())
+        return {{}, Error::outOfRange};
+    const auto found = std::upper_bound(
+        exactTempos_.begin(), exactTempos_.end(), tick.value,
+        [](std::int64_t value, const PreparedExactTempoSegment& segment) {
+            return value < segment.startTick.value;
+        });
+    const auto& segment = found == exactTempos_.begin() ? *found : *std::prev(found);
+    const auto result = segment.framesFromStart.at(
+        static_cast<std::uint64_t>(tick.value - segment.startTick.value));
+    if (result.frame < 0 || static_cast<std::uint64_t>(result.frame) > audio::exact::maximumFrame)
+        return {{}, Error::conversionOverflow};
+    return {result, {}};
 }
 Result<timeline::Seconds> PreparedMusicalTimeMap::secondsAt(QuarterNotePosition q) const noexcept {
     if (!coordinate(q.value * ppq)) return {{}, Error::outOfRange};

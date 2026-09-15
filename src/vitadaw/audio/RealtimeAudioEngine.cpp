@@ -61,7 +61,12 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     parameterWriteIndex_.store(0, std::memory_order_relaxed);
     planGeneration_.fetch_add(1, std::memory_order_acq_rel);
     clock_.prepare(project.duration);
-    configureTemporalContext(temporalContext_);
+    if (!prepareLegacyDeviceRate(project.projectSampleRate)) {
+        deviceError();
+        return;
+    }
+    if (!configureTemporalContext(temporalContext_))
+        static_cast<void>(configureTemporalContext(nullptr));
     clearMeters();
     publishMeters();
     publishTransport();
@@ -113,82 +118,127 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
     planGeneration_.fetch_add(1, std::memory_order_acq_rel);
     resetProcessors();
     clock_.prepare(plan.duration);
-    configureTemporalContext(temporalContext_);
+    baseClockFormat_ = plan.exactClock;
+    static_cast<void>(clock_.prepareFormat(plan.exactClock));
+    if (!configureTemporalContext(temporalContext_))
+        static_cast<void>(configureTemporalContext(nullptr));
     clearMeters();
     publishMeters();
     publishTransport();
 }
 
-void RealtimeAudioEngine::configureTemporalContext(
+bool RealtimeAudioEngine::canConfigureTemporalContext(
+    const PreparedTemporalContext* context) const noexcept {
+    const auto format = context ? context->exactClock : baseClockFormat_;
+    if (!format.valid) return false;
+    if (context && (context->projectSampleRate != projectSampleRate_ ||
+                    context->deviceSampleRate != processingFormat_.sampleRate))
+        return false;
+    if (plan_ && !processingPlanSupportsClock(*plan_, format)) return false;
+    if (!plan_) {
+        for (std::size_t index = 0; index < trackMixCount_; ++index) {
+            const auto& source = legacyTracks_[index].source;
+            if (source.isAvailable() &&
+                !exact::sourceMappingSupportsPhaseDenominator(
+                    source.exactSource, format.denominator)) return false;
+        }
+    }
+    exact::ProjectPhase certificate;
+    if (!certificate.installPreparedFormat(format)) return false;
+    const auto checkpoint = clock_.checkpoint();
+    return certificate.restore({{checkpoint.position.value, checkpoint.phase}});
+}
+
+bool RealtimeAudioEngine::configureTemporalContext(
     const PreparedTemporalContext* context) noexcept {
+    if (!plan_ && context &&
+        processingFormat_.sampleRate != context->deviceSampleRate &&
+        !prepareLegacyDeviceRate(context->deviceSampleRate)) return false;
+    if (!canConfigureTemporalContext(context)) return false;
+    const auto format = context ? context->exactClock : baseClockFormat_;
+    if (!clock_.prepareFormat(format)) return false;
     temporalContext_ = context;
     loopEnabled_ = loopEnabled_ && temporalContext_ != nullptr &&
                    temporalContext_->loop.has_value();
-    requestedLoopEnabled_.store(loopEnabled_, std::memory_order_release);
-    requestedMetronomeEnabled_.store(metronomeEnabled_, std::memory_order_release);
     const auto loop = loopEnabled_ && temporalContext_->loop
-        ? std::optional<RealtimeProjectClock::LoopBounds>{{
-              temporalContext_->loop->start.value,
-              temporalContext_->loop->end.value}}
+        ? std::optional<RealtimeProjectClock::LoopBounds>{temporalContext_->loop->clockBounds}
         : std::nullopt;
     clock_.setPlaybackPolicy(loop, metronomeEnabled_ && !loop);
-    clock_.setNavigationLimit(temporalContext_ != nullptr && temporalContext_->loop
-        ? timeline::ProjectFrameCount{static_cast<std::int64_t>(
-              std::ceil(temporalContext_->loop->end.value))}
-        : clock_.duration());
-    maximumSeekFrame_.store(clock_.playbackLimit().value,
-                            std::memory_order_release);
     clearMetronomeRuntime();
     metronomeLevelSmoother_.reset(prepareMetronomeLevel(metronomeLevel_));
     publishTransport();
+    return true;
+}
+
+bool RealtimeAudioEngine::prepareLegacyDeviceRate(timeline::SampleRate deviceRate) noexcept {
+    if (runtime_ != nullptr) return processingFormat_.sampleRate == deviceRate;
+    const auto baseFormat = exact::clockForPreparation(projectSampleRate_.hertz(), deviceRate.hertz());
+    if (!baseFormat.valid) return false;
+    const auto format = temporalContext_ &&
+                                temporalContext_->projectSampleRate == projectSampleRate_ &&
+                                temporalContext_->deviceSampleRate == deviceRate
+                            ? temporalContext_->exactClock : baseFormat;
+    if (!format.valid) return false;
+    std::array<exact::SourceMapping, maximumTrackCount> mappings;
+    for (std::size_t i = 0; i < trackMixCount_; ++i) {
+        const auto& track = legacyTracks_[i].source;
+        if (!track.isAvailable()) continue;
+        mappings[i] = exact::sourceForPreparation(track.sourceSampleRate.hertz(), projectSampleRate_.hertz(),
+            static_cast<double>(track.clipDuration.value), static_cast<double>(track.sourceOffset.value), format);
+        if (!mappings[i].valid) return false;
+    }
+    if (!clock_.prepareFormat(format)) return false;
+    baseClockFormat_ = baseFormat;
+    for (std::size_t i = 0; i < trackMixCount_; ++i) legacyTracks_[i].source.exactSource = mappings[i];
+    processingFormat_.sampleRate = deviceRate;
+    return true;
 }
 
 RealtimeAudioEngine::TemporalCheckpoint
 RealtimeAudioEngine::temporalCheckpoint() const noexcept {
     return {clock_.checkpoint(), loopEnabled_, metronomeEnabled_,
+            clock_.isRunUntilStop(),
             metronomeLevel_};
 }
 
-void RealtimeAudioEngine::restoreTemporalCheckpoint(
+bool RealtimeAudioEngine::restoreTemporalCheckpoint(
     TemporalCheckpoint checkpoint) noexcept {
+    if (!clock_.restoreQuiescentCheckpoint(checkpoint.clock)) return false;
     loopEnabled_ = checkpoint.loopEnabled && temporalContext_ != nullptr &&
                    temporalContext_->loop.has_value();
     metronomeEnabled_ = checkpoint.metronomeEnabled;
     metronomeLevel_ = checkpoint.metronomeLevel;
     const auto loop = loopEnabled_ && temporalContext_->loop
-        ? std::optional<RealtimeProjectClock::LoopBounds>{{
-              temporalContext_->loop->start.value,
-              temporalContext_->loop->end.value}}
+        ? std::optional<RealtimeProjectClock::LoopBounds>{temporalContext_->loop->clockBounds}
         : std::nullopt;
-    clock_.setPlaybackPolicy(loop, metronomeEnabled_ && !loop);
-    clock_.setNavigationLimit(temporalContext_ != nullptr && temporalContext_->loop
-        ? timeline::ProjectFrameCount{static_cast<std::int64_t>(
-              std::ceil(temporalContext_->loop->end.value))}
-        : clock_.duration());
-    maximumSeekFrame_.store(clock_.playbackLimit().value,
-                            std::memory_order_release);
-    clock_.restoreQuiescentCheckpoint(checkpoint.clock);
-    requestedLoopEnabled_.store(loopEnabled_, std::memory_order_release);
-    requestedMetronomeEnabled_.store(metronomeEnabled_, std::memory_order_release);
+    clock_.setPlaybackPolicy(loop, checkpoint.runUntilStop);
     metronomeLevelSmoother_.reset(prepareMetronomeLevel(metronomeLevel_));
     clearMetronomeRuntime();
     publishTransport();
+    return true;
 }
 
 void RealtimeAudioEngine::resetTemporalSessionState() noexcept {
     loopEnabled_ = false;
     metronomeEnabled_ = false;
     metronomeLevel_ = {};
-    requestedLoopEnabled_.store(false, std::memory_order_release);
-    requestedMetronomeEnabled_.store(false, std::memory_order_release);
     clock_.setPlaybackPolicy(std::nullopt, false);
-    clock_.setNavigationLimit(temporalContext_ != nullptr && temporalContext_->loop
-        ? timeline::ProjectFrameCount{static_cast<std::int64_t>(
-              std::ceil(temporalContext_->loop->end.value))}
-        : clock_.duration());
-    maximumSeekFrame_.store(clock_.playbackLimit().value,
-                            std::memory_order_release);
     metronomeLevelSmoother_.reset(prepareMetronomeLevel(metronomeLevel_));
+    clearMetronomeRuntime();
+    publishTransport();
+}
+
+void RealtimeAudioEngine::releasePreparedReferences() noexcept {
+    // Lifecycle publication/reset may still consult the old views here.
+    deviceUnavailable();
+    temporalContext_ = nullptr;
+    configure({projectSampleRate_, {}, {}, {}, false});
+}
+
+void RealtimeAudioEngine::deviceErrorPreservingTransport() noexcept {
+    const auto closure = lifecycleGate_.close(DeviceProcessingState::error);
+    resolveCommandsThrough(closure.cancellationWatermark);
+    resetProcessors();
     clearMetronomeRuntime();
     publishTransport();
 }
@@ -200,8 +250,6 @@ void RealtimeAudioEngine::deviceInitialising() noexcept {
 void RealtimeAudioEngine::deviceInitialisingPreservingTransport() noexcept {
     const auto closure = lifecycleGate_.close(DeviceProcessingState::initializing);
     resolveCommandsThrough(closure.cancellationWatermark);
-    requestedLoopEnabled_.store(loopEnabled_, std::memory_order_release);
-    requestedMetronomeEnabled_.store(metronomeEnabled_, std::memory_order_release);
     resetProcessors();
     clearMetronomeRuntime();
     publishTransport();
@@ -231,8 +279,6 @@ void RealtimeAudioEngine::transitionAwayFromOperational(
     DeviceProcessingState state) noexcept {
     const auto closure = lifecycleGate_.close(state);
     resolveCommandsThrough(closure.cancellationWatermark);
-    requestedLoopEnabled_.store(loopEnabled_, std::memory_order_release);
-    requestedMetronomeEnabled_.store(metronomeEnabled_, std::memory_order_release);
     clock_.stopAndRewind();
     resetProcessors();
     clearMetronomeRuntime();
@@ -240,59 +286,109 @@ void RealtimeAudioEngine::transitionAwayFromOperational(
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestPlay() noexcept {
+    refreshTransportProjection();
     if (deviceState() != DeviceProcessingState::operational ||
         (!hasPreparedAudio() &&
-         !requestedLoopEnabled_.load(std::memory_order_acquire) &&
-         !requestedMetronomeEnabled_.load(std::memory_order_acquire))) {
-        return {};
+         !projectedLoopEnabled_ && !projectionBase_.metronomeEnabled)) {
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
     }
-    return enqueue(CommandType::play);
+    const auto reduction = transport::reduceTransport(
+        projectedTransport_, {transport::TransportActionKind::play, {}},
+        transportReductionPolicy());
+    const auto request = enqueue(CommandType::play);
+    if (!request.accepted) return request;
+    commitTransportProjection(reduction, request.sequence);
+    return {true, request.sequence, AudioControlRejection::none,
+            reduction.state.playback, reduction.state.position, true};
 }
 
 AudioControlRequestResult RealtimeAudioEngine::trySetLoopEnabled(bool enabled) noexcept {
+    refreshTransportProjection();
     if (deviceState() != DeviceProcessingState::operational ||
         transportExchange_.snapshot().playback !=
             transport::PlaybackState::stopped ||
         (enabled && (temporalContext_ == nullptr || !temporalContext_->loop))) return {};
-    const auto request = enqueue(CommandType::setLoopEnabled, {}, enabled ? 1.0F : 0.0F);
-    if (request.accepted) requestedLoopEnabled_.store(enabled, std::memory_order_release);
-    return request;
+    return enqueue(CommandType::setLoopEnabled, {}, enabled ? 1.0F : 0.0F);
 }
 
 AudioControlRequestResult RealtimeAudioEngine::trySetMetronomeEnabled(bool enabled) noexcept {
+    refreshTransportProjection();
     if (deviceState() != DeviceProcessingState::operational) return {};
-    const auto request = enqueue(CommandType::setMetronomeEnabled, {}, enabled ? 1.0F : 0.0F);
-    if (request.accepted) requestedMetronomeEnabled_.store(enabled, std::memory_order_release);
-    return request;
+    return enqueue(CommandType::setMetronomeEnabled, {}, enabled ? 1.0F : 0.0F);
 }
 
 AudioControlRequestResult RealtimeAudioEngine::trySetMetronomeLevel(
     MetronomeLevelDb level) noexcept {
+    refreshTransportProjection();
     if (deviceState() != DeviceProcessingState::operational || !level.isValid()) return {};
     return enqueue(CommandType::setMetronomeLevel, {}, level.value);
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestPause() noexcept {
-    if (deviceState() != DeviceProcessingState::operational) return {};
-    return enqueue(CommandType::pause);
+    if (deviceState() != DeviceProcessingState::operational)
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
+    refreshTransportProjection();
+    const auto reduction = transport::reduceTransport(
+        projectedTransport_, {transport::TransportActionKind::pause, {}});
+    const auto request = enqueue(CommandType::pause);
+    if (!request.accepted) return request;
+    commitTransportProjection(reduction, request.sequence);
+    return {true, request.sequence, AudioControlRejection::none,
+            reduction.state.playback, reduction.state.position, true};
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestStop() noexcept {
     if (deviceState() != DeviceProcessingState::operational) {
-        // The lifecycle transition has already stopped and published the clock.
-        // Stop remains a valid idempotent application action without creating
-        // a command that would need a missing RT consumer.
-        return {true, transportExchange_.snapshot().lastProcessedCommandSequence};
+        const auto generation = lifecycleGate_.generation();
+        const auto snapshot = transportExchange_.snapshot();
+        if (snapshot.commandGeneration != generation ||
+            generation != lifecycleGate_.generation() ||
+            deviceState() == DeviceProcessingState::operational ||
+            snapshot.playback != transport::PlaybackState::stopped ||
+            snapshot.position.value != 0) {
+            return {false, 0, AudioControlRejection::unavailable,
+                    transport::PlaybackState::stopped, {}, false,
+                    AudioControlDisposition::rejected};
+        }
+        projectedTransport_.synchronise(snapshot.playback, snapshot.position,
+                                        snapshot.duration);
+        projectedTransportSequence_ = snapshot.lastProcessedCommandSequence;
+        return {true, snapshot.lastProcessedCommandSequence,
+                AudioControlRejection::none, snapshot.playback,
+                snapshot.position, true, AudioControlDisposition::alreadySatisfied};
     }
-    return enqueue(CommandType::stop);
+    refreshTransportProjection();
+    const auto reduction = transport::reduceTransport(
+        projectedTransport_, {transport::TransportActionKind::stop, {}});
+    const auto request = enqueue(CommandType::stop);
+    if (!request.accepted) return request;
+    commitTransportProjection(reduction, request.sequence);
+    return {true, request.sequence, AudioControlRejection::none,
+            reduction.state.playback, reduction.state.position, true};
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestSeek(
     timeline::ProjectFramePosition position) noexcept {
-    if (deviceState() != DeviceProcessingState::operational ||
-        position.value < 0 ||
-        position.value > maximumSeekFrame_.load(std::memory_order_acquire)) return {};
-    return enqueue(CommandType::seek, position);
+    if (deviceState() != DeviceProcessingState::operational)
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
+    refreshTransportProjection();
+    const auto reduction = transport::reduceTransport(
+        projectedTransport_, {transport::TransportActionKind::seek, position});
+    if (!reduction.accepted) {
+        const auto invalid =
+            !timeline::isSupportedProjectFramePosition(position);
+        return {false, 0, invalid ? AudioControlRejection::invalidPosition
+                                 : AudioControlRejection::disallowedState,
+                transport::PlaybackState::stopped, {}, false};
+    }
+    const auto request = enqueue(CommandType::seek, position);
+    if (!request.accepted) return request;
+    commitTransportProjection(reduction, request.sequence);
+    return {true, request.sequence, AudioControlRejection::none,
+            reduction.state.playback, reduction.state.position, true};
 }
 
 bool RealtimeAudioEngine::tryUpdateTrackMix(
@@ -395,6 +491,20 @@ RealtimeTransportSnapshot RealtimeAudioEngine::transportSnapshot() const noexcep
     return transportExchange_.snapshot();
 }
 
+RealtimeTransportSnapshot RealtimeAudioEngine::projectedTransportSnapshot() noexcept {
+    refreshTransportProjection();
+    auto result = projectionBase_;
+    result.playback = projectedTransport_.playback;
+    result.playing = result.playback == transport::PlaybackState::playing;
+    result.position = projectedTransport_.position;
+    result.duration = projectedTransport_.duration;
+    result.projectedThroughTicket = projectedTransportSequence_;
+    result.loopEnabled = projectedLoopEnabled_;
+    result.beforeContentEnd = projectedBoundaries_.beforeContentEnd;
+    result.beforeLoopEnd = projectedBoundaries_.beforeLoopEnd;
+    return result;
+}
+
 mixer::MeterSnapshot RealtimeAudioEngine::meterSnapshot() const noexcept {
     return meterExchange_.snapshot();
 }
@@ -419,8 +529,7 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
     if (deviceState() != DeviceProcessingState::operational ||
         !projectSampleRate_.isValid() || blockCapacity_ == 0 ||
         !deviceSampleRate.isValid() ||
-        (runtime_ != nullptr &&
-         processingFormat_.sampleRate != deviceSampleRate)) {
+        processingFormat_.sampleRate != deviceSampleRate) {
         publishMeters();
         publishTransport();
         return;
@@ -433,8 +542,6 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
         return;
     }
 
-    const auto projectFramesPerDeviceFrame = timeline::projectFramesForDeviceFrames(
-        {1}, projectSampleRate_, deviceSampleRate);
     for (std::size_t offset = 0; offset < output.frameCount;) {
         // Temporal scheduling has its own fixed upper bound even if a future
         // prepared DSP plan chooses a larger scratch block.
@@ -442,11 +549,11 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
         const auto capacityCount = std::min(
             {blockCapacity_, output.frameCount - offset,
              maximumTemporalSubBlockFrames});
-        const auto count = clock_.continuousFramesAvailable(
-            capacityCount, projectFramesPerDeviceFrame);
-        processSubBlock(output, offset, count, projectFramesPerDeviceFrame);
+        const auto count = clock_.continuousFramesAvailable(capacityCount);
+        processSubBlock(output, offset, count);
         offset += count;
         if (clock_.consumeWrapped()) {
+            pendingMetronomeWrap_ = metronomeEnabled_;
             processorDiscontinuity_ =
                 processors::TemporalDiscontinuity::loopWrap;
         }
@@ -550,8 +657,7 @@ void RealtimeAudioEngine::publishMeters() noexcept {
 }
 
 void RealtimeAudioEngine::processSubBlock(
-    AudioBlockView output, std::size_t outputOffset, std::size_t frameCount,
-    timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept {
+    AudioBlockView output, std::size_t outputOffset, std::size_t frameCount) noexcept {
     auto* masterLeft = runtime_ != nullptr ? runtime_->master.left.data()
                                            : legacyMasterLeft_.data();
     auto* masterRight = runtime_ != nullptr ? runtime_->master.right.data()
@@ -569,22 +675,16 @@ void RealtimeAudioEngine::processSubBlock(
 
     std::size_t validFrames{};
     while (validFrames < frameCount && clock_.isPlaying()) {
-        positions[validFrames] = clock_.position().value;
+        positions[validFrames] = clock_.renderPosition();
         ++validFrames;
-        clock_.advance(projectFramesPerDeviceFrame);
+        clock_.advanceDeviceFrame();
     }
 
     if (validFrames == 0) {
         return;
     }
 
-    const auto temporalEnd = temporalContext_ != nullptr && loopEnabled_ &&
-                                     temporalContext_->loop
-        ? std::min(temporalContext_->loop->end.value,
-                   positions[0] + projectFramesPerDeviceFrame.value * validFrames)
-        : positions[0] + projectFramesPerDeviceFrame.value * validFrames;
-    prepareMetronomeEvents(positions[0], temporalEnd, validFrames,
-                           projectFramesPerDeviceFrame);
+    prepareMetronomeEvents(positions, validFrames);
 
     if (runtime_ == nullptr) {
         processLegacySubBlock(output, outputOffset, validFrames, positions);
@@ -592,7 +692,7 @@ void RealtimeAudioEngine::processSubBlock(
     }
 
     const processors::ProcessorProcessContext context{
-        {positions[0]}, processingFormat_.sampleRate, validFrames,
+        {positions[0].approximate()}, processingFormat_.sampleRate, validFrames,
         processingFormat_.mode, true, processorDiscontinuity_};
 
     for (const auto& step : order_) {
@@ -603,29 +703,23 @@ void RealtimeAudioEngine::processSubBlock(
             std::fill_n(scratch.first.left.data(), validFrames, 0.0F);
             std::fill_n(scratch.first.right.data(), validFrames, 0.0F);
             if (route.clips.count != 0) {
-                const auto blockEnd = positions[validFrames - 1] +
-                                      projectFramesPerDeviceFrame.value;
                 const auto candidates = findPreparedClipCandidates(
-                    *plan_, route, positions[0], blockEnd);
+                    *plan_, route, positions[0], positions[validFrames - 1]);
                 for (std::size_t candidate = 0;
                      candidate < candidates.count; ++candidate) {
                     const auto& clip =
                         plan_->clips[candidates.first + candidate];
                     for (std::size_t frame = 0; frame < validFrames; ++frame) {
-                        if (positions[frame] < clip.projectStart ||
-                            positions[frame] >= clip.projectEnd) {
-                            continue;
-                        }
-                        const auto rendered = renderPreparedClipAtProjectPosition(
-                            *plan_, clip, {positions[frame]});
+                        const auto rendered = renderPreparedClipAtDspPosition(
+                            *plan_, clip, positions[frame]);
                         scratch.first.left[frame] += rendered.left;
                         scratch.first.right[frame] += rendered.right;
                     }
                 }
             } else {
                 for (std::size_t frame = 0; frame < validFrames; ++frame) {
-                    const auto rendered = renderTrackAtProjectPosition(
-                        route.source, {positions[frame]}, projectSampleRate_);
+                    const auto rendered = renderTrackAtDspPosition(
+                        route.source, positions[frame], projectSampleRate_);
                     scratch.first.left[frame] = rendered.left;
                     scratch.first.right[frame] = rendered.right;
                 }
@@ -746,15 +840,15 @@ void RealtimeAudioEngine::processSubBlock(
 
 void RealtimeAudioEngine::processLegacySubBlock(
     AudioBlockView output, std::size_t outputOffset, std::size_t validFrames,
-    const double* positions) noexcept {
+    const DspFramePosition* positions) noexcept {
     auto* masterLeft = legacyMasterLeft_.data();
     auto* masterRight = legacyMasterRight_.data();
     for (const auto& step : order_) {
         if (step.kind == ProcessingStepKind::track) {
             const auto& route = tracks_[step.index];
             for (std::size_t frame = 0; frame < validFrames; ++frame) {
-                const auto rendered = renderTrackAtProjectPosition(
-                    route.source, {positions[frame]}, projectSampleRate_);
+                const auto rendered = renderTrackAtDspPosition(
+                    route.source, positions[frame], projectSampleRate_);
                 const auto mix = trackMix_[step.index].next();
                 const auto postTap = makeTrackPostFaderPostPanTap(
                     rendered, route.source.channelCount, mix);
@@ -899,53 +993,86 @@ void RealtimeAudioEngine::clearMetronomeRuntime() noexcept {
     metronomeEventCount_ = 0;
     pendingMetronomeEvent_ = false;
     pendingMetronomeAccent_ = false;
+    pendingMetronomeWrap_ = false;
 }
 
 void RealtimeAudioEngine::prepareMetronomeEvents(
-    double segmentStart, double segmentEnd, std::size_t frameCount,
-    timeline::ProjectFrameDuration increment) noexcept {
+    const DspFramePosition* positions, std::size_t frameCount) noexcept {
     metronomeEventCount_ = 0;
-    if (!metronomeEnabled_ || temporalContext_ == nullptr ||
-        temporalContext_->musicalTime == nullptr || increment.value <= 0.0)
-        return;
+    if (!metronomeEnabled_ || temporalContext_ == nullptr || frameCount == 0) return;
     const auto appendEvent = [this](std::size_t frame, bool accent) noexcept {
-        if (metronomeEventCount_ != 0 &&
-            metronomeEvents_[metronomeEventCount_-1].frame == frame) {
-            metronomeEvents_[metronomeEventCount_-1].accent |= accent;
+        if (metronomeEventCount_ && metronomeEvents_[metronomeEventCount_ - 1].frame == frame) {
+            metronomeEvents_[metronomeEventCount_ - 1].accent |= accent;
             return;
         }
         if (metronomeEventCount_ < metronomeEvents_.size())
-            metronomeEvents_[metronomeEventCount_++] = {frame,accent};
+            metronomeEvents_[metronomeEventCount_++] = {frame, accent};
     };
     if (pendingMetronomeEvent_) {
-        const auto accent = pendingMetronomeAccent_;
-        pendingMetronomeEvent_ = false;
-        pendingMetronomeAccent_ = false;
-        appendEvent(0,accent);
+        appendEvent(0, pendingMetronomeAccent_);
+        pendingMetronomeEvent_ = pendingMetronomeAccent_ = false;
     }
-    std::array<musical::GridLine, 32> lines;
-    auto cursor = timeline::PreciseProjectFramePosition{segmentStart};
-    while (cursor.value < segmentEnd) {
-        const auto found = temporalContext_->musicalTime->enumerateBeats(
-            cursor, {segmentEnd}, lines);
-        if (found.error != musical::Error::none) return;
-        for (std::size_t index = 0; index < found.count; ++index) {
-            const auto continuousOffset =
-                (lines[index].frame.value - segmentStart) / increment.value;
-            if (continuousOffset < 0.0) continue;
-            const auto offset = static_cast<std::size_t>(
-                std::ceil(continuousOffset));
-            if (offset == frameCount) {
-                pendingMetronomeEvent_ = true;
-                pendingMetronomeAccent_ = pendingMetronomeAccent_ ||
-                                          lines[index].barStart;
-            } else if (offset < frameCount) {
-                appendEvent(offset,lines[index].barStart);
-            }
+    auto start = positions[0].exactPosition();
+    // The device sample after a wrap can lie strictly beyond loopStart. Keep
+    // the crossed interval explicitly, including its first event, rather than
+    // inferring it from the post-wrap locator. Placement below maps any crossed
+    // beat to frame zero and coalesces equal-frame events exactly once.
+    if (pendingMetronomeWrap_ && loopEnabled_ && temporalContext_->loop)
+        start = exact::boundaryPosition(temporalContext_->loop->clockBounds.exactStart);
+    pendingMetronomeWrap_ = false;
+    if (exact::floorPosition(start).frame > musical::maximumCoordinate) return;
+    exact::ProjectPhase next{clock_.exactFormat(), positions[frameCount - 1].exactPosition()};
+    next.advance(std::nullopt);
+    auto exclusive = next.position();
+    const auto* loop = loopEnabled_ && temporalContext_->loop ? &*temporalContext_->loop : nullptr;
+    if (loop && exact::compareBoundary(exclusive, loop->clockBounds.exactEnd) > 0)
+        exclusive = exact::boundaryPosition(loop->clockBounds.exactEnd);
+    if (!clock_.isPlaying() && !loop) {
+        const exact::Position end{clock_.duration().value, {}};
+        if (exact::comparePositions(exclusive, end) > 0) exclusive = end;
+    }
+    const auto firstFloor = exact::floorPosition(start).frame;
+    const auto lastFloor = exact::floorPosition(exclusive).frame;
+    // Prepared segment count <= 8191. With certified device rate >= 1 Hz,
+    // tempo <= 400 and denominator <= 64, <= 108 beats/second plus the bounded
+    // signature anchors can fall in a subblock. No search over project duration.
+    for (const auto& segment : temporalContext_->beats) {
+        // A loop endpoint at the same document tick overrides the segment's
+        // prepared anchor below. Its conservative range must include that
+        // endpoint too; the ordinary segment-only range cannot cull it.
+        if (!loop && (segment.lastFrame <= firstFloor || segment.firstFrame > lastFloor)) continue;
+        const auto beatCount = static_cast<std::uint64_t>(
+            (segment.endTick - 1 - segment.firstTick) / segment.ticksPerBeat + 1);
+        const auto beatPosition = [&](std::uint64_t index) noexcept {
+            const auto tick = segment.firstTick + static_cast<std::int64_t>(index) * segment.ticksPerBeat;
+            // Identical document ticks share their prepared loop boundary.
+            if (loop && tick == loop->musical.start.value) return exact::boundaryPosition(loop->clockBounds.exactStart);
+            if (loop && tick == loop->musical.end.value) return exact::boundaryPosition(loop->clockBounds.exactEnd);
+            return segment.positionAt(tick);
+        };
+        std::uint64_t low = 0, high = beatCount;
+        while (low < high) {
+            const auto middle = low + (high - low) / 2;
+            if (exact::comparePositions(beatPosition(middle), start) < 0) low = middle + 1;
+            else high = middle;
         }
-        if (!found.hasMore) break;
-        if (found.nextStart.value <= cursor.value) return;
-        cursor = found.nextStart;
+        for (auto index = low; index < beatCount; ++index) {
+            const auto beat = beatPosition(index);
+            if (exact::comparePositions(beat, exclusive) >= 0 ||
+                exact::floorPosition(beat).frame > musical::maximumCoordinate) break;
+            std::size_t begin = 0, end = frameCount;
+            while (begin < end) {
+                const auto middle = begin + (end - begin) / 2;
+                if (exact::comparePositions(positions[middle].exactPosition(), beat) < 0) begin = middle + 1;
+                else end = middle;
+            }
+            const auto tick = segment.firstTick + static_cast<std::int64_t>(index) * segment.ticksPerBeat;
+            const bool accent = (tick - segment.signatureTick) % segment.ticksPerBar == 0;
+            if (begin == frameCount) {
+                pendingMetronomeEvent_ = true;
+                pendingMetronomeAccent_ |= accent;
+            } else appendEvent(begin, accent);
+        }
     }
 }
 
@@ -976,31 +1103,51 @@ float RealtimeAudioEngine::renderMetronomeSample(std::size_t frame) noexcept {
 
 AudioControlRequestResult RealtimeAudioEngine::enqueue(
     CommandType type, timeline::ProjectFramePosition target, float value) noexcept {
+    if (pendingCommandCount_ == pendingCommandCapacity) {
+        return {false, 0, AudioControlRejection::queueFull,
+                transport::PlaybackState::stopped, {}, false};
+    }
     const auto claim = lifecycleGate_.tryClaim();
     if (!claim.active) {
-        return {};
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
+    }
+
+    // Admission was computed from this confirmed generation plus pure replay.
+    // A close/reopen before claim must not accept old-context semantics. A close
+    // after this check still invalidates the same token at tryAccept().
+    if (claim.generation != projectionBase_.commandGeneration) {
+        lifecycleGate_.reject(claim);
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
     }
 
     const auto write = commandWriteIndex_.load(std::memory_order_relaxed);
     const auto nextWrite = (write + 1) % commandCapacity;
     if (nextWrite == commandReadIndex_.load(std::memory_order_acquire)) {
         lifecycleGate_.reject(claim);
-        return {};
+        return {false, 0, AudioControlRejection::queueFull,
+                transport::PlaybackState::stopped, {}, false};
     }
 
     const auto sequence = lifecycleGate_.reserveSequence(claim);
     if (sequence == 0) {
         lifecycleGate_.reject(claim);
-        return {};
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
     }
     commands_[write] = {type, sequence, claim.generation, target, value};
 
     if (!lifecycleGate_.tryAccept(claim)) {
-        return {};
+        return {false, 0, AudioControlRejection::unavailable,
+                transport::PlaybackState::stopped, {}, false};
     }
     // The command becomes visible to RT only after its acceptance point.
     commandWriteIndex_.store(nextWrite, std::memory_order_release);
-    return {true, sequence};
+    // Space was secured before acceptance. Only this producer touches the log.
+    pendingCommands_[pendingCommandCount_++] = commands_[write];
+    return {true, sequence, AudioControlRejection::none,
+            transport::PlaybackState::stopped, {}, false};
 }
 
 void RealtimeAudioEngine::consumeCommands() noexcept {
@@ -1019,7 +1166,8 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
                 clock_.pause();
             } else if (queued.type == CommandType::seek) {
                 if (clock_.seek(queued.target)) {
-                    resetProcessors();
+                    processorDiscontinuity_ =
+                        processors::TemporalDiscontinuity::seek;
                     clearMetronomeRuntime();
                 }
             } else if (queued.type == CommandType::play) {
@@ -1028,9 +1176,7 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
                 loopEnabled_ = queued.value != 0.0F;
                 const auto loop = loopEnabled_ && temporalContext_ != nullptr &&
                                           temporalContext_->loop
-                    ? std::optional<RealtimeProjectClock::LoopBounds>{{
-                          temporalContext_->loop->start.value,
-                          temporalContext_->loop->end.value}}
+                    ? std::optional<RealtimeProjectClock::LoopBounds>{temporalContext_->loop->clockBounds}
                     : std::nullopt;
                 clock_.setPlaybackPolicy(loop, metronomeEnabled_ && !loop);
             } else if (queued.type == CommandType::setMetronomeEnabled) {
@@ -1039,9 +1185,7 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
                 if (!metronomeEnabled_) clearMetronomeRuntime();
                 const auto loop = loopEnabled_ && temporalContext_ != nullptr &&
                                           temporalContext_->loop
-                    ? std::optional<RealtimeProjectClock::LoopBounds>{{
-                          temporalContext_->loop->start.value,
-                          temporalContext_->loop->end.value}}
+                    ? std::optional<RealtimeProjectClock::LoopBounds>{temporalContext_->loop->clockBounds}
                     : std::nullopt;
                 const auto preserveUnboundedPlayback =
                     clock_.isPlaying() && !loop && wasUnbounded;
@@ -1061,6 +1205,71 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
     commandReadIndex_.store(read, std::memory_order_release);
 }
 
+void RealtimeAudioEngine::refreshTransportProjection() noexcept {
+    const auto snapshot = transportExchange_.snapshot();
+    projectionBase_ = snapshot;
+    projectedTransport_.synchronise(snapshot.playback, snapshot.position,
+                                    snapshot.duration);
+    projectedBoundaries_ = {snapshot.beforeContentEnd, snapshot.beforeLoopEnd};
+    projectedLoopEnabled_ = snapshot.loopEnabled;
+    projectedTransportSequence_ = snapshot.lastProcessedCommandSequence;
+    std::size_t retained{};
+    for (std::size_t index = 0; index < pendingCommandCount_; ++index) {
+        const auto command = pendingCommands_[index];
+        if (command.sequence <= snapshot.lastProcessedCommandSequence) continue;
+        // A newer coherent generation cancels older history even if the late
+        // reservation was not observed in the closure's watermark.
+        if (command.generation < snapshot.commandGeneration) continue;
+        pendingCommands_[retained++] = command;
+        if (command.type == CommandType::setLoopEnabled) {
+            projectedLoopEnabled_ = command.value != 0.0F;
+        } else if (command.type == CommandType::setMetronomeEnabled) {
+            projectionBase_.metronomeEnabled = command.value != 0.0F;
+        } else if (command.type == CommandType::setMetronomeLevel) {
+            projectionBase_.metronomeLevelDb = command.value;
+        } else if (command.type == CommandType::play || command.type == CommandType::pause ||
+                   command.type == CommandType::stop || command.type == CommandType::seek) {
+            const auto action = command.type == CommandType::play ? transport::TransportActionKind::play :
+                command.type == CommandType::pause ? transport::TransportActionKind::pause :
+                command.type == CommandType::stop ? transport::TransportActionKind::stop :
+                                                   transport::TransportActionKind::seek;
+            const auto policy = transportReductionPolicy();
+            const auto reduction = transport::reduceTransport(projectedTransport_,
+                {action, command.target}, policy);
+            commitTransportProjection(reduction, command.sequence);
+        }
+        projectedTransportSequence_ = command.sequence;
+    }
+    pendingCommandCount_ = retained;
+}
+
+transport::TransportReductionPolicy
+RealtimeAudioEngine::transportReductionPolicy() const noexcept {
+    transport::TransportReductionPolicy result;
+    result.boundaries = projectedBoundaries_;
+    if (projectedLoopEnabled_ &&
+        temporalContext_ != nullptr && temporalContext_->loop) {
+        result.loop = transport::TransportReductionPolicy::Loop{
+            temporalContext_->loop->clockBounds};
+    }
+    return result;
+}
+
+void RealtimeAudioEngine::commitTransportProjection(
+    const transport::TransportReduction& reduction,
+    AudioCommandSequence sequence) noexcept {
+    auto boundaryPolicy = transportReductionPolicy();
+    // Preserve the prepared loop relation while disabled, so a later pending
+    // enable never has to infer the residue from the public integer.
+    if (temporalContext_ && temporalContext_->loop)
+        boundaryPolicy.loop = transport::TransportReductionPolicy::Loop{
+            temporalContext_->loop->clockBounds};
+    projectedBoundaries_ = transport::boundariesAfterReduction(
+        reduction, projectedBoundaries_, boundaryPolicy);
+    projectedTransport_ = reduction.state;
+    projectedTransportSequence_ = sequence;
+}
+
 void RealtimeAudioEngine::publishTransport() noexcept {
     transportExchange_.publish({clock_.isPlaying(), clock_.publicPosition(),
                                 clock_.duration(),
@@ -1068,7 +1277,11 @@ void RealtimeAudioEngine::publishTransport() noexcept {
                                     std::memory_order_acquire),
                                 clock_.playback(), loopEnabled_,
                                 metronomeEnabled_, metronomeLevel_.value,
-                                temporalContext_ ? temporalContext_->revision : 0});
+                                temporalContext_ ? temporalContext_->revision : 0,
+                                lifecycleGate_.generation(),
+                                clock_.boundaryFacts().beforeContentEnd,
+                                temporalContext_ && temporalContext_->loop &&
+                                    clock_.isBefore(temporalContext_->loop->clockBounds.exactEnd)});
 }
 
 void RealtimeAudioEngine::resolveCommandsThrough(

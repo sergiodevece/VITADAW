@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/timeline/Time.h"
+#include "vitadaw/audio/ExactTemporal.h"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -85,6 +86,10 @@ struct PreparedTempoSegment {
     TempoBpm bpm;
     double secondsPerQuarter{};
 };
+struct PreparedExactTempoSegment {
+    MusicalTickPosition startTick;
+    audio::exact::LinearMapping framesFromStart;
+};
 struct PreparedTimeSignatureSegment {
     BarIndex startBar; MusicalTickPosition startTick; TimeSignature signature;
     std::int64_t ticksPerBeat{}, ticksPerBar{};
@@ -111,6 +116,10 @@ public:
     [[nodiscard]] Result<timeline::PreciseProjectFramePosition> preciseProjectFrameAtTick(MusicalTickPosition t) const noexcept {
         return preciseProjectFrameAt(QuarterNotePosition{static_cast<double>(t.value) / ppq});
     }
+    // DSP preparation only: this path never evaluates the tick/frame boundary
+    // through seconds or floating point.
+    [[nodiscard]] Result<audio::exact::Position> exactProjectFrameAtTick(
+        MusicalTickPosition) const noexcept;
     [[nodiscard]] Result<timeline::ProjectFramePosition> projectFrameAt(MusicalTickPosition, Rounding = Rounding::nearest) const noexcept;
     [[nodiscard]] Result<timeline::ProjectFramePosition> projectFrameAt(MusicalPosition, Rounding = Rounding::nearest) const noexcept;
     [[nodiscard]] Result<MusicalTickPosition> tickAt(MusicalPosition) const noexcept;
@@ -139,6 +148,8 @@ private:
     timeline::SampleRate rate_;
     std::uint64_t revision_{};
     std::vector<PreparedTempoSegment> tempos_;
+    std::vector<PreparedExactTempoSegment> exactTempos_;
+    bool exactDspCertified_{true};
     std::vector<PreparedTimeSignatureSegment> signatures_;
     std::vector<TempoLookupNode> gridTempoIndex_;
 };

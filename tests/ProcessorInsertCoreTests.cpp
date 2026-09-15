@@ -43,6 +43,12 @@ struct ProcessorProbe {
     std::atomic<int> destructions{};
     std::atomic<int> activeRealtimeRegions{};
     std::atomic<int> destructionsWhileRealtimeActive{};
+    processors::TemporalDiscontinuity lastDiscontinuity{
+        processors::TemporalDiscontinuity::continuous};
+    int seekDiscontinuities{};
+    int loopDiscontinuities{};
+    void (*onceDuringProcess)(void*) noexcept{};
+    void* schedulingContext{};
 };
 
 class TestProcessor final : public processors::IAudioProcessor {
@@ -100,7 +106,18 @@ public:
         audio::ConstAudioBlockView input,
         audio::AudioBlockView output) noexcept override {
         if (probe_ != nullptr) {
+            // Deterministic test interleaving after the real FIFO cutoff but
+            // before the real end-of-callback snapshot. No wait or allocation.
+            if (const auto hook = std::exchange(probe_->onceDuringProcess, nullptr))
+                hook(probe_->schedulingContext);
             ++probe_->processCalls;
+            probe_->lastDiscontinuity = context.discontinuity;
+            if (context.discontinuity ==
+                processors::TemporalDiscontinuity::seek)
+                ++probe_->seekDiscontinuities;
+            if (context.discontinuity ==
+                processors::TemporalDiscontinuity::loopWrap)
+                ++probe_->loopDiscontinuities;
         }
         for (std::size_t frame = 0; frame < context.frameCount; ++frame) {
             for (std::size_t channel = 0; channel < input.channelCount;
@@ -397,6 +414,35 @@ int main() {
           "track post-send must observe inserts and the channel gain/pan stage");
 
     TestFactory factory;
+    {
+        ProcessorProbe probe;
+        TestFactory schedulingFactory;
+        schedulingFactory.probes = {{{1}, &probe}};
+        auto specification = basic();
+        specification.tracks = {{{1}, {}, {}, {{processor(1, "test.counter")}}}};
+        const std::vector<float> shortAudio{0.2F, 0.4F, 0.6F};
+        const std::array shortSource{source({1}, shortAudio)};
+        Harness harness{specification, shortSource, 64, &schedulingFactory};
+        harness.render(1);
+        struct PendingPause { audio::RealtimeAudioEngine* engine; audio::AudioControlRequestResult result; } pending{&harness.engine, {}};
+        probe.schedulingContext = &pending;
+        probe.onceDuringProcess = [](void* context) noexcept {
+            auto& state = *static_cast<PendingPause*>(context);
+            state.result = state.engine->tryRequestPause();
+        };
+        harness.render(2);
+        check(pending.result.accepted && harness.engine.transportSnapshot().playback ==
+                  transport::PlaybackState::stopped &&
+                  harness.engine.transportSnapshot().lastProcessedCommandSequence < pending.result.sequence,
+              "real callback confirms natural end while Pause is still pending");
+        const auto seek = harness.engine.tryRequestSeek({1});
+        check(seek.accepted && seek.projectedPlayback == transport::PlaybackState::stopped,
+              "natural end rebases pending Pause before projecting Seek");
+        harness.render(0);
+        check(harness.engine.transportSnapshot().playback == transport::PlaybackState::stopped &&
+                  harness.engine.transportSnapshot().position.value == 1,
+              "pending Pause plus Seek resolves Stopped at C");
+    }
     auto nonCommutative = basic();
     nonCommutative.tracks = {{{1}, {}, {},
                               {{processor(1, "test.add-one"),
@@ -432,6 +478,49 @@ int main() {
               bypassOutput.first[2] == 1.0F &&
               latencyProbe.processCalls == 1,
           "host bypass must run the processor and delay dry by declared latency");
+
+    check(bypassHarness.engine.tryRequestPause().accepted,
+          "processor Seek fixture pauses transport");
+    bypassHarness.render(1);
+    const auto resetsBeforeSeek = latencyProbe.resetCalls;
+    check(bypassHarness.engine.tryRequestSeek({4}).accepted,
+          "Paused Seek is accepted with an insert prepared");
+    bypassHarness.render(1);
+    check(latencyProbe.resetCalls == resetsBeforeSeek &&
+              latencyProbe.seekDiscontinuities == 0,
+          "Paused Seek neither resets processors nor consumes its discontinuity");
+    check(bypassHarness.engine.tryRequestPlay().accepted,
+          "processor Seek fixture resumes transport");
+    bypassHarness.render(1);
+    check(latencyProbe.resetCalls == resetsBeforeSeek &&
+              latencyProbe.lastDiscontinuity ==
+                  processors::TemporalDiscontinuity::seek &&
+              latencyProbe.seekDiscontinuities == 1,
+          "first DSP block after Seek receives one explicit Seek discontinuity");
+    bypassHarness.render(1);
+    check(latencyProbe.lastDiscontinuity ==
+              processors::TemporalDiscontinuity::continuous &&
+              latencyProbe.seekDiscontinuities == 1,
+          "Seek discontinuity becomes continuous after the first processed block");
+
+    check(bypassHarness.engine.tryRequestPause().accepted, "pause before seek/rebuild");
+    bypassHarness.render(0);
+    check(bypassHarness.engine.tryRequestSeek({5}).accepted, "seek before rebuild");
+    bypassHarness.render(0);
+    const auto checkpoint = bypassHarness.engine.temporalCheckpoint();
+    const auto resetsBeforeRebuild = latencyProbe.resetCalls;
+    bypassHarness.engine.configure(bypassHarness.prepared->plan, bypassHarness.prepared->runtime);
+    bypassHarness.engine.restoreTemporalCheckpoint(checkpoint);
+    bypassHarness.engine.deviceInitialisingPreservingTransport();
+    bypassHarness.render(0);
+    check(latencyProbe.resetCalls > resetsBeforeRebuild && bypassHarness.engine.tryRequestPlay().accepted,
+          "quiescent rebuild performs legitimate reset and preserves paused locator");
+    bypassHarness.render(1);
+    check(latencyProbe.lastDiscontinuity == processors::TemporalDiscontinuity::hardDiscontinuity,
+          "rebuild hard discontinuity subsumes pending seek");
+    bypassHarness.render(1);
+    check(latencyProbe.lastDiscontinuity == processors::TemporalDiscontinuity::continuous,
+          "hard discontinuity is consumed by first rebuilt DSP block");
 
     check(bypassHarness.engine.tryRequestStop().accepted &&
               bypassHarness.engine.tryRequestStop().accepted &&
@@ -512,6 +601,36 @@ int main() {
         check(probe.processCalls == 2,
               "callbacks larger than capacity must preserve one DSP call per subblock");
     }
+    factory.probes.clear();
+
+    ProcessorProbe exactLoopProbe;
+    factory.probes = {{{1}, &exactLoopProbe}};
+    std::vector<float> exactLoopSamples(30000,1.0F);
+    const std::array exactLoopSource{source({1},exactLoopSamples,nullptr,48000)};
+    auto exactLoopPlan=basic(48000);
+    exactLoopPlan.tracks={{{1},{},{},{{processor(1,"test.counter")}}}};
+    Harness exactLoopHarness{exactLoopPlan,exactLoopSource,1024,&factory};
+    check(exactLoopHarness.engine.tryRequestStop().accepted &&
+          exactLoopHarness.engine.tryRequestStop().accepted,
+          "exact loop fixture stops before temporal replacement");
+    exactLoopHarness.render(0);
+    musical::MusicalTimeMap exactLoopMap;
+    exactLoopMap.tempo.events[0].bpm={123.0};
+    auto exactLoopTemporal=audio::prepareTemporalContext(exactLoopMap,
+        musical::MusicalLoopRange{{0},{musical::ppq}},
+        timeline::SampleRate{48000},timeline::SampleRate{48000},77);
+    check(exactLoopTemporal.success() &&
+          exactLoopHarness.engine.configureTemporalContext(
+              exactLoopTemporal.prepared.get()),
+          "fractional processor loop context configures exactly");
+    check(exactLoopHarness.engine.trySetLoopEnabled(true).accepted,
+          "fractional processor loop enables");
+    exactLoopHarness.render(0);
+    check(exactLoopHarness.engine.tryRequestPlay().accepted,
+          "fractional processor loop plays");
+    exactLoopHarness.render(23416);
+    check(exactLoopProbe.loopDiscontinuities==1,
+          "exact fractional wrap emits one loop discontinuity");
     factory.probes.clear();
 
     auto latency = basic();

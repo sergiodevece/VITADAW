@@ -124,7 +124,12 @@ El módulo `timeline` evita valores numéricos sin unidad mediante:
 - `Seconds` y `SampleRate` para conversiones explícitas.
 
 La duración de un clip se convierte una sola vez de frames fuente a frames de
-proyecto. Las posiciones observables se redondean al frame más próximo, mientras
+proyecto. Desde el candidato 0.6.0 la posición autoritativa del transporte es
+siempre un `ProjectFramePosition` entero. Un residuo fraccionario acotado existe
+como estado del reloj RT para convertir device frames a project frames; el render
+recibe una copia efímera para conversiones locales. No se publica a la UI ni
+funciona como segundo locator. Las posiciones derivadas de audio
+se redondean al frame más próximo, mientras
 que un límite exclusivo de duración se redondea hacia arriba. Así la escala de
 proyecto cubre todo recurso no vacío, incluso si uno, dos o tres frames fuente
 equivalen a menos de un frame de proyecto. `TransportState` nunca contiene
@@ -239,8 +244,8 @@ device frame
 
 No existe un cursor por pista. Todas las posiciones se recalculan desde la misma
 posición global, por lo que el número de pistas no introduce deriva relativa. El
-reloj conserva suma compensada si dispositivo y proyecto difieren de sample
-rate. La duración global es el máximo `clip start + clip duration` de todas las
+reloj del candidato 0.6.0 conserva un resto racional exacto preparado si dispositivo
+y proyecto difieren de sample rate. La duración global es el máximo `clip start + clip duration` de todas las
 pistas preparadas.
 
 `TrackRenderer` convierte la posición común y produce una contribución estéreo
@@ -1292,12 +1297,13 @@ Se rechaza el agotamiento antes de sumar; los IDs eliminados no se reciclan.
 
 ### Preparación y conversiones
 
-`PreparedMusicalTimeMap::compile` valida y prepara fuera de RT dos vectores
-separados: segmentos de tempo (tick, quarter, segundos prefijo, BPM, segundos
-por negra) y de métrica (bar, tick, N/D, ticks por beat/bar). El siguiente
-elemento proporciona el límite exclusivo; el último se extrapola dentro del
-dominio numérico. Los prefijos de segundos usan suma compensada, sin redondear
-beats ni fronteras a frames enteros.
+`PreparedMusicalTimeMap::compile` valida y prepara fuera de RT tres colecciones:
+segmentos de tempo para presentación (tick, quarter, segundos prefijo, BPM,
+segundos por negra), segmentos de tempo racionales para DSP y segmentos de
+métrica (bar, tick, N/D, ticks por beat/bar). El siguiente elemento proporciona
+el límite exclusivo; el último se extrapola dentro del dominio numérico. Los
+prefijos de segundos usan suma compensada para UI. Las fronteras DSP no se
+obtienen de esos prefijos: integran exactamente los bits binary64 de rate/BPM.
 
 En un segmento: `seconds = startSeconds + (q-startQuarter)*60/BPM`;
 inversa `q = startQuarter + (seconds-startSeconds)*BPM/60`.
@@ -1618,7 +1624,176 @@ pero compila `PreparedProcessingPlan` y ejecuta colas, reloj, mezcla, snapshots 
 `RealtimeAudioEngine::processBlock` de producción. Los dobles se limitan a
 decodificación y filesystem deterministas.
 
-## Evolución hasta 0.5.6
+## Transport & Timeline Foundation 0.6.0 (candidato)
+
+### Autoridad y dominio navegable
+
+El transporte conserva tres conceptos separados:
+
+- `contentDuration`: límite exclusivo descriptivo del contenido preparado;
+- dominio navegable: posiciones enteras no negativas admitidas por la
+  implementación temporal actual;
+- `ProjectFramePosition`: locator autoritativo del transporte.
+
+Navegar después de `contentDuration` es válido y no crea ni alarga clips.
+`GoToEnd` continúa apuntando al final del contenido. No existe un `projectEnd`
+persistente. El dominio actual termina provisionalmente en
+`maximumSupportedProjectFrame()` = 2^53−1 se conserva por compatibilidad.
+No es la definición conceptual del timeline. Las búsquedas RT de clips utilizan
+inicios y finales exclusivos enteros conservadores, no sumas absolutas double.
+
+### Representación exacta preparada (candidato, sin versionar)
+
+`TemporalInteger.h` proporciona palabras fijas UInt128 y UInt256, carry/borrow,
+shifts, los productos necesarios y divmod. El backend portable usa productos
+de mitades de 32 bits; el acelerado puede usar __int128. No hay enteros dinámicos.
+GCD, descomposición binary64, reducción y certificación solo se ejecutan en
+preparación. La división portable recorre como máximo 256 bits.
+
+`ProjectPhase` conserva P entero, magnitud/signo de residuo y denominador D.
+El incremento preparado es cociente entero + resto. Pause/checkpoints conservan
+la fase; Seek entero la pone a cero. Natural end, wrap y corte de subbloques usan
+comparaciones/divmod enteros, sin epsilon/FMA. Un checkpoint no convertible
+exactamente se rechaza sin modificar el reloj. El adaptador certifica el checkpoint
+antes del commit de un plan que deba conservarlo.
+El checkpoint captura además la política efectiva `runUntilStop`; su restore no
+la reconstruye desde el estado visible de metrónomo/loop. Esto conserva el caso
+en que el metrónomo se desactiva durante Playing pero la ejecución abierta debe
+continuar hasta un Stop explícito.
+
+`SourceMapping` guarda factores de hasta 128 bits. El render separa parte entera,
+fase y offset, calcula los índices mediante divmod y solo convierte el resto a
+floating point después de validar pertenencia y exclusive end. Prepared y legacy
+comparten este kernel. No se materializa una coordenada fuente absoluta double
+ni el producto absoluto expandido de 296 bits. Los temporales de 256 bits bastan.
+
+El dominio profesional certificado incluye todos los sample rates binary64 de
+[1, 1048576] Hz, locator hasta 2^53−1, duración diádica con denominador hasta 2^84,
+offset hasta 2^116 y frontera de loop hasta 2^72. Las tasas fuera del intervalo
+pueden admitirse en audio si pasan el certificado genérico; el reproducer de
+una muestra y sourceRate=0x1.77000000002dcp-38 está incluido.
+El scheduler musical requiere project/device rates en ese intervalo para acotar
+también su densidad de eventos. SampleRate::isValid no cambia de significado.
+
+El ClockFormat base exige D de hasta 125 bits; su extensión para fronteras
+musicales puede ocupar hasta 128 bits, y vuelve a certificar los mappings fuente.
+El certificado exige factores persistentes de hasta 128,
+parte impar del denominador fuente de hasta 128 y temporales con margen para
+las sumas hasta 256. No hay fallback aproximado. La ruta legacy debe preparar el
+device rate fuera del callback mediante prepareLegacyDeviceRate; processBlock
+no prepara ratios al recibir un rate distinto.
+
+`DspFramePosition` copia P y la fase exacta al scratch preasignado. Su campo double
+phase es exclusivamente una vista de presentación. Los presupuestos existentes
+contabilizan el nuevo sizeof de descriptores y buffers de posiciones.
+
+`PreparedMusicalTimeMap` mantiene dos rutas deliberadamente separadas. La ruta de
+presentación conserva los segmentos de segundos/doubles existentes. La ruta DSP
+descompone directamente los bits binary64 contractuales de project rate y BPM y
+prepara por segmento `framesPerTick = projectRate / (256 * BPM)`. El anchor del
+segmento siguiente es el resultado racional exacto del anterior; no se acumulan
+segundos ni se convierte primero una frontera floating point. Cada segmento tiene
+su propio denominador y se certifica con temporales UInt256 y componentes UInt128.
+
+El loop musical recorre ticks -> mapa exacto -> `RationalBoundary` -> contexto
+temporal certificado. El mismo tick alimenta los segmentos analíticos del
+metrónomo. El reductor, la proyección y RT reciben los mismos límites preparados;
+no reconstruyen fronteras desde los doubles de presentación. El reloj amplía su
+denominador fuera del callback solo para los límites racionales que interactúan
+con RT. Una integral, anchor, LCM o conversión de checkpoint que exceda la
+capacidad fija se rechaza antes del commit y preserva el contexto anterior.
+
+El adaptador prepara conjuntamente el plan y contexto del nuevo dispositivo,
+certifica fuentes y checkpoint contra el ClockFormat **efectivo**, y solo entonces
+retira las vistas del motor bajo quiescencia. Los owners anteriores permanecen
+vivos hasta completar la retirada y la instalación del conjunto nuevo. El cierre
+también retira primero esas vistas, antes de destruir planes y contextos.
+El bootstrap anterior a DawApplication certifica un motor vacío usando la tasa
+del dispositivo como política inicial de proyecto, sin cambiarla en reaperturas.
+Un rechazo de reprepare conserva owners, revisión, fase y políticas lógicas;
+el dispositivo físico puede quedar en error y no renderizar. No se promete
+reabrir automáticamente el dispositivo físico anterior.
+
+El metrónomo recibe segmentos analíticos preparados (como máximo 8191 por los
+límites existentes de tempo y métrica). El callback selecciona beats y muestra de
+salida mediante comparaciones enteras; no enumera una rejilla floating point.
+La densidad queda acotada por los límites de device rate/tempo/métrica y por los
+1024 frames máximos del subbloque. La preparación, propiedad y destrucción de los
+segmentos permanecen fuera de RT. Seno, envolvente y amplitud de click siguen
+siendo continuos floating point porque no deciden la muestra de disparo.
+Un wrap deja un indicador explícito hasta el siguiente subbloque DSP: el scheduler
+incluye el intervalo desde loopStart atravesado por el overshoot. Los eventos
+cruzados se ubican en su primera muestra de dispositivo y se coalescen por muestra,
+sin epsilon ni alterar la fase. El recorrido de hasta 8191 segmentos sigue siendo
+global por subbloque, no por pista; su deadline profesional no está benchmarkeado.
+
+### Orden de comandos
+
+`TransportReducer` expresa de forma portable, determinista y `noexcept` las
+transiciones Play/Pause/Stop/Seek y los eventos internos de final/rebobinado.
+Tanto productor como consumidor usan esa decisión; el reloj aplica sus efectos.
+Los hechos de frontera del snapshot permiten distinguir locator redondeado y
+frontera DSP alcanzada sin publicar la fase como una posición alternativa.
+
+El único productor conserva un registro fijo de 14 comandos pendientes. Un
+snapshot coherente, incluso parcialmente resuelto, reemplaza la base confirmada;
+se eliminan tickets resueltos/generaciones canceladas y se reaplican los restantes
+en orden. El replay es puro: no toca reloj, DSP, FIFO, lifecycle ni discontinuidades
+reales. La FIFO tiene 7 huecos utilizables: se exige capacidad simultánea en ambas
+estructuras antes de reservar. Agotar el registro añade backpressure acotado,
+nunca crecimiento dinámico ni pérdida de historial.
+
+El CAS final del gate es el punto de aceptación, antes de publicar FIFO y confirmar
+el registro del productor. Un rechazo de dominio/capacidad no reserva ticket.
+Si lifecycle gana después de una reserva, el CAS falla y no se publica ninguna
+acción. El ticket rechazado puede aparecer en el watermark o dejar un hueco.
+`AudioCommandSequence` identifica reservas/resoluciones, NO un ordinal consecutivo
+de acciones aceptadas. La reserva aceptada precede al CAS release y el cierre
+acquire la incluye; una reserva rechazada carece de esa garantía y puede quedar
+fuera del watermark sin dejar una acción aceptada sin resolver.
+
+Play no consulta flags requestedLoopEnabled/requestedMetronomeEnabled: se han
+eliminado. Su disponibilidad proviene del contenido preparado y de snapshot más
+replay. El claim debe pertenecer a la misma generación que esa base confirmada;
+si hubo cierre/reapertura después de validar, se rechaza antes de reservar ticket.
+Si el cierre ocurre después del claim, el CAS final falla. Si ocurre después de
+aceptar, la acción se cancela normalmente. Ningún store auxiliar tardío puede
+reabrir disponibilidad cancelada.
+
+El snapshot RT mantiene `lastProcessedCommandSequence` como watermark confirmado.
+La vista de aplicación distingue `projectedThroughTicket`: no afirma ejecución
+RT de los pendientes. La proyección es provisional frente a eventos todavía no
+publicados. El corte FIFO del callback determina qué comandos aplica ese bloque;
+su final natural puede preceder a comandos aceptados para el siguiente callback.
+Al conocer ese final se reconcilia la proyección, no se descarta el snapshot.
+No se promete frescura instantánea entre hilos.
+
+Stop no operativo solo es `alreadySatisfied` ante Stopped @ 0 confirmado en la
+generación correspondiente. Una ventana de cierre con snapshot antiguo, Paused
+preservado o Stopped @ X requieren rechazo: no existe consumidor que garantice
+la acción. Stop operativo aceptado es `scheduled`; no se añade una cola diferida.
+
+Stop permanece como Stop en la FIFO. Desde Playing/Paused, el primero conserva
+posición y pasa a Stopped; otro Stop aceptado contra esa proyección rebobina a
+cero aunque ambos lleguen antes del mismo callback. En Paused, varios Seek se
+reducen en orden y el último destino gana. Seek se admite en Stopped/Paused y se
+rechaza provisionalmente en Playing. Play en o después de `contentDuration`
+reinicia a cero por compatibilidad 0.5.x cuando la frontera DSP realmente está
+alcanzada, no simplemente porque el locator se haya redondeado a ella. No es una política definitiva para
+grabación ni proyectos vacíos.
+
+### Discontinuidad Seek
+
+Un Seek consumido fija `TemporalDiscontinuity::seek` pero no llama a
+`IAudioProcessor::reset()`. Si el transporte está Paused, la marca permanece
+pendiente porque no hay procesamiento DSP. El primer subbloque realmente
+procesado desde la nueva posición recibe la marca; los siguientes reciben
+`continuous`. Esto informa a cada procesador sin imponer una política universal
+de reset. Si un rebuild ocurre antes del DSP, su `hardDiscontinuity` subsume a
+Seek y se conservan los resets legítimos. Stop, lifecycle y loop conservan sus
+políticas anteriores; no se introduce una colección de causas ni otra API de inserts.
+
+## Evolución hasta 0.6.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1692,6 +1867,10 @@ decodificación y filesystem deterministas.
 29. **Completado en 0.5.6:** hardening combinado de transporte, loop, edición,
     historial, persistencia, fronteras de bloque y escala sobre processBlock
     real, sin añadir funciones ni cambiar la matriz de comportamiento.
+
+30. **Candidato 0.6.0:** autoridad entera de project frame, dominio navegable
+    independiente del contenido, proyección linealizada de transporte y
+    discontinuidad Seek explícita sin reset universal.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

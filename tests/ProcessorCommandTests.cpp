@@ -121,15 +121,19 @@ public:
     audio::AudioControlRequestResult tryRequestPlay() noexcept override {
         const auto sequence = nextSequence++;
         snapshot.playing = true;
+        snapshot.playback = transport::PlaybackState::playing;
         snapshot.lastProcessedCommandSequence = sequence;
-        return {true, sequence};
+        return {true, sequence, audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
     audio::AudioControlRequestResult tryRequestStop() noexcept override {
         const auto sequence = nextSequence++;
         snapshot.playing = false;
+        snapshot.playback = transport::PlaybackState::stopped;
         snapshot.position = {};
         snapshot.lastProcessedCommandSequence = sequence;
-        return {true, sequence};
+        return {true, sequence, audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
     audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override {
         return snapshot;

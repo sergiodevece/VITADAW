@@ -257,7 +257,8 @@ public:
         snapshot.playing = true;
         snapshot.playback = vitadaw::transport::PlaybackState::playing;
         snapshot.lastProcessedCommandSequence = sequence;
-        return {true, sequence};
+        return {true, sequence, vitadaw::audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
 
     vitadaw::audio::AudioControlRequestResult tryRequestStop() noexcept override {
@@ -272,7 +273,8 @@ public:
         snapshot.playback = vitadaw::transport::PlaybackState::stopped;
         if (wasStopped) snapshot.position = {0};
         snapshot.lastProcessedCommandSequence = sequence;
-        return {true, sequence};
+        return {true, sequence, vitadaw::audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
 
     vitadaw::audio::AudioControlRequestResult tryRequestPause() noexcept override {
@@ -280,16 +282,25 @@ public:
         snapshot.playing = false;
         snapshot.playback = vitadaw::transport::PlaybackState::paused;
         snapshot.lastProcessedCommandSequence = sequence;
-        return {true, sequence};
+        return {true, sequence, vitadaw::audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
 
     vitadaw::audio::AudioControlRequestResult tryRequestSeek(
         vitadaw::timeline::ProjectFramePosition position) noexcept override {
-        if (position.value < 0 || position.value > snapshot.duration.value) return {};
+        if (!vitadaw::timeline::isSupportedProjectFramePosition(position)) {
+            return {false, 0,
+                    vitadaw::audio::AudioControlRejection::invalidPosition};
+        }
+        if (snapshot.playback == vitadaw::transport::PlaybackState::playing) {
+            return {false, 0,
+                    vitadaw::audio::AudioControlRejection::disallowedState};
+        }
         const auto sequence = nextSequence++;
         snapshot.position = position;
         snapshot.lastProcessedCommandSequence = sequence;
-        return {true, sequence};
+        return {true, sequence, vitadaw::audio::AudioControlRejection::none,
+                snapshot.playback, snapshot.position, true};
     }
 
     vitadaw::audio::AudioControlRequestResult trySetLoopEnabled(bool enabled) noexcept override {
@@ -1102,6 +1113,25 @@ int main() {
               commands::CommandStatus::accepted &&
           !sessionApp.project().loopRange().has_value(),
           "Undo removes the loop range");
+
+    FakeAudioEngine capacityAudio;
+    application::DawApplication capacityApp{capacityAudio,
+                                             timeline::SampleRate{48000}};
+    commands::CommandDispatcher capacityDispatcher{capacityApp};
+    check(capacityDispatcher.dispatch(commands::SetTempo{{1},{123.432}}).status ==
+              commands::CommandStatus::accepted &&
+          capacityDispatcher.dispatch(commands::AddTempoChange{{1000},{96.1425}}).status ==
+              commands::CommandStatus::accepted,
+          "representable exact tempo segments commit");
+    const auto beforeCapacityFailure=capacityApp.project().musicalTime();
+    const auto temporalRevisionBefore=
+        capacityAudio.transportSnapshot().temporalRevision;
+    const auto capacityFailure=capacityDispatcher.dispatch(
+        commands::AddTempoChange{{2000},{105.55}});
+    check(capacityFailure.status==commands::CommandStatus::rejected &&
+          capacityApp.project().musicalTime()==beforeCapacityFailure &&
+          capacityAudio.transportSnapshot().temporalRevision==temporalRevisionBefore,
+          "uncertifiable exact anchor rejects without changing model or RT context");
 
     std::cout << "All command-flow tests passed\n";
     return EXIT_SUCCESS;

@@ -21,6 +21,7 @@ void check(bool value, std::string_view message) {
     if (!value) { std::cerr << "FAILED: " << message << '\n'; std::exit(1); }
 }
 void enterOperational(audio::RealtimeAudioEngine& engine, double rate) {
+    check(engine.prepareLegacyDeviceRate(timeline::SampleRate{rate}), "prepare exact device context outside RT");
     engine.deviceInitialising();
     std::array<float*, 0> none{};
     engine.processBlock({none.data(), 0, 0}, timeline::SampleRate{rate});
@@ -95,6 +96,18 @@ void preparationAndPersistence() {
     check(audio::prepareTemporalContext(maximumMap,std::nullopt,
               timeline::SampleRate{48000},timeline::SampleRate{48000},10).success(),
           "maximum-size musical map prepares temporal context off RT");
+
+    musical::MusicalTimeMap fractional;
+    fractional.tempo.events[0].bpm={123.0};
+    auto exactLoop=audio::prepareTemporalContext(fractional,
+        musical::MusicalLoopRange{{0},{musical::ppq}},
+        timeline::SampleRate{48000},timeline::SampleRate{48000},11);
+    check(exactLoop.success(),"non-dyadic musical loop prepares");
+    check(audio::exact::comparePositions(
+              audio::exact::boundaryPosition(
+                  exactLoop.prepared->loop->clockBounds.exactEnd),
+              {23414,{{26,0},{41,0},false}})==0,
+          "loop end preserves exact 960000/41 boundary");
 }
 
 void fractionalClock() {
@@ -187,6 +200,167 @@ void partitionInvariance() {
     const std::array<std::size_t,8> split{64,128,256,7,201,128,128,88};
     check(renderPartitionedLoop(single)==renderPartitionedLoop(split),
           "loop render and fractional phase are callback-partition invariant");
+}
+
+std::vector<float> renderExactMusicalLoop(
+    std::span<const std::size_t> partitions) {
+    std::vector<float> samples(30000);
+    for (std::size_t index=0; index<samples.size(); ++index)
+        samples[index]=static_cast<float>(index+1)/30001.0F;
+    audio::PreparedTrackView track{{1},{{samples.data(),nullptr}},1,
+        {static_cast<std::uint64_t>(samples.size())},
+        timeline::SampleRate{48000},{0},{30000},{0},{}};
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000},{30000},
+        std::span{&track,1}});
+    musical::MusicalTimeMap map;
+    map.tempo.events[0].bpm={123.0};
+    auto temporal=audio::prepareTemporalContext(map,
+        musical::MusicalLoopRange{{0},{musical::ppq}},
+        timeline::SampleRate{48000},timeline::SampleRate{48000},12);
+    check(temporal.success(),"exact 123 BPM runtime loop prepares");
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "exact runtime loop clock is certified with renderer");
+    enterOperational(engine,48000);
+    check(engine.trySetLoopEnabled(true).accepted,"exact loop enable");
+    std::vector<float> empty;
+    process(engine,empty,empty,48000);
+    check(engine.tryRequestPlay().accepted,"exact loop Play");
+    std::size_t total{};
+    for (const auto count:partitions) total+=count;
+    std::vector<float> left(total),right(total);
+    std::size_t offset{};
+    realtimeAllocations.store(0,std::memory_order_relaxed);
+    countRealtimeAllocations.store(true,std::memory_order_relaxed);
+    for (const auto count:partitions) {
+        processRange(engine,left,right,offset,count,48000);
+        offset+=count;
+    }
+    countRealtimeAllocations.store(false,std::memory_order_relaxed);
+    check(realtimeAllocations.load(std::memory_order_relaxed)==0,
+          "exact non-dyadic loop processing allocates nothing in RT");
+    check(left[23414]>left[23415]*1000.0F && left[23415]>0.0F,
+          "last interior sample renders and first exterior sample wraps");
+    check(engine.transportSnapshot().position.value==1,
+          "fractional musical loop wraps on the exact device sample");
+    return left;
+}
+
+void crossedLoopStartMetronome() {
+    const auto render = [](std::size_t partition) {
+        musical::MusicalTimeMap map;
+        map.tempo.events[0].bpm = {123.0};
+        auto temporal = audio::prepareTemporalContext(map,
+            musical::MusicalLoopRange{{0}, {musical::ppq}},
+            timeline::SampleRate{48000}, timeline::SampleRate{48000}, 1);
+        check(temporal.success(), "crossed-event loop prepares");
+        audio::RealtimeAudioEngine engine;
+        engine.configure({timeline::SampleRate{48000}, {0},
+                          std::span<const audio::PreparedTrackView>{}});
+        check(engine.configureTemporalContext(temporal.prepared.get()), "crossed-event context");
+        enterOperational(engine, 48000);
+        check(engine.trySetLoopEnabled(true).accepted && engine.trySetMetronomeEnabled(true).accepted,
+              "simultaneous loop/metronome");
+        check(engine.trySetMetronomeLevel({0.0F}).accepted, "unity metronome");
+        std::vector<float> empty;
+        process(engine, empty, empty, 48000);
+        std::vector<float> settle(512), settleRight(512);
+        process(engine, settle, settleRight, 48000); // settle level while Stopped
+        check(engine.tryRequestPlay().accepted, "crossed-event Play");
+        constexpr std::size_t frames = 100000;
+        std::vector<float> result(frames), right(frames);
+        realtimeAllocations.store(0);
+        for (std::size_t offset = 0; offset < frames;) {
+            const auto count = std::min(partition, frames - offset);
+            std::array<float*, 2> outputs{result.data()+offset, right.data()+offset};
+            countRealtimeAllocations.store(true);
+            engine.processBlock({outputs.data(), 2, count}, timeline::SampleRate{48000});
+            countRealtimeAllocations.store(false);
+            offset += count;
+        }
+        check(realtimeAllocations.load() == 0, "crossed-event scheduling allocates nothing");
+        // Independent integer oracle: the first device sample in lap k is
+        // ceil(k * 960000 / 41). Tables give an audio oracle (including silence
+        // between voices); duplicate events would change the summed waveform.
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            float expected = 0;
+            for (std::size_t lap = 0; lap <= 4; ++lap) {
+                const auto trigger = (lap * 960000 + 40) / 41;
+                if (frame >= trigger && frame-trigger < temporal.prepared->clicks.frameCount)
+                    expected += temporal.prepared->clicks.accent[frame-trigger];
+            }
+            check(std::abs(result[frame]-expected) < 1.0e-6F,
+                  "one audible loop-start event per lap, including fractional overshoot");
+        }
+        return result;
+    };
+    const auto reference = render(100000);
+    check(reference == render(127) && reference == render(1024),
+          "loop-start events are callback-partition independent");
+}
+
+void exactMusicalLoopAndMetronome() {
+    const std::array<std::size_t,1> single{23416};
+    const std::array<std::size_t,5> split{511,1024,8192,10000,3689};
+    check(renderExactMusicalLoop(single)==renderExactMusicalLoop(split),
+          "non-dyadic musical loop is callback-partition invariant");
+
+    musical::MusicalTimeMap map;
+    map.tempo.events={{{1},{0},{120.0}},{{2},{musical::ppq},{123.0}}};
+    map.tempo.nextId={3};
+    auto temporal=audio::prepareTemporalContext(map,std::nullopt,
+        timeline::SampleRate{48000},timeline::SampleRate{48000},13);
+    check(temporal.success(),"exact metronome tempo-change context prepares");
+    for (const auto& segment:temporal.prepared->beats) {
+        if (segment.firstTick>=segment.endTick) continue;
+        const auto authoritative=temporal.prepared->musicalTime->exactProjectFrameAtTick(
+            {segment.firstTick});
+        check(authoritative && audio::exact::comparePositions(
+                  authoritative.value,segment.positionAt(segment.firstTick))==0,
+              "meter-derived beat ticks use the authoritative exact tempo mapping");
+    }
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000},{0},
+        std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "exact metronome context configures");
+    enterOperational(engine,48000);
+    check(engine.trySetMetronomeEnabled(true).accepted,
+          "exact metronome enable");
+    std::vector<float> empty;
+    process(engine,empty,empty,48000);
+    check(engine.tryRequestPlay().accepted,"exact metronome Play");
+    std::vector<float> left(47418),right(47418);
+    process(engine,left,right,48000);
+    // First post-change beat is 24000 + 960000/41 = 47414 + 26/41.
+    check(left[47414]==0.0F && left[47415]==0.0F &&
+          std::abs(left[47416])>0.0F,
+          "metronome event starts at first device sample at/after exact beat");
+
+    musical::MusicalTimeMap projectionMap;
+    projectionMap.tempo.events[0].bpm={123.0};
+    auto projectionTemporal=audio::prepareTemporalContext(projectionMap,
+        musical::MusicalLoopRange{{musical::ppq},{2*musical::ppq}},
+        timeline::SampleRate{48000},timeline::SampleRate{48000},14);
+    check(projectionTemporal.success(),"fractional projection loop prepares");
+    audio::RealtimeAudioEngine projection;
+    projection.configure({timeline::SampleRate{48000},{0},
+        std::span<const audio::PreparedTrackView>{}});
+    check(projection.configureTemporalContext(projectionTemporal.prepared.get()),
+          "fractional projection context configures");
+    enterOperational(projection,48000);
+    check(projection.trySetLoopEnabled(true).accepted,"projection loop enable");
+    process(projection,empty,empty,48000);
+    check(projection.tryRequestSeek({60000}).accepted,"seek beyond loop while stopped");
+    process(projection,empty,empty,48000);
+    check(projection.tryRequestPlay().accepted,"projection loop Play");
+    const auto projected=projection.projectedTransportSnapshot();
+    check(projected.position.value==23415,
+          "projection rounds the exact prepared loop start");
+    process(projection,empty,empty,48000);
+    check(projection.transportSnapshot().position.value==23415 &&
+          projection.transportSnapshot().position==projected.position,
+          "RT and projection consume the same exact loop boundary");
 }
 
 void temporalReregistrationPreservesClock() {
@@ -303,6 +477,8 @@ int main() {
     fractionalClock();
     loopRenderAndMultipleWraps();
     partitionInvariance();
+    exactMusicalLoopAndMetronome();
+    crossedLoopStartMetronome();
     temporalReregistrationPreservesClock();
     metronomeAndEmptyPolicy();
     std::cout << "Loop and metronome tests passed\n";

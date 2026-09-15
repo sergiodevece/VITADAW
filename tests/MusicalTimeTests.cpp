@@ -45,6 +45,34 @@ void golden() {
     const long double oracle=(777.L/ppq*0.5L+(2.L-777.L/ppq)*60.L/123.456L)*48000.L;
     near(p->preciseProjectFrameAt({2}).value.value,oracle);
 }
+void exactDspPreparation() {
+    MusicalTimeMap map;
+    map.tempo.events[0].bpm = {123.0};
+    auto prepared = prepare(map, 48000.0);
+    const auto beat = prepared->exactProjectFrameAtTick({ppq});
+    check(bool(beat), "123 BPM exact beat prepares");
+    check(audio::exact::comparePositions(
+              beat.value, {23414, {{26,0},{41,0},false}}) == 0,
+          "48000/123 beat is exactly 960000/41 frames");
+    check(audio::exact::comparePositions(
+              {23414, {{25,0},{41,0},false}}, beat.value) < 0,
+          "rational position immediately before beat remains before");
+    check(audio::exact::comparePositions(
+              {23414, {{27,0},{41,0},false}}, beat.value) > 0,
+          "rational position immediately after beat remains after");
+
+    map.tempo.events.push_back({{2},{ppq},{std::nextafter(123.0, 124.0)}});
+    map.tempo.events.push_back({{3},{3*ppq},{123.5}});
+    map.tempo.nextId = {4};
+    prepared = prepare(map, 48000.0);
+    const auto firstAnchor = prepared->exactProjectFrameAtTick({ppq});
+    const auto secondAnchor = prepared->exactProjectFrameAtTick({3*ppq});
+    check(firstAnchor && secondAnchor &&
+          audio::exact::comparePositions(firstAnchor.value, beat.value) == 0,
+          "later tempo events do not perturb the exact prior anchor");
+    check(audio::exact::comparePositions(secondAnchor.value, firstAnchor.value) > 0,
+          "neighboring-binary64 and fractional BPM segments remain monotonic");
+}
 void numeric() {
     std::mt19937_64 rng{5242};
     for (double rate:{44100.,48000.,96000.}) {
@@ -127,4 +155,4 @@ void validation() {
     check(!p->quarterNotePositionAt(timeline::PreciseProjectFramePosition{double(maximumCoordinate)*2}),"overflow query");
 }
 }
-int main(){golden();numeric();grid();validation();std::cout<<"Musical time tests passed\n";}
+int main(){golden();exactDspPreparation();numeric();grid();validation();std::cout<<"Musical time tests passed\n";}

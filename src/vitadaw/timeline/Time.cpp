@@ -1,4 +1,5 @@
 #include "vitadaw/timeline/Time.h"
+#include "vitadaw/audio/TemporalInteger.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,20 @@ std::int64_t roundedFrames(double frames) noexcept {
 
 bool SampleRate::isValid() const noexcept {
     return hertz_ > 0.0 && std::isfinite(hertz_);
+}
+
+std::optional<ProjectFramePosition> checkedExclusiveProjectEnd(
+    ProjectFramePosition start, ProjectFrameDuration duration) noexcept {
+    using namespace audio::exact;
+    const auto decoded = decodeForPreparation(duration.value);
+    if (start.value < 0 || !decoded.valid || zero(wide(decoded.numerator))) return std::nullopt;
+    auto length = divmod(wide(decoded.numerator), wide(decoded.denominator));
+    if (!zero(length.remainder)) add(length.quotient, wide(1), length.quotient);
+    if (!fits64(length.quotient) || length.quotient.words[0] > static_cast<std::uint64_t>(INT64_MAX)) return std::nullopt;
+    const auto whole = static_cast<std::int64_t>(length.quotient.words[0]);
+    if (whole > std::numeric_limits<std::int64_t>::max() - start.value)
+        return std::nullopt;
+    return ProjectFramePosition{start.value + whole};
 }
 
 Seconds sourceFramesToSeconds(SourceFrameCount frames,
@@ -37,6 +52,15 @@ Seconds projectPositionToSeconds(ProjectFramePosition position,
     return {static_cast<double>(position.value) / projectSampleRate.hertz()};
 }
 
+std::optional<Seconds> checkedProjectPositionToSeconds(
+    ProjectFramePosition position, SampleRate projectSampleRate) noexcept {
+    if (!isSupportedProjectFramePosition(position) ||
+        !projectSampleRate.isValid()) return std::nullopt;
+    const auto seconds = projectPositionToSeconds(position, projectSampleRate);
+    return std::isfinite(seconds.value)
+        ? std::optional<Seconds>{seconds} : std::nullopt;
+}
+
 ProjectFrameCount secondsToProjectFrames(Seconds seconds,
                                          SampleRate projectSampleRate) noexcept {
     return {roundedFrames(seconds.value * projectSampleRate.hertz())};
@@ -56,15 +80,15 @@ ProjectFrameCount sourceFramesToProjectDuration(SourceFrameCount frames,
         !projectSampleRate.isValid()) {
         return {};
     }
-    const auto converted = std::ceil(
-        static_cast<long double>(frames.value) *
-        static_cast<long double>(projectSampleRate.hertz()) /
-        static_cast<long double>(sourceSampleRate.hertz()));
-    if (!std::isfinite(converted) ||
-        converted > static_cast<long double>(std::numeric_limits<std::int64_t>::max())) {
+    using namespace audio::exact;
+    const auto ratio = rateRatioForPreparation(projectSampleRate.hertz(), sourceSampleRate.hertz());
+    if (!ratio.valid) return {std::numeric_limits<std::int64_t>::max()};
+    auto converted = divmod(multiply({frames.value, 0}, ratio.numerator), wide(ratio.denominator));
+    if (!zero(converted.remainder)) add(converted.quotient, wide(1), converted.quotient);
+    if (!fits64(converted.quotient) || converted.quotient.words[0] > static_cast<std::uint64_t>(INT64_MAX)) {
         return {std::numeric_limits<std::int64_t>::max()};
     }
-    return {std::max<std::int64_t>(1, static_cast<std::int64_t>(converted))};
+    return {std::max<std::int64_t>(1, static_cast<std::int64_t>(converted.quotient.words[0]))};
 }
 
 ProjectFramePosition sourcePositionToProjectPosition(

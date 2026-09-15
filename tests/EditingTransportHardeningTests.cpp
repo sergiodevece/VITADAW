@@ -229,6 +229,9 @@ public:
     audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override {
         return rt_.transportSnapshot();
     }
+    audio::RealtimeTransportSnapshot projectedTransportSnapshot() noexcept override {
+        return rt_.projectedTransportSnapshot();
+    }
     mixer::MeterSnapshot meterSnapshot() const noexcept override {
         return rt_.meterSnapshot();
     }

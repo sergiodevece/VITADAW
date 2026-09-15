@@ -14,7 +14,10 @@ enum class ChannelLayout : std::uint8_t { mono = 1, stereo = 2 };
 enum class ProcessingMode : std::uint8_t { realtime, offline };
 enum class TemporalDiscontinuity : std::uint8_t {
     continuous,
+    // A quiescent rebuild subsumes a pending Seek. Its first DSP block receives
+    // hardDiscontinuity, then continuous. Legitimate rebuild resets remain.
     hardDiscontinuity,
+    seek,
     loopWrap,
 };
 

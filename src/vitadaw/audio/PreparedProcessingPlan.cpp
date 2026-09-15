@@ -230,7 +230,7 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
                              scratchBytesPerFrame) ||
             !checkedAdd(mixBytesPerFrame, scratchBytesPerFrame,
                         bytesPerFrame) ||
-            !checkedAdd(bytesPerFrame, sizeof(double), bytesPerFrame)) {
+            !checkedAdd(bytesPerFrame, sizeof(DspFramePosition), bytesPerFrame)) {
             return {nullptr, "Processing buffer size overflow"};
         }
         std::size_t preparedBytes{};
@@ -362,6 +362,8 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
         }
 
         PreparedProcessingPlan plan;
+        plan.exactClock = exact::clockForPreparation(specification.projectSampleRate.hertz(), processingSampleRate.hertz());
+        if (!plan.exactClock.valid) return {nullptr, "Unsupported exact project/device rate configuration"};
         plan.projectSampleRate = specification.projectSampleRate;
         plan.blockCapacity = blockCapacity;
         plan.stereoProcessingFormat = {
@@ -631,6 +633,10 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
             if (preparedSource != legacySources.end()) {
                 source = *preparedSource;
                 source.mix = track.mix;
+                source.exactSource = exact::sourceForPreparation(source.sourceSampleRate.hertz(),
+                    specification.projectSampleRate.hertz(), static_cast<double>(source.clipDuration.value),
+                    static_cast<double>(source.sourceOffset.value), plan.exactClock);
+                if (!source.exactSource.valid) return {nullptr, "Legacy source exceeds exact DSP capacity"};
                 if (source.clipDuration.value >
                     std::numeric_limits<std::int64_t>::max() -
                         source.clipStart.value) {
@@ -649,7 +655,7 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
                                : track.layout;
             route.clips.first = plan.clips.size();
             route.destinationBusIndex = destination;
-            double prefixMaximumEnd{};
+            std::int64_t prefixMaximumEnd{};
             for (const auto& clip : track.clips) {
                 const auto sourceFound = std::lower_bound(
                     plan.sources.begin(), plan.sources.end(), clip.source,
@@ -661,7 +667,7 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
                     sourceFound == plan.sources.end() ||
                     sourceFound->id != clip.source ||
                     sourceFound->layout != track.layout ||
-                    clip.projectStart.value < 0 ||
+                    !timeline::isSupportedProjectFramePosition(clip.projectStart) ||
                     !std::isfinite(clip.duration.value) ||
                     clip.duration.value <= 0.0 ||
                     !std::isfinite(clip.sourceOffset.value) ||
@@ -670,7 +676,9 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
                 }
                 const auto projectStart =
                     static_cast<double>(clip.projectStart.value);
-                const auto projectEnd = projectStart + clip.duration.value;
+                // Conservative candidate-search bound. DSP uses local duration.
+                const auto projectEnd = std::nextafter(projectStart + clip.duration.value,
+                    std::numeric_limits<double>::infinity());
                 const auto sourceEnd =
                     static_cast<long double>(clip.sourceOffset.value) +
                     static_cast<long double>(clip.duration.value) *
@@ -708,12 +716,20 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
                      static_cast<std::size_t>(sourceFound - plan.sources.begin()),
                      projectStart, projectEnd, clip.sourceOffset.value,
                      sourceFound->sampleRate.hertz() /
-                         specification.projectSampleRate.hertz()});
-                prefixMaximumEnd = std::max(prefixMaximumEnd, projectEnd);
-                plan.clipPrefixMaximumEnd.push_back(prefixMaximumEnd);
+                         specification.projectSampleRate.hertz(), clip.duration.value, {}, {}});
+                auto& numericClip = plan.clips.back();
+                numericClip.exactStart = clip.projectStart.value;
+                numericClip.exactSource = exact::sourceForPreparation(sourceFound->sampleRate.hertz(),
+                    specification.projectSampleRate.hertz(), clip.duration.value, clip.sourceOffset.value, plan.exactClock);
+                if (!numericClip.exactSource.valid)
+                    return {nullptr, "Clip exceeds the certified exact DSP domain"};
                 ++route.clips.count;
-                const auto exclusiveEnd = static_cast<std::int64_t>(
-                    std::ceil(projectEnd));
+                const auto end = timeline::checkedExclusiveProjectEnd(clip.projectStart, clip.duration);
+                if (!end || !timeline::isSupportedProjectFramePosition(*end))
+                    return {nullptr, "Prepared clip exceeds the supported numerical domain"};
+                const auto exclusiveEnd = end->value;
+                prefixMaximumEnd = std::max(prefixMaximumEnd, exclusiveEnd);
+                plan.clipPrefixMaximumEnd.push_back(prefixMaximumEnd);
                 plan.duration.value = std::max(plan.duration.value,
                                                exclusiveEnd);
             }

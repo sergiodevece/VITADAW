@@ -1,187 +1,115 @@
 #pragma once
-
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/transport/PlaybackState.h"
-
-#include <algorithm>
-#include <cmath>
-#include <cstddef>
+#include "vitadaw/transport/TransportReducer.h"
+#include "vitadaw/audio/DspFramePosition.h"
+#include "vitadaw/audio/ExactProjectPhase.h"
 #include <optional>
-#include <limits>
 
 namespace vitadaw::audio {
-
-// The only advancing clock in the RT render path. Tracks derive their source
-// positions from position(); they never own or advance independent cursors.
 class RealtimeProjectClock {
 public:
+    using LoopBounds = exact::LoopBounds;
     void prepare(timeline::ProjectFrameCount duration) noexcept {
         duration_ = duration;
-        navigationLimit_ = duration;
-        playbackLimit_ = duration;
         loop_.reset();
         runUntilStop_ = false;
+        phase_ = {};
+        phase_.installPreparedFormat(exact::clockForPreparation(1, 1));
         stopAndRewind();
     }
-
-    struct LoopBounds { double start{}, end{}; };
-    void setPlaybackPolicy(std::optional<LoopBounds> loop,
-                           bool runUntilStop) noexcept {
-        loop_ = loop;
+    // Quiescent/non-RT. Never prepare or reduce a rate inside advanceDeviceFrame.
+    bool prepareFormat(exact::ClockFormat format) noexcept {
+        return phase_.installPreparedFormat(format);
+    }
+    void setPlaybackPolicy(std::optional<LoopBounds> loop, bool runUntilStop) noexcept {
+        loop_ = loop && loop->valid ? loop : std::nullopt;
         runUntilStop_ = runUntilStop;
-        playbackLimit_ = navigationLimit_;
-        if (loop_) {
-            playbackLimit_.value = std::max(
-                playbackLimit_.value,
-                static_cast<std::int64_t>(std::ceil(loop_->end)));
-        }
     }
-
-    // A documentary locator may legitimately extend beyond audible content even
-    // while looping is disabled. Preparation publishes that bound quiescently;
-    // it is navigation metadata, not an alternative playback clock.
-    void setNavigationLimit(timeline::ProjectFrameCount limit) noexcept {
-        navigationLimit_.value = std::max(duration_.value, limit.value);
-        playbackLimit_ = navigationLimit_;
-        if (loop_) {
-            playbackLimit_.value = std::max(
-                playbackLimit_.value,
-                static_cast<std::int64_t>(std::ceil(loop_->end)));
-        }
+    bool play() noexcept {
+        if (duration_.value <= 0 && !loop_ && !runUntilStop_) return false;
+        return transition({transport::TransportActionKind::play, {}}).accepted;
     }
-
-    [[nodiscard]] bool play() noexcept {
-        if (duration_.value <= 0 && !loop_ && !runUntilStop_) {
-            return false;
-        }
-        if (loop_ && position_.value >= loop_->end) {
-            position_ = {loop_->start};
-            compensation_ = 0.0;
-        } else if (!loop_ && duration_.value > 0 &&
-                   position_.value >= static_cast<double>(duration_.value)) {
-            position_ = {0.0};
-            compensation_ = 0.0;
-        }
-        playback_ = transport::PlaybackState::playing;
-        return true;
+    void pause() noexcept { static_cast<void>(transition({transport::TransportActionKind::pause, {}})); }
+    void stop() noexcept { static_cast<void>(transition({transport::TransportActionKind::stop, {}})); }
+    bool seek(timeline::ProjectFramePosition target) noexcept {
+        return transition({transport::TransportActionKind::seek, target}).accepted;
     }
-
-    void pause() noexcept {
-        if (playback_ == transport::PlaybackState::playing)
-            playback_ = transport::PlaybackState::paused;
+    void stopAndRewind() noexcept { static_cast<void>(transition({transport::TransportActionKind::rewind, {}})); }
+    transport::TransportBoundaryFacts boundaryFacts() const noexcept {
+        return {phase_.before(integerBoundary(duration_.value)), loop_ && phase_.before(loop_->exactEnd)};
     }
-
-    void stop() noexcept {
-        if (playback_ == transport::PlaybackState::stopped) {
-            position_ = {0.0};
-            compensation_ = 0.0;
-        }
-        playback_ = transport::PlaybackState::stopped;
-    }
-
-    [[nodiscard]] bool seek(timeline::ProjectFramePosition target) noexcept {
-        if (target.value < 0 || target.value > playbackLimit_.value || isPlaying()) return false;
-        position_ = {static_cast<double>(target.value)};
-        compensation_ = 0.0;
-        wrapped_ = false;
-        return true;
-    }
-
-    void stopAndRewind() noexcept {
-        playback_ = transport::PlaybackState::stopped;
-        position_ = {0.0};
-        compensation_ = 0.0;
-    }
-
-    void advance(timeline::ProjectFrameDuration frames) noexcept {
-        if (!isPlaying()) {
-            return;
-        }
-
-        const auto compensatedIncrement = frames.value - compensation_;
-        const auto next = position_.value + compensatedIncrement;
-        compensation_ = (next - position_.value) - compensatedIncrement;
-        position_.value = next;
-
-        if (loop_) {
-            if (position_.value >= loop_->end) {
-                const auto length = loop_->end - loop_->start;
-                position_.value = loop_->start +
-                    std::fmod(position_.value - loop_->start, length);
-                if (position_.value < loop_->start) position_.value += length;
-                wrapped_ = true;
+    bool isBefore(exact::Boundary boundary) const noexcept { return phase_.before(boundary); }
+    bool isBefore(exact::RationalBoundary boundary) const noexcept { return phase_.before(boundary); }
+    transport::TransportReduction transition(transport::TransportAction action) noexcept {
+        transport::TransportReductionPolicy policy;
+        if (loop_) policy.loop = transport::TransportReductionPolicy::Loop{*loop_};
+        policy.boundaries = boundaryFacts();
+        const auto result = transport::reduceTransport({playback_, publicPosition(), duration_}, action, policy);
+        if (result.accepted) {
+            playback_ = result.state.playback;
+            if (result.clockEffect == transport::ClockEffect::loopStart) phase_.locate(loop_->exactStart);
+            else if (result.clockEffect == transport::ClockEffect::locate) {
+                phase_.locate(static_cast<std::uint64_t>(result.state.position.value));
+                wrapped_ = false;
             }
-            return;
         }
-        if (runUntilStop_) return;
-        const auto end = static_cast<double>(duration_.value);
-        constexpr auto tolerance = 1.0e-7;
-        if (position_.value >= end - tolerance) {
-            position_.value = end;
-            compensation_ = 0.0;
-            playback_ = transport::PlaybackState::stopped;
-        }
-    }
-
-    [[nodiscard]] bool isPlaying() const noexcept {
-        return playback_ == transport::PlaybackState::playing;
-    }
-    [[nodiscard]] transport::PlaybackState playback() const noexcept { return playback_; }
-    [[nodiscard]] timeline::PreciseProjectFramePosition position() const noexcept {
-        return position_;
-    }
-    [[nodiscard]] timeline::ProjectFramePosition publicPosition() const noexcept {
-        const auto rounded = static_cast<std::int64_t>(std::llround(position_.value));
-        return {std::max(rounded, std::int64_t{0})};
-    }
-    [[nodiscard]] timeline::ProjectFrameCount duration() const noexcept {
-        return duration_;
-    }
-    [[nodiscard]] timeline::ProjectFrameCount playbackLimit() const noexcept {
-        return playbackLimit_;
-    }
-    [[nodiscard]] std::optional<LoopBounds> loop() const noexcept { return loop_; }
-    [[nodiscard]] bool isRunUntilStop() const noexcept { return runUntilStop_; }
-    [[nodiscard]] std::size_t continuousFramesAvailable(
-        std::size_t requested, timeline::ProjectFrameDuration increment) const noexcept {
-        if (!loop_ || !isPlaying() || increment.value <= 0.0) return requested;
-        const auto remaining = loop_->end - position_.value;
-        if (remaining <= 0.0) return 1;
-        const auto quotient = std::nextafter(
-            remaining / increment.value,
-            -std::numeric_limits<double>::infinity());
-        const auto frames = static_cast<std::size_t>(std::ceil(quotient));
-        return std::max<std::size_t>(1, std::min(requested, frames));
-    }
-    [[nodiscard]] bool consumeWrapped() noexcept {
-        const auto result = wrapped_;
-        wrapped_ = false;
         return result;
     }
+    // Offline compatibility helper for existing clock tests. Not used by engine.
+    void advance(timeline::ProjectFrameDuration frames) noexcept {
+        const auto format = exact::clockForPreparation(frames.value, 1);
+        if (format.valid && phase_.installPreparedFormat(format)) advancePrepared();
+    }
+    void advanceDeviceFrame() noexcept { advancePrepared(); }
+    bool isPlaying() const noexcept { return playback_ == transport::PlaybackState::playing; }
+    transport::PlaybackState playback() const noexcept { return playback_; }
+    timeline::PreciseProjectFramePosition position() const noexcept { return {renderPosition().approximate()}; }
+    timeline::ProjectFramePosition publicPosition() const noexcept { return {phase_.position().frame}; }
+    DspFramePosition renderPosition() const noexcept {
+        const auto value = phase_.position();
+        return {{value.frame}, value.phase};
+    }
+    timeline::ProjectFrameCount duration() const noexcept { return duration_; }
+    std::optional<LoopBounds> loop() const noexcept { return loop_; }
+    bool isRunUntilStop() const noexcept { return runUntilStop_; }
+    exact::ClockFormat exactFormat() const noexcept { return phase_.format(); }
+    std::size_t continuousFramesAvailable(std::size_t requested) const noexcept {
+        return loop_ && isPlaying() ? phase_.framesBefore(loop_->exactEnd, requested) : requested;
+    }
+    bool consumeWrapped() noexcept { const bool result = wrapped_; wrapped_ = false; return result; }
     struct Checkpoint {
-        timeline::PreciseProjectFramePosition position;
+        timeline::ProjectFramePosition position;
+        exact::Phase phase;
         transport::PlaybackState playback{transport::PlaybackState::stopped};
     };
-    [[nodiscard]] Checkpoint checkpoint() const noexcept {
-        return {position_, playback_};
-    }
-    void restoreQuiescentCheckpoint(Checkpoint value) noexcept {
-        position_.value = std::max(0.0, value.position.value);
-        compensation_ = 0.0;
+    Checkpoint checkpoint() const noexcept { return {publicPosition(), phase_.position().phase, playback_}; }
+    bool restoreQuiescentCheckpoint(Checkpoint value) noexcept {
+        if (!phase_.restore({{value.position.value, value.phase}})) return false;
         playback_ = value.playback;
         wrapped_ = false;
+        return true;
     }
-
 private:
-    timeline::PreciseProjectFramePosition position_;
+    static exact::Boundary integerBoundary(std::int64_t frame) noexcept {
+        return {static_cast<std::uint64_t>(frame), {}, 0, true};
+    }
+    void advancePrepared() noexcept {
+        if (!isPlaying()) return;
+        std::optional<exact::ProjectPhase::Loop> loop;
+        if (loop_) loop = {{loop_->exactStart, loop_->exactEnd}};
+        wrapped_ = phase_.advance(loop) || wrapped_;
+        if (loop_) return;
+        if (!phase_.before(integerBoundary(timeline::maximumSupportedProjectFrame().value))) {
+            static_cast<void>(transition({transport::TransportActionKind::finish, timeline::maximumSupportedProjectFrame()}));
+        } else if (!runUntilStop_ && !phase_.before(integerBoundary(duration_.value))) {
+            static_cast<void>(transition({transport::TransportActionKind::finish, {duration_.value}}));
+        }
+    }
+    exact::ProjectPhase phase_;
     timeline::ProjectFrameCount duration_;
-    timeline::ProjectFrameCount navigationLimit_;
-    timeline::ProjectFrameCount playbackLimit_;
     std::optional<LoopBounds> loop_;
-    bool runUntilStop_{};
-    bool wrapped_{};
-    double compensation_{};
+    bool runUntilStop_{}, wrapped_{};
     transport::PlaybackState playback_{transport::PlaybackState::stopped};
 };
-
 } // namespace vitadaw::audio

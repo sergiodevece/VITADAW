@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/musical/MusicalTime.h"
+#include "vitadaw/audio/ExactTemporal.h"
 
 #include <array>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vitadaw::audio {
 
@@ -35,6 +37,7 @@ struct PreparedLoopRange {
     timeline::PreciseProjectFramePosition end;
     timeline::ProjectFrameDuration duration;
     std::uint64_t musicalMapRevision{};
+    exact::LoopBounds clockBounds;
     [[nodiscard]] bool isValid() const noexcept;
 };
 
@@ -45,11 +48,27 @@ struct PreparedClickTables {
     timeline::SampleRate deviceSampleRate;
 };
 
+// A bounded analytical beat grid. Anchors are the document's prepared project
+// frame values; advancement and placement from those anchors use exact ratios.
+struct PreparedBeatSegment {
+    std::int64_t tempoTick{}, firstTick{}, endTick{}, signatureTick{}, ticksPerBeat{}, ticksPerBar{};
+    std::int64_t firstFrame{}, lastFrame{};
+    exact::LinearMapping framesFromTempo;
+    [[nodiscard]] exact::Position positionAt(std::int64_t tick) const noexcept {
+        return framesFromTempo.at(
+            static_cast<std::uint64_t>(tick - tempoTick));
+    }
+};
+
 struct PreparedTemporalContext {
     musical::MusicalTimeMap documentMap;
     std::unique_ptr<const musical::PreparedMusicalTimeMap> musicalTime;
     std::optional<PreparedLoopRange> loop;
     PreparedClickTables clicks;
+    std::vector<PreparedBeatSegment> beats;
+    exact::ClockFormat exactClock;
+    timeline::SampleRate projectSampleRate;
+    timeline::SampleRate deviceSampleRate;
     std::uint64_t revision{};
 };
 

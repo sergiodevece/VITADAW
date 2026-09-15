@@ -187,6 +187,53 @@ y corrigió una discrepancia de tolerancia entre `ProjectState` y la preparació
 del plan para duraciones 44,1↔48 kHz; no se modificó el callback ni el render.
 Detalles: [`docs/validation-0.5.6.md`](docs/validation-0.5.6.md).
 
+El candidato VitaDAW 0.6.0 refuerza los fundamentos temporales sin cambiar aún
+la versión publicada 0.5.6. `ProjectFramePosition` entero es la única posición
+autoritativa; los segundos son solo presentación y el residuo fraccionario del
+reloj queda confinado a la conversión device/project. La duración describe el
+contenido, no el dominio navegable: un Seek detenido o pausado puede situarse
+después del último clip sin crear contenido. El límite técnico provisional es
+`maximumSupportedProjectFrame()` (2^53−1), encapsulado por depender de rutas DSP
+que todavía usan `double`.
+
+Play, Pause, Stop y Seek se proyectan mediante un reductor portable siguiendo el
+orden de comandos realmente aceptados por el motor. Así dos Stop pendientes
+conservan la semántica de segundo Stop y una ráfaga de Seek termina en el último
+destino. Seek durante Playing sigue rechazado provisionalmente. Un Seek aceptado
+marca una discontinuidad específica que permanece pendiente durante Pause y se
+entrega al primer bloque DSP posterior, sin llamar a `reset()` universalmente.
+Si antes hay una reconstrucción, `hardDiscontinuity` subsume esa notificación.
+El reductor se utiliza también en RT: el reloj aplica sus efectos, y la proyección
+reconcilia snapshots parciales mediante replay puro de un registro acotado de
+comandos aceptados. La aceptación requiere espacio en FIFO y registro.
+Los identificadores de comandos son tickets de reserva/resolución: una reserva
+rechazada puede dejar un hueco o aparecer en el watermark, sin ejecutar su acción.
+Las fronteras usan entero/residuo y el render conserva esa separación hasta
+calcular coordenadas locales; un locator redondeado al final no implica que DSP
+haya terminado. La proyección no garantiza observación instantánea de RT.
+La disponibilidad de Play procede del snapshot más replay y se valida contra la
+generación del claim, sin flags auxiliares. Las coordenadas fuente conservan el
+resto racional hasta comprobar límites; el final natural no usa una epsilon anticipatoria.
+La migración numérica usa componentes de 128 bits y temporales fijos de 256,
+backend portable y oráculo independiente Python/Fraction (también con fast-math).
+El render decide índice y pertenencia antes de interpolar. El scheduler RT del
+metrónomo también usa datos preparados y comparaciones enteras.
+La preparación DSP del mapa musical interpreta los bits binary64 contractuales
+de project rate y BPM sin evaluar antes segundos ni frames en floating point.
+Los anchors de tempo, beats, límites de loop y eventos de metrónomo comparten
+ahora una integral racional exacta preparada fuera de RT. Las APIs de ruler,
+etiquetas y presentación conservan sus doubles, pero no realimentan decisiones
+discretas de audio. Las configuraciones cuya integral o integración con el reloj
+exceda la capacidad fija 128/256 se rechazan transaccionalmente, sin aproximación.
+El reloj base admite un denominador de hasta 125 bits y el extendido musical
+hasta 128, sujeto a certificación conjunta. El adaptador JUCE prepara plan,
+contexto y checkpoint antes de reemplazarlos; retira las referencias del motor
+antes de destruir sus propietarios. Un rechazo conserva el estado DSP anterior,
+aunque el dispositivo físico puede quedar indisponible. La validación incluye
+un harness JUCE sin hardware para bootstrap, lifetime, checkpoint y reprepare;
+no equivale a un smoke acústico ni a un benchmark RT profesional.
+Detalles: [`docs/validation-0.6.0.md`](docs/validation-0.6.0.md).
+
 ## Tecnología propuesta
 
 - **C++20** para el núcleo y el callback de audio.
@@ -577,6 +624,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.6 — Editing & Transport Hardening:** matriz de transporte y edición,
   loops y límites de bloque, historial/persistencia bajo secuencias largas,
   escala combinada y validación coherente del round-trip 44,1↔48 kHz.
+- **0.6.0 — Transport & Timeline Foundation (candidato):** posición entera
+  autoritativa, dominio navegable separado del contenido, reducción sobre el
+  orden aceptado y discontinuidad Seek explícita sin reset universal.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -604,4 +654,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.3.md`](docs/validation-0.5.3.md) y
 [`docs/validation-0.5.4.md`](docs/validation-0.5.4.md) y
 [`docs/validation-0.5.5.md`](docs/validation-0.5.5.md) y
-[`docs/validation-0.5.6.md`](docs/validation-0.5.6.md).
+[`docs/validation-0.5.6.md`](docs/validation-0.5.6.md) y
+[`docs/validation-0.6.0.md`](docs/validation-0.6.0.md).

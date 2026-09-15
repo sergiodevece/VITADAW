@@ -52,15 +52,22 @@ struct JuceAudioDeviceAdapter::PreparedJuceProcessingPlan final
 JuceAudioDeviceAdapter::JuceAudioDeviceAdapter() = default;
 JuceAudioDeviceAdapter::~JuceAudioDeviceAdapter() { shutdown(); }
 
-bool JuceAudioDeviceAdapter::initialise() {
+void JuceAudioDeviceAdapter::beginDeviceReinitialisation() noexcept {
+    detachAudioCallback(true);
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
     closeDevice(false);
+    static_cast<void>(realtimeEngine_.restoreTemporalCheckpoint(checkpoint));
     pendingLifecycleEvent_.store(PendingLifecycleEvent::none, std::memory_order_release);
-    realtimeEngine_.deviceInitialising();
+    realtimeEngine_.deviceInitialisingPreservingTransport();
+}
+
+bool JuceAudioDeviceAdapter::initialise() {
+    beginDeviceReinitialisation();
     deviceManager_.addChangeListener(this);
     changeListenerRegistered_ = true;
     const auto error = deviceManager_.initialiseWithDefaultDevices(0, 2);
     if (error.isNotEmpty()) {
-        realtimeEngine_.deviceError();
+        realtimeEngine_.deviceErrorPreservingTransport();
         stateModel_.markError(error.toStdString());
         publishState();
         return false;
@@ -71,19 +78,12 @@ bool JuceAudioDeviceAdapter::initialise() {
     }
     std::string preparationError;
     if (!reprepareForCurrentDevice(preparationError)) {
-        realtimeEngine_.deviceError();
+        realtimeEngine_.deviceErrorPreservingTransport();
         stateModel_.markError(std::move(preparationError));
         publishState();
         return false;
     }
-    if (!reprepareTemporalForCurrentDevice(preparationError)) {
-        realtimeEngine_.deviceError();
-        stateModel_.markError(std::move(preparationError));
-        publishState();
-        return false;
-    }
-    realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
-    attachAudioCallback();
+    attachAudioCallback(true);
     refreshState();
     return stateModel_.state().status == audio::AudioDeviceStatus::active;
 }
@@ -92,27 +92,22 @@ bool JuceAudioDeviceAdapter::reinitialise() { return initialise(); }
 void JuceAudioDeviceAdapter::shutdown() noexcept { closeDevice(true); }
 
 void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
-    if (preparedProject_ != nullptr && deviceSampleRate_.isValid() &&
-        preparedProject_->specification.processingSampleRate !=
-            deviceSampleRate_) {
+    if (deviceSampleRate_.isValid() &&
+        ((preparedProject_ && preparedProject_->specification.processingSampleRate != deviceSampleRate_) ||
+         (preparedTemporalContext_ && preparedTemporalContext_->deviceSampleRate != deviceSampleRate_))) {
         const auto callbackWasRegistered = callbackRegistered_;
-        detachAudioCallback();
+        detachAudioCallback(true);
+        const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+        static_cast<void>(realtimeEngine_.restoreTemporalCheckpoint(checkpoint));
         std::string error;
         if (!reprepareForCurrentDevice(error)) {
-            realtimeEngine_.deviceError();
+            realtimeEngine_.deviceErrorPreservingTransport();
             stateModel_.markError(std::move(error));
             publishState();
             return;
         }
-        if (!reprepareTemporalForCurrentDevice(error)) {
-            realtimeEngine_.deviceError();
-            stateModel_.markError(std::move(error));
-            publishState();
-            return;
-        }
-        realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
         if (callbackWasRegistered) {
-            attachAudioCallback();
+            attachAudioCallback(true);
         }
         refreshState();
         return;
@@ -517,12 +512,45 @@ bool JuceAudioDeviceAdapter::commitPreparedTemporalContext(
     std::unique_ptr<audio::PreparedTemporalContext> candidate,
     audio::AudioFileCommitAction modelCommit) noexcept {
     if (!candidate || !modelCommit.isValid()) return false;
-    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    // A new application has a valid prepared musical context before its first
+    // audio plan exists. Establish the empty portable engine at the project's
+    // logical rate so this context is already certified if audio-device
+    // initialisation happens before the first import.
+    if (preparedProject_ == nullptr && !projectSampleRate_.isValid()) {
+        realtimeEngine_.configure({candidate->projectSampleRate, {}, {}, {}, false});
+        if (!realtimeEngine_.configureTemporalContext(candidate.get())) return false;
+        projectSampleRate_ = candidate->projectSampleRate;
+        preparedTemporalContext_.swap(candidate);
+        modelCommit.execute();
+        return true;
+    }
     const auto callbackWasRegistered = callbackRegistered_;
-    detachAudioCallback();
+    detachAudioCallback(true);
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    if (!realtimeEngine_.canConfigureTemporalContext(candidate.get())) {
+        if (callbackWasRegistered) {
+            try { attachAudioCallback(true); }
+            catch (...) { realtimeEngine_.deviceErrorPreservingTransport(); }
+        }
+        return false;
+    }
     preparedTemporalContext_.swap(candidate);
-    realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
-    realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
+    if (!realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get()) ||
+        !realtimeEngine_.restoreTemporalCheckpoint(checkpoint)) {
+        preparedTemporalContext_.swap(candidate);
+        static_cast<void>(realtimeEngine_.configureTemporalContext(
+            preparedTemporalContext_.get()));
+        static_cast<void>(realtimeEngine_.restoreTemporalCheckpoint(checkpoint));
+        if (callbackWasRegistered) {
+            try { attachAudioCallback(true); }
+            catch (...) {
+                realtimeEngine_.deviceError();
+                pendingLifecycleEvent_.store(PendingLifecycleEvent::error,
+                                             std::memory_order_release);
+            }
+        }
+        return false;
+    }
     modelCommit.execute();
     if (callbackWasRegistered) {
         try { attachAudioCallback(true); }
@@ -541,7 +569,12 @@ bool JuceAudioDeviceAdapter::commitPreparedProjectAndTemporalContext(
     audio::AudioFileCommitAction modelCommit) noexcept {
     auto* projectCandidate = dynamic_cast<PreparedJuceProcessingPlan*>(project.get());
     if (!projectCandidate || !projectCandidate->preparedProject || !temporal ||
-        !modelCommit.isValid()) return false;
+        !modelCommit.isValid() ||
+        temporal->projectSampleRate != projectCandidate->preparedProject->processing->plan.projectSampleRate ||
+        temporal->deviceSampleRate != projectCandidate->preparedProject->processing->plan.stereoProcessingFormat.sampleRate ||
+        !audio::processingPlanSupportsClock(
+            projectCandidate->preparedProject->processing->plan,
+            temporal->exactClock)) return false;
     const auto callbackWasRegistered = callbackRegistered_;
     detachAudioCallback();
     preparedProject_.swap(projectCandidate->preparedProject);
@@ -588,6 +621,9 @@ audio::AudioControlRequestResult JuceAudioDeviceAdapter::trySetMetronomeLevel(
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
     return realtimeEngine_.transportSnapshot();
 }
+audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::projectedTransportSnapshot() noexcept {
+    return realtimeEngine_.projectedTransportSnapshot();
+}
 mixer::MeterSnapshot JuceAudioDeviceAdapter::meterSnapshot() const noexcept {
     return realtimeEngine_.meterSnapshot();
 }
@@ -619,7 +655,10 @@ void JuceAudioDeviceAdapter::audioDeviceAboutToStart(juce::AudioIODevice* device
 }
 
 void JuceAudioDeviceAdapter::audioDeviceStopped() noexcept {
-    realtimeEngine_.deviceStopped();
+    if (preserveTransportDuringRegistration_.load(std::memory_order_acquire))
+        realtimeEngine_.deviceInitialisingPreservingTransport();
+    else
+        realtimeEngine_.deviceStopped();
     if (!suppressLifecycleNotification_.load(std::memory_order_acquire)) {
         pendingLifecycleEvent_.store(PendingLifecycleEvent::stopped,
                                      std::memory_order_release);
@@ -649,6 +688,7 @@ void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
     suppressLifecycleNotification_.store(false, std::memory_order_release);
     realtimeEngine_.deviceUnavailable();
     if (publishClosedState) {
+        realtimeEngine_.releasePreparedReferences();
         preparedProject_.reset();
         preparedTemporalContext_.reset();
         projectSampleRate_ = {};
@@ -689,11 +729,15 @@ void JuceAudioDeviceAdapter::publishState() {
     }
 }
 
-void JuceAudioDeviceAdapter::detachAudioCallback() noexcept {
+void JuceAudioDeviceAdapter::detachAudioCallback(bool preserveTransport) noexcept {
     if (callbackRegistered_) {
+        // removeAudioCallback serialises against the last render. Its stopped
+        // notification must not erase the checkpoint we read AFTER removal.
+        preserveTransportDuringRegistration_.store(preserveTransport, std::memory_order_release);
         suppressLifecycleNotification_.store(true, std::memory_order_release);
         deviceManager_.removeAudioCallback(this);
         suppressLifecycleNotification_.store(false, std::memory_order_release);
+        preserveTransportDuringRegistration_.store(false, std::memory_order_release);
         callbackRegistered_ = false;
     }
 }
@@ -722,12 +766,16 @@ void JuceAudioDeviceAdapter::attachAudioCallback(bool preserveTransport) {
 void JuceAudioDeviceAdapter::configureRealtimeEngine() noexcept {
     if (preparedProject_ == nullptr || preparedProject_->processing == nullptr) {
         realtimeEngine_.configure({projectSampleRate_, {}, {}, {}, false});
-        realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
+        if (deviceSampleRate_.isValid() && !realtimeEngine_.prepareLegacyDeviceRate(deviceSampleRate_))
+            realtimeEngine_.deviceError();
+        static_cast<void>(realtimeEngine_.configureTemporalContext(
+            preparedTemporalContext_.get()));
         return;
     }
     realtimeEngine_.configure(preparedProject_->processing->plan,
                               preparedProject_->processing->runtime);
-    realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
+    static_cast<void>(realtimeEngine_.configureTemporalContext(
+        preparedTemporalContext_.get()));
 }
 
 bool JuceAudioDeviceAdapter::prepareProjectPlan(
@@ -791,38 +839,45 @@ bool JuceAudioDeviceAdapter::prepareProjectPlan(
 
 bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
     std::string& errorMessage) {
-    if (preparedProject_ == nullptr) {
-        return true;
+    // This entire operation runs with the callback quiescent. Preparation and
+    // certification do not touch the live owners, clock, policies or revision.
+    const auto rate = projectSampleRate_.isValid() ? projectSampleRate_ : deviceSampleRate_;
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    std::unique_ptr<PreparedProject> project;
+    if (preparedProject_) {
+        project = std::make_unique<PreparedProject>();
+        project->resources = preparedProject_->resources;
+        if (!prepareProjectPlan(*project, preparedProject_->specification, errorMessage)) return false;
     }
-    auto candidate = std::make_unique<PreparedProject>();
-    candidate->resources = preparedProject_->resources;
-    if (!prepareProjectPlan(*candidate, preparedProject_->specification,
-                            errorMessage)) {
+    std::unique_ptr<audio::PreparedTemporalContext> temporal;
+    if (preparedTemporalContext_) {
+        auto result = audio::prepareTemporalContext(preparedTemporalContext_->documentMap,
+            preparedTemporalContext_->loop
+                ? std::optional<musical::MusicalLoopRange>{preparedTemporalContext_->loop->musical}
+                : std::nullopt,
+            rate, deviceSampleRate_, preparedTemporalContext_->revision);
+        if (!result.success()) { errorMessage = std::move(result.errorMessage); return false; }
+        temporal = std::move(result.prepared);
+    }
+    const auto format = temporal ? temporal->exactClock
+        : audio::exact::clockForPreparation(rate.hertz(), deviceSampleRate_.hertz());
+    audio::exact::ProjectPhase certificate;
+    if ((project && !audio::processingPlanSupportsClock(project->processing->plan, format)) ||
+        !certificate.installPreparedFormat(format) ||
+        !certificate.restore({{checkpoint.clock.position.value, checkpoint.clock.phase}})) {
+        errorMessage = "Device configuration cannot preserve the exact temporal checkpoint";
         return false;
     }
-    preparedProject_.swap(candidate);
-    projectSampleRate_ = preparedProject_->specification.projectSampleRate;
-    masterMix_ = preparedProject_->specification.masterMix;
+    // No fallible preparation below. Retire ALL raw views while both old owners
+    // still live; locals retain them until the new configuration is installed.
+    realtimeEngine_.releasePreparedReferences();
+    preparedProject_.swap(project);
+    preparedTemporalContext_.swap(temporal);
+    projectSampleRate_ = rate;
     configureRealtimeEngine();
-    return true;
-}
-
-bool JuceAudioDeviceAdapter::reprepareTemporalForCurrentDevice(
-    std::string& errorMessage) {
-    if (!preparedTemporalContext_) return true;
-    auto candidate = audio::prepareTemporalContext(
-        preparedTemporalContext_->documentMap,
-        preparedTemporalContext_->loop
-            ? std::optional<musical::MusicalLoopRange>{
-                  preparedTemporalContext_->loop->musical}
-            : std::nullopt,
-        preparedTemporalContext_->musicalTime->sampleRate(), deviceSampleRate_,
-        preparedTemporalContext_->revision);
-    if (!candidate.success()) {
-        errorMessage = std::move(candidate.errorMessage);
-        return false;
-    }
-    preparedTemporalContext_ = std::move(candidate.prepared);
+    const auto restored = realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
+    jassert(restored);
+    static_cast<void>(restored);
     return true;
 }
 
@@ -834,9 +889,29 @@ bool JuceAudioDeviceAdapter::commitPreparedProject(
         !modelCommit.isValid()) {
         return false;
     }
-    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    const auto& plan = candidate->processing->plan;
+    if (preparedTemporalContext_ &&
+        (preparedTemporalContext_->projectSampleRate != plan.projectSampleRate ||
+         preparedTemporalContext_->deviceSampleRate != plan.stereoProcessingFormat.sampleRate ||
+         !audio::processingPlanSupportsClock(plan, preparedTemporalContext_->exactClock)))
+        return false;
     const auto callbackWasRegistered = callbackRegistered_;
-    detachAudioCallback();
+    detachAudioCallback(true);
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    if (preserveTransport) {
+        audio::exact::ProjectPhase certificate;
+        const auto format = preparedTemporalContext_ ? preparedTemporalContext_->exactClock
+                                                    : candidate->processing->plan.exactClock;
+        if (!audio::processingPlanSupportsClock(candidate->processing->plan, format) ||
+            !certificate.installPreparedFormat(format) ||
+            !certificate.restore({{checkpoint.clock.position.value, checkpoint.clock.phase}})) {
+            if (callbackWasRegistered) {
+                try { attachAudioCallback(true); }
+                catch (...) { realtimeEngine_.deviceErrorPreservingTransport(); }
+            }
+            return false;
+        }
+    }
     preparedProject_.swap(candidate);
     projectSampleRate_ = preparedProject_->specification.projectSampleRate;
     masterMix_ = preparedProject_->specification.masterMix;

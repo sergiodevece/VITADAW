@@ -9,11 +9,30 @@
 
 namespace vitadaw::audio {
 
+// Monotonic reservation/resolution ticket, NOT a consecutive accepted-command
+// ordinal. A rejected claim may leave a gap or an observable cancellation watermark.
 using AudioCommandSequence = std::uint64_t;
+
+enum class AudioControlDisposition : std::uint8_t { rejected, scheduled, alreadySatisfied };
+
+enum class AudioControlRejection : std::uint8_t {
+    none,
+    unavailable,
+    queueFull,
+    invalidPosition,
+    disallowedState,
+};
 
 struct AudioControlRequestResult {
     bool accepted{};
     AudioCommandSequence sequence{};
+    AudioControlRejection rejection{AudioControlRejection::none};
+    transport::PlaybackState projectedPlayback{
+        transport::PlaybackState::stopped};
+    timeline::ProjectFramePosition projectedPosition;
+    bool hasProjection{};
+    AudioControlDisposition disposition{accepted ? AudioControlDisposition::scheduled
+                                                 : AudioControlDisposition::rejected};
 };
 
 struct RealtimeTransportSnapshot {
@@ -28,6 +47,11 @@ struct RealtimeTransportSnapshot {
     bool metronomeEnabled{};
     float metronomeLevelDb{-12.0F};
     std::uint64_t temporalRevision{};
+    std::uint64_t commandGeneration{};
+    bool beforeContentEnd{};
+    bool beforeLoopEnd{};
+    // Non-RT projected view only; RT's resolution watermark remains separate.
+    AudioCommandSequence projectedThroughTicket{};
 };
 
 // Single-writer/single-reader exchange. Every operation participates in C++20's
@@ -54,6 +78,9 @@ public:
         metronomeLevelBits_.store(std::bit_cast<std::uint32_t>(state.metronomeLevelDb),
                                   std::memory_order_seq_cst);
         temporalRevision_.store(state.temporalRevision, std::memory_order_seq_cst);
+        commandGeneration_.store(state.commandGeneration, std::memory_order_seq_cst);
+        beforeContentEnd_.store(state.beforeContentEnd, std::memory_order_seq_cst);
+        beforeLoopEnd_.store(state.beforeLoopEnd, std::memory_order_seq_cst);
         revision_.fetch_add(1, std::memory_order_seq_cst);
     }
 
@@ -76,7 +103,10 @@ public:
                 loopEnabled_.load(std::memory_order_seq_cst),
                 metronomeEnabled_.load(std::memory_order_seq_cst),
                 std::bit_cast<float>(metronomeLevelBits_.load(std::memory_order_seq_cst)),
-                temporalRevision_.load(std::memory_order_seq_cst)};
+                temporalRevision_.load(std::memory_order_seq_cst),
+                commandGeneration_.load(std::memory_order_seq_cst),
+                beforeContentEnd_.load(std::memory_order_seq_cst),
+                beforeLoopEnd_.load(std::memory_order_seq_cst)};
 
             if (revision_.load(std::memory_order_seq_cst) == before) {
                 lastCoherentSnapshot_ = result;
@@ -90,6 +120,8 @@ private:
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
     static_assert(std::atomic<std::uint8_t>::is_always_lock_free);
+    static_assert(std::atomic<bool>::is_always_lock_free);
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 
     std::atomic<std::uint64_t> revision_{};
     std::atomic<std::uint8_t> playback_{};
@@ -100,6 +132,9 @@ private:
     std::atomic<bool> metronomeEnabled_{};
     std::atomic<std::uint32_t> metronomeLevelBits_{std::bit_cast<std::uint32_t>(-12.0F)};
     std::atomic<std::uint64_t> temporalRevision_{};
+    std::atomic<std::uint64_t> commandGeneration_{};
+    std::atomic<bool> beforeContentEnd_{};
+    std::atomic<bool> beforeLoopEnd_{};
     // Read and written only by the single non-RT consumer.
     mutable RealtimeTransportSnapshot lastCoherentSnapshot_{};
 };

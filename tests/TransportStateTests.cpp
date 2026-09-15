@@ -41,7 +41,7 @@ int main() {
           "natural end should transition transport to stopped");
     check(state.position.value == state.duration.value,
           "natural end should remain at the end position");
-    state.seek({24000});
+    check(state.seek({24000}), "valid application locator should be accepted");
     state.markPlaying();
     state.markPaused();
     state.stop();
@@ -59,9 +59,13 @@ int main() {
     std::atomic<bool> publishingDone{};
     std::thread writer([&] {
         for (std::int64_t generation = 1; generation <= 200000; ++generation) {
-            concurrentExchange.publish(
-                {(generation & 1) != 0, {generation}, {generation * 3},
-                 static_cast<audio::AudioCommandSequence>(generation)});
+            audio::RealtimeTransportSnapshot state{
+                (generation & 1) != 0, {generation}, {generation * 3},
+                static_cast<audio::AudioCommandSequence>(generation)};
+            state.commandGeneration = static_cast<std::uint64_t>(generation);
+            state.beforeContentEnd = (generation & 1) != 0;
+            state.beforeLoopEnd = (generation & 2) != 0;
+            concurrentExchange.publish(state);
         }
         publishingDone.store(true, std::memory_order_release);
     });
@@ -72,7 +76,10 @@ int main() {
                 value.lastProcessedCommandSequence);
             check(value.position.value == generation &&
                       value.duration.value == generation * 3 &&
-                      value.playing == ((generation & 1) != 0),
+                      value.playing == ((generation & 1) != 0) &&
+                      value.commandGeneration == static_cast<std::uint64_t>(generation) &&
+                      value.beforeContentEnd == ((generation & 1) != 0) &&
+                      value.beforeLoopEnd == ((generation & 2) != 0),
                   "concurrent snapshot fields must come from one publication");
         }
     } while (!publishingDone.load(std::memory_order_acquire));
