@@ -5,6 +5,7 @@
 #include "vitadaw/audio/DeviceProcessingState.h"
 #include "vitadaw/audio/PreparedProject.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
+#include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/audio/MixerSmoother.h"
 #include "vitadaw/audio/RealtimeMeterExchange.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
@@ -35,10 +36,26 @@ public:
     void configure(PreparedProjectView project) noexcept;
     void configure(const PreparedProcessingPlan& plan,
                    ProcessingPlanRuntime& runtime) noexcept;
+    // Called only with a quiescent consumer. The supplied context remains owned
+    // off RT and must outlive every callback until the next quiescent swap.
+    void configureTemporalContext(const PreparedTemporalContext* context) noexcept;
+    struct TemporalCheckpoint {
+        RealtimeProjectClock::Checkpoint clock;
+        bool loopEnabled{};
+        bool metronomeEnabled{};
+        MetronomeLevelDb metronomeLevel;
+    };
+    [[nodiscard]] TemporalCheckpoint temporalCheckpoint() const noexcept;
+    void restoreTemporalCheckpoint(TemporalCheckpoint) noexcept;
+    void resetTemporalSessionState() noexcept;
     // Lifecycle transitions may race with the application command producer.
     // Transitions away from operational are invoked only while render is
     // quiescent (JUCE serialises them against its callback).
     void deviceInitialising() noexcept;
+    // Controlled callback re-registration after a quiescent temporal commit.
+    // It closes the command generation exactly like initialisation but keeps
+    // the already-restored stopped/paused clock position.
+    void deviceInitialisingPreservingTransport() noexcept;
     void deviceConsumerStarted() noexcept;
     void deviceStopped() noexcept;
     void deviceError() noexcept;
@@ -50,6 +67,9 @@ public:
     [[nodiscard]] AudioControlRequestResult tryRequestStop() noexcept;
     [[nodiscard]] AudioControlRequestResult tryRequestSeek(
         timeline::ProjectFramePosition) noexcept;
+    [[nodiscard]] AudioControlRequestResult trySetLoopEnabled(bool) noexcept;
+    [[nodiscard]] AudioControlRequestResult trySetMetronomeEnabled(bool) noexcept;
+    [[nodiscard]] AudioControlRequestResult trySetMetronomeLevel(MetronomeLevelDb) noexcept;
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track, mixer::PreparedTrackMixState mix,
         PreparedAudibilityState audibility) noexcept;
@@ -75,13 +95,18 @@ public:
 private:
     static_assert(std::atomic<std::size_t>::is_always_lock_free);
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 
-    enum class CommandType : std::uint8_t { play, pause, stop, seek };
+    enum class CommandType : std::uint8_t {
+        play, pause, stop, seek, setLoopEnabled,
+        setMetronomeEnabled, setMetronomeLevel
+    };
     struct QueuedCommand {
         CommandType type{CommandType::stop};
         AudioCommandSequence sequence{};
         std::uint64_t generation{};
         timeline::ProjectFramePosition target;
+        float value{};
     };
     struct TrackMixCommand {
         std::size_t trackIndex{};
@@ -119,7 +144,8 @@ private:
     static_assert(std::is_trivially_copyable_v<ParameterCommand>);
 
     [[nodiscard]] AudioControlRequestResult enqueue(
-        CommandType type, timeline::ProjectFramePosition target = {}) noexcept;
+        CommandType type, timeline::ProjectFramePosition target = {},
+        float value = 0.0F) noexcept;
     void consumeCommands() noexcept;
     void consumeParameterCommands(
         timeline::SampleRate deviceSampleRate) noexcept;
@@ -133,6 +159,11 @@ private:
     void processSubBlock(AudioBlockView output, std::size_t outputOffset,
                          std::size_t frameCount,
                          timeline::ProjectFrameDuration projectFramesPerDeviceFrame) noexcept;
+    void prepareMetronomeEvents(double segmentStart, double segmentEnd,
+                                std::size_t frameCount,
+                                timeline::ProjectFrameDuration increment) noexcept;
+    [[nodiscard]] float renderMetronomeSample(std::size_t frame) noexcept;
+    void clearMetronomeRuntime() noexcept;
     void processLegacySubBlock(
         AudioBlockView output, std::size_t outputOffset,
         std::size_t validFrames, const double* positions) noexcept;
@@ -151,6 +182,7 @@ private:
 
     timeline::SampleRate projectSampleRate_;
     timeline::ProjectFrameCount projectDuration_;
+    std::atomic<std::int64_t> maximumSeekFrame_{};
     std::span<const PreparedTrackRoute> tracks_;
     std::span<const PreparedBusNode> buses_;
     std::span<const PreparedSendDescriptor> sends_;
@@ -163,6 +195,7 @@ private:
     std::size_t blockCapacity_{defaultProcessingBlockCapacity};
     ProcessingPlanRuntime* runtime_{};
     const PreparedProcessingPlan* plan_{};
+    const PreparedTemporalContext* temporalContext_{};
     std::array<PreparedTrackRoute, maximumTrackCount> legacyTracks_{};
     std::array<ProcessingStep, maximumTrackCount + 1> legacyOrder_{};
     std::array<float, defaultProcessingBlockCapacity> legacyMasterLeft_{};
@@ -192,7 +225,24 @@ private:
     std::array<mixer::StereoPeak, maximumBusCount> busPeaks_{};
     mixer::StereoPeak masterPeak_;
     RealtimeMeterExchange meterExchange_;
-    bool processorDiscontinuity_{true};
+    processors::TemporalDiscontinuity processorDiscontinuity_{
+        processors::TemporalDiscontinuity::hardDiscontinuity};
+    bool loopEnabled_{};
+    bool metronomeEnabled_{};
+    MetronomeLevelDb metronomeLevel_{};
+    LinearSmoother metronomeLevelSmoother_;
+    struct MetronomeVoice { bool active{}; bool accent{}; std::size_t frame{}; };
+    std::array<MetronomeVoice, metronomeVoiceCount> metronomeVoices_{};
+    struct MetronomeEvent { std::size_t frame{}; bool accent{}; };
+    // One entry per distinct device frame is sufficient: musical boundaries
+    // which quantise causally to the same frame start one (accent-dominant)
+    // click. The prepared processing limit is far below this fixed RT bound.
+    std::array<MetronomeEvent, maximumClickTableFrames> metronomeEvents_{};
+    std::size_t metronomeEventCount_{};
+    bool pendingMetronomeEvent_{};
+    bool pendingMetronomeAccent_{};
+    std::atomic<bool> requestedLoopEnabled_{};
+    std::atomic<bool> requestedMetronomeEnabled_{};
 };
 
 } // namespace vitadaw::audio

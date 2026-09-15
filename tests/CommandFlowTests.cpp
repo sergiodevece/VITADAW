@@ -2,6 +2,7 @@
 #include "vitadaw/commands/CommandDispatcher.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -68,6 +69,20 @@ public:
             rejectNextLoad = false;
             return {nullptr, "Invalid WAV"};
         }
+        if (nextPreparationFailure !=
+            vitadaw::audio::AudioFilePreparationFailure::none) {
+            const auto failure = nextPreparationFailure;
+            nextPreparationFailure =
+                vitadaw::audio::AudioFilePreparationFailure::none;
+            auto persistence = vitadaw::persistence::PersistenceResult{
+                vitadaw::persistence::PersistenceCode::preparationFailed,
+                vitadaw::persistence::PersistencePhase::prepare};
+            if (failure == vitadaw::audio::AudioFilePreparationFailure::fileNotFound)
+                persistence.code = vitadaw::persistence::PersistenceCode::fileNotFound;
+            else if (failure == vitadaw::audio::AudioFilePreparationFailure::permissionDenied)
+                persistence.code = vitadaw::persistence::PersistenceCode::permissionDenied;
+            return {nullptr, {}, std::move(persistence), failure};
+        }
         const auto track = trackFor(file);
         const auto metadata = metadataFor(track);
         return {std::make_unique<PreparedFile>(metadata, file, track,
@@ -95,12 +110,23 @@ public:
     vitadaw::audio::StructuralPlanPreparationResult
     prepareProcessingPlanWithAudio(
         const vitadaw::audio::ProcessingPlanSpecification& specification,
-        vitadaw::media::SourceId,
+        vitadaw::media::SourceId source,
         vitadaw::audio::PreparedAudioFilePtr preparedAudio) override {
         ++structuralPrepareRequests;
         if (rejectNextStructuralPreparation) {
             rejectNextStructuralPreparation = false;
             return {nullptr, "Injected routing preparation failure"};
+        }
+        if (auto* file = dynamic_cast<PreparedFile*>(preparedAudio.get())) {
+            for (const auto& track : specification.tracks) {
+                const auto ownsSource = std::any_of(
+                    track.clips.begin(), track.clips.end(),
+                    [source](const auto& clip) { return clip.source == source; });
+                if (ownsSource) {
+                    file->track = track.id;
+                    break;
+                }
+            }
         }
         return {std::make_unique<PreparedPlan>(specification,
                                                 std::move(preparedAudio)), {}};
@@ -150,6 +176,16 @@ public:
             }
         }
         modelCommit.execute();
+        return true;
+    }
+
+    bool commitPreparedTemporalContext(
+        std::unique_ptr<vitadaw::audio::PreparedTemporalContext> prepared,
+        vitadaw::audio::AudioFileCommitAction commit) noexcept override {
+        if (!prepared || !commit.isValid()) return false;
+        temporal = std::move(prepared);
+        snapshot.temporalRevision = temporal->revision;
+        commit.execute();
         return true;
     }
 
@@ -210,7 +246,8 @@ public:
 
     vitadaw::audio::AudioControlRequestResult tryRequestPlay() noexcept override {
         ++playRequests;
-        if (!acceptRequests || live.empty()) {
+        if (!acceptRequests || (live.empty() && !snapshot.loopEnabled &&
+                                !snapshot.metronomeEnabled)) {
             return {};
         }
         const auto sequence = nextSequence++;
@@ -255,6 +292,29 @@ public:
         return {true, sequence};
     }
 
+    vitadaw::audio::AudioControlRequestResult trySetLoopEnabled(bool enabled) noexcept override {
+        if (!acceptRequests || (enabled && (!temporal || !temporal->loop))) return {};
+        const auto sequence = nextSequence++;
+        snapshot.loopEnabled = enabled;
+        snapshot.lastProcessedCommandSequence = sequence;
+        return {true,sequence};
+    }
+    vitadaw::audio::AudioControlRequestResult trySetMetronomeEnabled(bool enabled) noexcept override {
+        if (!acceptRequests) return {};
+        const auto sequence = nextSequence++;
+        snapshot.metronomeEnabled = enabled;
+        snapshot.lastProcessedCommandSequence = sequence;
+        return {true,sequence};
+    }
+    vitadaw::audio::AudioControlRequestResult trySetMetronomeLevel(
+        vitadaw::audio::MetronomeLevelDb level) noexcept override {
+        if (!acceptRequests || !level.isValid()) return {};
+        const auto sequence = nextSequence++;
+        snapshot.metronomeLevelDb = level.value;
+        snapshot.lastProcessedCommandSequence = sequence;
+        return {true,sequence};
+    }
+
     vitadaw::audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override {
         return snapshot;
     }
@@ -286,6 +346,8 @@ public:
     int stopRequests{};
     bool acceptRequests{true};
     bool rejectNextLoad{};
+    vitadaw::audio::AudioFilePreparationFailure nextPreparationFailure{
+        vitadaw::audio::AudioFilePreparationFailure::none};
     bool throwNextPreparation{};
     bool acceptMixerRequests{true};
     int trackMixRequests{};
@@ -299,6 +361,7 @@ public:
     bool rejectNextStructuralCommit{};
     vitadaw::audio::ProcessingPlanSpecification liveSpecification;
     ResourceCounters resourceCounters;
+    std::unique_ptr<vitadaw::audio::PreparedTemporalContext> temporal;
 
 private:
     [[nodiscard]] static vitadaw::tracks::TrackId trackFor(
@@ -338,10 +401,164 @@ void check(bool condition, std::string_view message) {
     }
 }
 
+void firstImportRegressionTests() {
+    using namespace vitadaw;
+    {
+        FakeAudioEngine audio;
+        application::DawApplication app{audio, timeline::SampleRate{48000.0}};
+        commands::CommandDispatcher dispatch{app};
+        const auto initialToken = app.history().currentStateToken();
+        check(app.project().tracks().empty() && app.project().sources().empty() &&
+                  app.project().routing().buses().empty() &&
+                  app.project().routing().sends().empty() &&
+                  app.project().masterMix() == mixer::MasterMixState{} &&
+                  app.project().musicalTime() == musical::MusicalTimeMap{} &&
+                  !app.project().loopRange() && !app.session().dirty(),
+              "New Project is an empty, clean audio topology with master defaults");
+
+        const auto cancelled = dispatch.dispatch(commands::ImportAudioFile{{}, {0}});
+        check(cancelled.status == commands::CommandStatus::rejected &&
+                  cancelled.error == commands::CommandError::userCancelled &&
+                  audio.loadRequests == 0 &&
+                  app.history().currentStateToken() == initialToken &&
+                  app.project().tracks().empty(),
+              "chooser cancellation is explicit and leaves the session unchanged");
+
+        const std::array failures{
+            std::pair{audio::AudioFilePreparationFailure::fileNotFound,
+                      commands::CommandError::fileNotFound},
+            std::pair{audio::AudioFilePreparationFailure::permissionDenied,
+                      commands::CommandError::permissionDenied},
+            std::pair{audio::AudioFilePreparationFailure::unsupportedFormat,
+                      commands::CommandError::unsupportedFormat},
+            std::pair{audio::AudioFilePreparationFailure::decodeFailed,
+                      commands::CommandError::decodeFailed},
+            std::pair{audio::AudioFilePreparationFailure::preparationFailed,
+                      commands::CommandError::preparationFailed}};
+        for (const auto& [failure, expected] : failures) {
+            audio.nextPreparationFailure = failure;
+            const auto result = dispatch.dispatch(
+                commands::ImportAudioFile{"unreadable.wav", {0}});
+            check(result.status == commands::CommandStatus::rejected &&
+                      result.error == expected &&
+                      app.history().currentStateToken() == initialToken &&
+                      app.project().tracks().empty() && app.project().sources().empty(),
+                  "media/access failures remain typed and transactional");
+        }
+
+        const auto imported = dispatch.dispatch(
+            commands::ImportAudioFile{"first.wav", {0}});
+        check(imported.status == commands::CommandStatus::accepted &&
+                  app.project().tracks().size() == 1 &&
+                  app.project().sources().size() == 1,
+              "first import atomically creates the initial track, source and clip");
+        const auto& track = app.project().tracks().front();
+        const auto& source = app.project().sources().front();
+        const auto& clip = track.clips.front();
+        check(track.id.isValid() && source.id.isValid() && clip.id.isValid() &&
+                  clip.source == source.id && clip.projectStart.value == 0 &&
+                  source.frameCount.value == 44100 &&
+                  source.sampleRate == timeline::SampleRate{44100.0} &&
+                  clip.duration.value == 48000.0 &&
+                  app.project().projectContentDuration().value == 48000,
+              "first import preserves Source/Clip ownership and converted duration");
+        const auto timeline = app.timelineSnapshot();
+        check(timeline.tracks.size() == 1 &&
+                  timeline.tracks.front().clips.size() == 1 &&
+                  timeline.contentDuration.value == 48000 &&
+                  timeline.tracks.front().clips.front().id == clip.id,
+              "the committed first clip is immediately present in TimelineSnapshot");
+        check(app.session().dirty() && !app.canUndo() && !app.canRedo() &&
+                  app.history().currentStateToken() != initialToken,
+              "successful non-undoable import uses a dirty history barrier");
+        check(dispatch.dispatch(commands::Play{}).status ==
+                  commands::CommandStatus::accepted,
+              "the first imported prepared resource is playable");
+    }
+
+    {
+        FakeAudioEngine audio;
+        application::DawApplication app{audio, timeline::SampleRate{48000.0}};
+        commands::CommandDispatcher dispatch{app};
+        check(dispatch.dispatch(commands::AddAudioTrack{
+                  "Existing", media::AudioChannelLayout::mono}).status ==
+                  commands::CommandStatus::accepted,
+              "existing empty mono track setup succeeds");
+        const auto target = app.project().tracks().front().id;
+        check(dispatch.dispatch(commands::ImportAudioToTrack{
+                  "first.wav", target, {0}}).status ==
+                  commands::CommandStatus::accepted &&
+                  app.project().findTrack(target)->clips.size() == 1,
+              "target-specific import into an existing empty track still works");
+    }
+
+    {
+        FakeAudioEngine audio;
+        application::DawApplication app{audio, timeline::SampleRate{48000.0}};
+        commands::CommandDispatcher dispatch{app};
+        check(dispatch.dispatch(commands::AddAudioTrack{
+                  "Stereo", media::AudioChannelLayout::stereo}).status ==
+                  commands::CommandStatus::accepted,
+              "incompatible target setup succeeds");
+        const auto token = app.history().currentStateToken();
+        const auto noTarget = dispatch.dispatch(
+            commands::ImportAudioFile{"first.wav", {0}});
+        check(noTarget.error == commands::CommandError::noTargetTrack &&
+                  app.history().currentStateToken() == token &&
+                  app.project().sources().empty(),
+              "general import requires an explicit target in a non-empty topology");
+
+        audio.rejectNextStructuralPreparation = true;
+        const auto preparation = dispatch.dispatch(
+            commands::ImportAudioToTrack{"b.wav", app.project().tracks().front().id, {0}});
+        check(preparation.error == commands::CommandError::preparationFailed &&
+                  app.history().currentStateToken() == token &&
+                  app.project().sources().empty(),
+              "prepared-plan failure rolls back the candidate model");
+
+        audio.rejectNextStructuralCommit = true;
+        const auto commit = dispatch.dispatch(
+            commands::ImportAudioToTrack{"b.wav", app.project().tracks().front().id, {0}});
+        check(commit.error == commands::CommandError::commitFailed &&
+                  app.history().currentStateToken() == token &&
+                  app.project().sources().empty(),
+              "commit failure preserves the active project and StateToken");
+    }
+
+    {
+        FakeAudioEngine audio;
+        application::DawApplication app{audio, timeline::SampleRate{48000.0}};
+        commands::CommandDispatcher dispatch{app};
+        check(dispatch.dispatch(commands::AddTempoChange{
+                  {8 * musical::ppq}, {90.0}}).status ==
+                  commands::CommandStatus::accepted &&
+                  dispatch.dispatch(commands::SetLoopRangeMusical{
+                      {4 * musical::ppq}, {12 * musical::ppq}}).status ==
+                  commands::CommandStatus::accepted &&
+                  dispatch.dispatch(commands::SetLoopEnabled{true}).status ==
+                  commands::CommandStatus::accepted &&
+                  dispatch.dispatch(commands::SetMetronomeEnabled{true}).status ==
+                  commands::CommandStatus::accepted &&
+                  dispatch.dispatch(commands::SetMetronomeLevel{{-18.0F}}).status ==
+                  commands::CommandStatus::accepted,
+              "musical and session state setup succeeds before first import");
+        app.synchroniseTransport();
+        const auto map = app.project().musicalTime();
+        const auto loop = app.project().loopRange();
+        check(dispatch.dispatch(commands::ImportAudioFile{"first.wav", {0}}).status ==
+                  commands::CommandStatus::accepted &&
+                  app.project().musicalTime() == map &&
+                  app.project().loopRange() == loop && app.loopEnabled() &&
+                  app.metronomeEnabled() && app.metronomeLevel().value == -18.0F,
+              "first import preserves musical maps, loop locators and session controls");
+    }
+}
+
 } // namespace
 
 int main() {
     using namespace vitadaw;
+    firstImportRegressionTests();
     FakeAudioEngine audio;
     application::DawApplication app{audio, timeline::SampleRate{48000.0}};
     commands::CommandDispatcher dispatcher{app};
@@ -851,6 +1068,40 @@ int main() {
     audio.close();
     check(audio.resourceCounters.destroyed == destroyedBeforeClose + 3,
           "closing should destroy all live N-track resources");
+
+    FakeAudioEngine sessionAudio;
+    application::DawApplication sessionApp{sessionAudio,
+                                            timeline::SampleRate{48000}};
+    commands::CommandDispatcher sessionDispatcher{sessionApp};
+    const auto initialToken = sessionApp.history().currentStateToken();
+    check(sessionDispatcher.dispatch(commands::SetLoopRangeMusical{
+              {4*musical::ppq},{12*musical::ppq}}).status ==
+              commands::CommandStatus::accepted &&
+          sessionApp.project().loopRange().has_value() &&
+          sessionApp.history().currentStateToken() != initialToken,
+          "loop range is a documentary undoable edit");
+    const auto loopToken = sessionApp.history().currentStateToken();
+    check(sessionDispatcher.dispatch(commands::SetLoopEnabled{true}).status ==
+              commands::CommandStatus::accepted,
+          "loop enabled is a session command");
+    sessionApp.synchroniseTransport();
+    check(sessionApp.loopEnabled() &&
+          sessionApp.history().currentStateToken() == loopToken,
+          "applied loop state is observable without dirtying history");
+    check(sessionDispatcher.dispatch(commands::SetMetronomeEnabled{true}).status ==
+              commands::CommandStatus::accepted &&
+          sessionDispatcher.dispatch(commands::SetMetronomeLevel{{-18.0F}}).status ==
+              commands::CommandStatus::accepted,
+          "metronome session controls dispatch");
+    sessionApp.synchroniseTransport();
+    check(sessionApp.metronomeEnabled() &&
+          sessionApp.metronomeLevel().value == -18.0F &&
+          sessionApp.history().currentStateToken() == loopToken,
+          "metronome applied state is observable and non-documentary");
+    check(sessionDispatcher.dispatch(commands::Undo{}).status ==
+              commands::CommandStatus::accepted &&
+          !sessionApp.project().loopRange().has_value(),
+          "Undo removes the loop range");
 
     std::cout << "All command-flow tests passed\n";
     return EXIT_SUCCESS;

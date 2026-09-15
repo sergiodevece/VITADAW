@@ -36,6 +36,9 @@ public:
     [[nodiscard]] ui::timeline::TimelineSnapshot timelineSnapshot() const;
     [[nodiscard]] const musical::PreparedMusicalTimeMap& musicalTime() const noexcept { return *musicalTime_; }
     [[nodiscard]] std::uint64_t musicalRevision() const noexcept { return musicalRevision_; }
+    [[nodiscard]] bool loopEnabled() const noexcept { return session_.loopEnabled; }
+    [[nodiscard]] bool metronomeEnabled() const noexcept { return session_.metronomeEnabled; }
+    [[nodiscard]] audio::MetronomeLevelDb metronomeLevel() const noexcept { return session_.metronomeLevel; }
 
 private:
     commands::CommandResult musicalCommand(const commands::Command&);

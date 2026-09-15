@@ -186,9 +186,9 @@ void codecTests() {
     };
     reject(original.substr(0, original.size()/2), PersistenceCode::parseError);
     reject(changed(original,"VitaDAWProject","WrongProject"), PersistenceCode::schemaValidationFailed);
-    reject(changed(original,"\"schemaVersion\": 2","\"schemaVersion\": 3"), PersistenceCode::unsupportedSchema);
-    reject(changed(original,"\"schemaVersion\": 2","\"schemaVersion\": 2,\"schemaVersion\":2"), PersistenceCode::schemaValidationFailed);
-    reject(changed(original,"\"schemaVersion\": 2","\"schemaVersion\": 2,\"futureField\":true"), PersistenceCode::schemaValidationFailed);
+    reject(changed(original,"\"schemaVersion\": 3","\"schemaVersion\": 4"), PersistenceCode::unsupportedSchema);
+    reject(changed(original,"\"schemaVersion\": 3","\"schemaVersion\": 3,\"schemaVersion\":3"), PersistenceCode::schemaValidationFailed);
+    reject(changed(original,"\"schemaVersion\": 3","\"schemaVersion\": 3,\"futureField\":true"), PersistenceCode::schemaValidationFailed);
     reject(changed(original,"\"id\": \"1\"","\"id\": \"01\""), PersistenceCode::schemaValidationFailed);
     reject(changed(original,"\"id\": \"1\"","\"id\": \"18446744073709551616\""), PersistenceCode::schemaValidationFailed);
     reject(changed(original,"\"clip\": \"11\"","\"clip\": \"1\""), PersistenceCode::semanticValidationFailed);
@@ -210,6 +210,12 @@ void codecTests() {
     check(!project::ProjectState::fromDocumentData(bad), "duplicate clip ID rejected");
     bad=p.documentData();bad.routing.buses[1].outputDestination=routing::OutputDestination::toBus(bad.routing.buses[0].id);
     check(!project::ProjectState::fromDocumentData(bad), "cycle combining bus output/send rejected");
+    auto v2 = nlohmann::json::parse(original);
+    v2["schemaVersion"] = 2;
+    v2.erase("loopRange");
+    const auto migratedV2 = deserializeProject(v2.dump());
+    check(migratedV2.result.success() && !migratedV2.project->loopRange(),
+          "v2 migrates to v3 with no loop range");
     check(encode(p,"/other/deep/project.vitadaw").find("../../session/media/a.wav")!=std::string::npos, "Save As rebases paths");
     for (const char* name : {"minimal-project-v1.vitadaw", "full-project-v1.vitadaw"}) {
         std::ifstream file(std::filesystem::path{VITADAW_FIXTURES}/name);
@@ -323,7 +329,7 @@ void musicalTransactions() {
     Files f; f.content["/session/media/a.wav"]="A";
     f.content["/session/a.vitadaw"]=encode(complex());
     auto legacyAudio=nlohmann::json::parse(f.content["/session/a.vitadaw"]);
-    legacyAudio.erase("musicalTime");legacyAudio["schemaVersion"]=1;
+    legacyAudio.erase("musicalTime");legacyAudio.erase("loopRange");legacyAudio["schemaVersion"]=1;
     f.content["/session/legacy-a.vitadaw"]=legacyAudio.dump();
     Engine e{f};application::DawApplication app{e,timeline::SampleRate{48000},f};
     auto invoke=[&](Command c,bool accepted=true){check((app.handle(c).status==CommandStatus::accepted)==accepted,"musical command result");};
@@ -390,7 +396,7 @@ void musicalTransactions() {
     check(!app.session().dirty()&&!app.canUndo()&&app.project().musicalTime()==musical::MusicalTimeMap{},"migrated session clean");
     invoke(SetTempo{{1},{123.456}});invoke(Undo{});check(!app.session().dirty(),"undo after migration clean");invoke(Redo{});
     invoke(SaveProjectAs{"/new.vitadaw"});
-    check(f.content["/legacy.vitadaw"]==legacy&&f.content["/new.vitadaw"].find("\"schemaVersion\": 2")!=std::string::npos,"v1 untouched save v2");
+    check(f.content["/legacy.vitadaw"]==legacy&&f.content["/new.vitadaw"].find("\"schemaVersion\": 3")!=std::string::npos,"v1 untouched save v3");
     invoke(LoadProject{"/new.vitadaw"});check(app.musicalTime().tempoAt(timeline::ProjectFramePosition{0}).value.value==123.456,"load prepared musical map");
 }
 

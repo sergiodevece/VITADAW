@@ -56,6 +56,52 @@ commands::CommandError clipCommandError(
     return Error::preparationFailed;
 }
 
+commands::CommandError importCommandError(
+    audio::AudioFilePreparationFailure failure) noexcept {
+    using Failure = audio::AudioFilePreparationFailure;
+    using Error = commands::CommandError;
+    switch (failure) {
+    case Failure::fileNotFound:
+        return Error::fileNotFound;
+    case Failure::permissionDenied:
+        return Error::permissionDenied;
+    case Failure::unsupportedFormat:
+        return Error::unsupportedFormat;
+    case Failure::decodeFailed:
+        return Error::decodeFailed;
+    case Failure::capacityExceeded:
+        return Error::capacityExceeded;
+    case Failure::none:
+    case Failure::preparationFailed:
+    case Failure::ioError:
+        return Error::preparationFailed;
+    }
+    return Error::preparationFailed;
+}
+
+const char* importFailureMessage(
+    audio::AudioFilePreparationFailure failure) noexcept {
+    using Failure = audio::AudioFilePreparationFailure;
+    switch (failure) {
+    case Failure::fileNotFound:
+        return "The selected WAV file no longer exists";
+    case Failure::permissionDenied:
+        return "Permission to read the selected WAV file was denied";
+    case Failure::unsupportedFormat:
+        return "Only WAV PCM or float files are supported";
+    case Failure::decodeFailed:
+        return "The selected WAV file could not be decoded";
+    case Failure::capacityExceeded:
+        return "The selected WAV exceeds the preparation limits";
+    case Failure::ioError:
+        return "The selected WAV file could not be read";
+    case Failure::none:
+    case Failure::preparationFailed:
+        return "The selected WAV could not be prepared";
+    }
+    return "The selected WAV could not be prepared";
+}
+
 } // namespace
 
 DawApplication::DawApplication(audio::IAudioEngineControl& audioEngine,
@@ -65,6 +111,14 @@ DawApplication::DawApplication(audio::IAudioEngineControl& audioEngine,
     auto map = musical::PreparedMusicalTimeMap::compile(session_.project.musicalTime(), projectSampleRate);
     if (!map) throw std::invalid_argument("Invalid musical time context");
     musicalTime_ = std::move(map.value);
+    auto temporal = audioEngine_.prepareTemporalContext(
+        session_.project.musicalTime(), session_.project.loopRange(),
+        projectSampleRate, musicalRevision_);
+    if (!temporal.success()) throw std::invalid_argument("Invalid prepared temporal context");
+    int marker{};
+    const audio::AudioFileCommitAction commit{&marker, [](void*) noexcept {}};
+    if (!audioEngine_.commitPreparedTemporalContext(std::move(temporal.prepared), commit))
+        throw std::runtime_error("Temporal context could not be committed");
 }
 
 commands::CommandResult DawApplication::handle(const commands::Command& command) {
@@ -137,7 +191,15 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 return commitStructuralProject(std::move(candidate), "Clip edit committed",
                                                &*pending);
             } else {
-                constexpr bool persistent = !std::is_same_v<T, Play> && !std::is_same_v<T, Stop>;
+                constexpr bool persistent =
+                    !std::is_same_v<T, Play> && !std::is_same_v<T, Pause> &&
+                    !std::is_same_v<T, Stop> &&
+                    !std::is_same_v<T, SeekToProjectFrame> &&
+                    !std::is_same_v<T, GoToStart> &&
+                    !std::is_same_v<T, GoToEnd> &&
+                    !std::is_same_v<T, SetLoopEnabled> &&
+                    !std::is_same_v<T, SetMetronomeEnabled> &&
+                    !std::is_same_v<T, SetMetronomeLevel>;
                 if constexpr (persistent) {
                     if (!session_.history.canCreateState())
                         return {CommandStatus::rejected, "History token capacity exceeded",
@@ -306,33 +368,41 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                             "Send could not be removed"};
                 }
             } else if constexpr (std::is_same_v<T, commands::LoadAudioFile> ||
-                                 std::is_same_v<T, commands::ImportAudioToTrack>) {
+                                 std::is_same_v<T, commands::ImportAudioToTrack> ||
+                                 std::is_same_v<T, commands::ImportAudioFile>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
                     return {commands::CommandStatus::rejected,
                             "Clips cannot change during playback",
                             commands::CommandError::transportMustBeStopped};
                 }
-                const auto* destination = session_.project.findTrack(value.track);
-                if (destination == nullptr) {
+                if (value.file.empty()) {
                     return {commands::CommandStatus::rejected,
-                            "Audio track does not exist"};
+                            "Import cancelled",
+                            commands::CommandError::userCancelled};
                 }
                 audio::AudioFilePreparationResult preparation;
                 try {
                     preparation = audioEngine_.prepareWav(value.file);
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
-                            "Not enough memory to prepare WAV"};
+                            "Not enough memory to prepare WAV",
+                            commands::CommandError::capacityExceeded};
                 } catch (const std::exception&) {
                     return {commands::CommandStatus::rejected,
-                            "Unexpected error while preparing WAV"};
+                            "Unexpected error while preparing WAV",
+                            commands::CommandError::preparationFailed};
                 } catch (...) {
                     return {commands::CommandStatus::rejected,
-                            "Unknown error while preparing WAV"};
+                            "Unknown error while preparing WAV",
+                            commands::CommandError::preparationFailed};
                 }
                 if (!preparation.success()) {
+                    const auto error = importCommandError(preparation.failure);
+                    auto message = std::move(preparation.errorMessage);
+                    if (message.empty()) message = importFailureMessage(preparation.failure);
                     return {commands::CommandStatus::rejected,
-                            std::move(preparation.errorMessage)};
+                            std::move(message), error,
+                            std::move(preparation.result)};
                 }
 
                 std::optional<project::ProjectState> candidate;
@@ -344,21 +414,43 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                                             ? media::AudioChannelLayout::mono
                                             : media::AudioChannelLayout::stereo;
                     candidate.emplace(session_.project);
+                    tracks::TrackId target;
+                    if constexpr (std::is_same_v<T, commands::ImportAudioFile>) {
+                        if (candidate->tracks().empty()) {
+                            auto name = value.file.stem().string();
+                            if (name.empty()) name = "Audio Track";
+                            target = candidate->addAudioTrack(std::move(name), layout);
+                        } else {
+                            return {commands::CommandStatus::rejected,
+                                    "Choose an existing audio track as the import target",
+                                    commands::CommandError::noTargetTrack};
+                        }
+                    } else {
+                        target = value.track;
+                        const auto* destination = candidate->findTrack(target);
+                        if (destination == nullptr || destination->layout != layout) {
+                            return {commands::CommandStatus::rejected,
+                                    destination == nullptr
+                                        ? "Audio track does not exist"
+                                        : "WAV channel layout does not match the target track",
+                                    commands::CommandError::noTargetTrack};
+                        }
+                    }
                     imported = candidate->importAudioToTrack(
-                        value.track, preparation.prepared->media.isValid() ? preparation.prepared->media
+                        target, preparation.prepared->media.isValid() ? preparation.prepared->media
                             : media::MediaReference{value.file, {}, {}},
                         metadata.sourceFrameCount, metadata.sourceSampleRate,
                         layout,
                         [&]() {
-                            if constexpr (std::is_same_v<
-                                              T, commands::ImportAudioToTrack>) {
+                            if constexpr (std::is_same_v<T, commands::ImportAudioToTrack> ||
+                                          std::is_same_v<T, commands::ImportAudioFile>) {
                                 return value.projectStart;
                             }
                             return timeline::ProjectFramePosition{0};
                         }());
 
                     std::ostringstream message;
-                    message << "Loaded track " << value.track.value
+                    message << "Loaded track " << target.value
                             << ": " << value.file.filename().string() << " | "
                             << std::fixed << std::setprecision(0)
                             << metadata.sourceSampleRate.hertz() << " Hz | "
@@ -368,13 +460,16 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                     successMessage = message.str();
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
-                            "Not enough memory to prepare project state"};
+                            "Not enough memory to prepare project state",
+                            commands::CommandError::capacityExceeded};
                 } catch (const std::exception&) {
                     return {commands::CommandStatus::rejected,
-                            "Project update could not be prepared"};
+                            "Project update could not be prepared",
+                            commands::CommandError::preparationFailed};
                 } catch (...) {
                     return {commands::CommandStatus::rejected,
-                            "Unknown error while preparing project state"};
+                            "Unknown error while preparing project state",
+                            commands::CommandError::preparationFailed};
                 }
 
                 audio::StructuralPlanPreparationResult planPreparation;
@@ -384,14 +479,17 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                         std::move(preparation.prepared));
                 } catch (const std::bad_alloc&) {
                     return {commands::CommandStatus::rejected,
-                            "Not enough memory to prepare imported project"};
+                            "Not enough memory to prepare imported project",
+                            commands::CommandError::capacityExceeded};
                 } catch (...) {
                     return {commands::CommandStatus::rejected,
-                            "Imported project could not be prepared"};
+                            "Imported project could not be prepared",
+                            commands::CommandError::preparationFailed};
                 }
                 if (!planPreparation.success()) {
                     return {commands::CommandStatus::rejected,
-                            std::move(planPreparation.errorMessage)};
+                            std::move(planPreparation.errorMessage),
+                            commands::CommandError::preparationFailed};
                 }
                 struct CommitContext {
                     DawApplication* application;
@@ -414,7 +512,8 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                 if (!audioEngine_.commitPreparedProcessingPlan(
                         std::move(planPreparation.prepared), modelCommit)) {
                     return {commands::CommandStatus::rejected,
-                            "Prepared WAV could not be committed"};
+                            "Prepared WAV could not be committed",
+                            commands::CommandError::commitFailed};
                 }
 
                 pendingAudioCommandSequence_ =
@@ -460,6 +559,45 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                     return {commands::CommandStatus::rejected,
                             "Clip update could not be prepared"};
                 }
+            } else if constexpr (std::is_same_v<T, commands::SetLoopEnabled>) {
+                if (transport_.playback != transport::PlaybackState::stopped)
+                    return {commands::CommandStatus::rejected,
+                            "Loop enable requires Stopped transport",
+                            commands::CommandError::transportMustBeStopped};
+                if (value.enabled && !session_.project.loopRange())
+                    return {commands::CommandStatus::rejected,
+                            "Define a valid loop range first",
+                            commands::CommandError::validationFailed};
+                const auto request = audioEngine_.trySetLoopEnabled(value.enabled);
+                if (!request.accepted)
+                    return {commands::CommandStatus::rejected,
+                            "Loop command queue is full or transport unavailable",
+                            commands::CommandError::transportUnavailable};
+                pendingAudioCommandSequence_ = request.sequence;
+                return {commands::CommandStatus::accepted,
+                        value.enabled ? "Loop enabled" : "Loop disabled"};
+            } else if constexpr (std::is_same_v<T, commands::SetMetronomeEnabled>) {
+                const auto request = audioEngine_.trySetMetronomeEnabled(value.enabled);
+                if (!request.accepted)
+                    return {commands::CommandStatus::rejected,
+                            "Metronome command queue is full or transport unavailable",
+                            commands::CommandError::transportUnavailable};
+                pendingAudioCommandSequence_ = request.sequence;
+                return {commands::CommandStatus::accepted,
+                        value.enabled ? "Metronome enabled" : "Metronome disabled"};
+            } else if constexpr (std::is_same_v<T, commands::SetMetronomeLevel>) {
+                if (!value.level.isValid())
+                    return {commands::CommandStatus::rejected,
+                            "Metronome level must be between -100 and 0 dB",
+                            commands::CommandError::validationFailed};
+                const auto request = audioEngine_.trySetMetronomeLevel(value.level);
+                if (!request.accepted)
+                    return {commands::CommandStatus::rejected,
+                            "Metronome command queue is full or transport unavailable",
+                            commands::CommandError::transportUnavailable};
+                pendingAudioCommandSequence_ = request.sequence;
+                return {commands::CommandStatus::accepted,
+                        "Metronome level updated"};
             } else if constexpr (std::is_same_v<T, commands::Play>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
                     return {commands::CommandStatus::accepted, "Already playing"};
@@ -467,7 +605,7 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                 const auto request = audioEngine_.tryRequestPlay();
                 if (!request.accepted) {
                     return {commands::CommandStatus::rejected,
-                            "Play requires at least one valid prepared WAV"};
+                            "Play requires prepared audio, an enabled loop, or the metronome"};
                 }
                 pendingAudioCommandSequence_ = request.sequence;
                 transport_.markPlaying();
@@ -515,7 +653,14 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                             session_.project.projectContentDuration().value};
                     else return value.position;
                 }();
-                const auto duration = session_.project.projectContentDuration();
+                auto duration = session_.project.projectContentDuration();
+                if (session_.project.loopRange()) {
+                    const auto loopEnd = musicalTime_->preciseProjectFrameAtTick(
+                        session_.project.loopRange()->end);
+                    if (loopEnd) duration.value = std::max(
+                        duration.value,
+                        static_cast<std::int64_t>(std::ceil(loopEnd.value.value)));
+                }
                 if (target.value < 0 || target.value > duration.value) {
                     return {commands::CommandStatus::rejected,
                             "Seek position is outside project content",
@@ -1004,6 +1149,10 @@ void DawApplication::synchroniseTransport() noexcept {
                               ? transport::PlaybackState::playing
                               : snapshot.playback;
     transport_.synchronise(playback, snapshot.position, snapshot.duration);
+    session_.loopEnabled = snapshot.loopEnabled;
+    session_.metronomeEnabled = snapshot.metronomeEnabled;
+    session_.metronomeLevel = {snapshot.metronomeLevelDb};
+    session_.appliedTemporalRevision = snapshot.temporalRevision;
 }
 
 const project::ProjectState& DawApplication::project() const noexcept {
@@ -1025,6 +1174,23 @@ ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
     result.musicalRevision = musicalRevision_;
     const auto position = musicalTime_->musicalPositionAt(transport_.position);
     if (position) result.musicalPosition = position.value;
+    result.loopRange = session_.project.loopRange();
+    result.loopEnabled = session_.loopEnabled;
+    result.metronomeEnabled = session_.metronomeEnabled;
+    result.metronomeLevel = session_.metronomeLevel;
+    result.temporalRevision = session_.appliedTemporalRevision;
+    if (result.loopRange) {
+        const auto start = musicalTime_->preciseProjectFrameAtTick(result.loopRange->start);
+        const auto end = musicalTime_->preciseProjectFrameAtTick(result.loopRange->end);
+        if (start && end) {
+            result.loopStart = start.value;
+            result.loopEnd = end.value;
+            const auto startLabel = musicalTime_->musicalPositionAt(start.value);
+            const auto endLabel = musicalTime_->musicalPositionAt(end.value);
+            if (startLabel) result.loopStartPosition = startLabel.value;
+            if (endLabel) result.loopEndPosition = endLabel.value;
+        }
+    }
     return result;
 }
 

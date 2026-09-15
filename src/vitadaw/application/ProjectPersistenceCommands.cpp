@@ -60,6 +60,11 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
     if (musicalRevision_ == UINT64_MAX) return {PersistenceCode::capacityExceeded, PersistencePhase::prepare};
     auto musicalMap = musical::PreparedMusicalTimeMap::compile(data.musicalTime, data.settings.sampleRate, musicalRevision_ + 1);
     if (!musicalMap) return {PersistenceCode::semanticValidationFailed, PersistencePhase::prepare};
+    auto temporal = audioEngine_.prepareTemporalContext(
+        data.musicalTime, data.loopRange, data.settings.sampleRate,
+        musicalRevision_ + 1);
+    if (!temporal.success())
+        return {PersistenceCode::semanticValidationFailed, PersistencePhase::prepare};
     std::vector<audio::PreparedSourceAudio> resources;
     resources.reserve(data.sources.size());
     std::size_t candidateBytes{};
@@ -126,7 +131,8 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
         c.app->transport_.stopAndRewind();
         c.app->transport_.setDuration(c.app->session_.project.duration());
     }};
-    if (!audioEngine_.commitPreparedProcessingPlan(std::move(plan.prepared), commit))
+    if (!audioEngine_.commitPreparedProjectAndTemporalContext(
+            std::move(plan.prepared), std::move(temporal.prepared), commit))
         return {PersistenceCode::preparationFailed, PersistencePhase::commit};
     pendingAudioCommandSequence_ = audioEngine_.transportSnapshot().lastProcessedCommandSequence;
     return {};

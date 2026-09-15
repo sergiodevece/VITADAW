@@ -15,15 +15,33 @@ commands::CommandResult DawApplication::commitMusicalProject(project::ProjectSta
         if (!compiled) return {CommandStatus::rejected, musical::errorName(compiled.error), CommandError::validationFailed};
         prepared = std::move(compiled.value);
     }
-    CommandResult success{CommandStatus::accepted, "Musical time committed"};
-    // All fallible work completed. No RT consumer in 0.5.2; audio ownership is unchanged.
-    session_.project.swap(candidate);
-    musicalTime_.swap(prepared);
-    ++musicalRevision_;
-    if (pending) session_.history.commit(std::move(*pending));
-    else if (direction > 0) session_.history.commitRedo();
-    else session_.history.commitUndo();
-    return success;
+    auto temporal = audioEngine_.prepareTemporalContext(
+        candidate.musicalTime(), candidate.loopRange(), candidate.sampleRate(),
+        musicalRevision_ + 1);
+    if (!temporal.success())
+        return {CommandStatus::rejected, std::move(temporal.errorMessage),
+                CommandError::validationFailed};
+    struct Context {
+        DawApplication* application;
+        project::ProjectState* candidate;
+        std::unique_ptr<const musical::PreparedMusicalTimeMap>* prepared;
+        history::UndoManager::PendingAppend* pending;
+        int direction;
+    } context{this, &candidate, &prepared, pending, direction};
+    const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
+        auto& value = *static_cast<Context*>(raw);
+        value.application->session_.project.swap(*value.candidate);
+        value.application->musicalTime_.swap(*value.prepared);
+        ++value.application->musicalRevision_;
+        if (value.pending) value.application->session_.history.commit(std::move(*value.pending));
+        else if (value.direction > 0) value.application->session_.history.commitRedo();
+        else value.application->session_.history.commitUndo();
+    }};
+    if (!audioEngine_.commitPreparedTemporalContext(
+            std::move(temporal.prepared), commit))
+        return {CommandStatus::rejected, "Temporal context commit failed",
+                CommandError::preparationFailed};
+    return {CommandStatus::accepted, "Musical time committed"};
 }
 commands::CommandResult DawApplication::musicalCommand(const commands::Command& command) {
     using namespace commands;
@@ -35,7 +53,10 @@ commands::CommandResult DawApplication::musicalCommand(const commands::Command& 
     history::UndoableOperation operation;
     const auto error = std::visit([&](const auto& c) -> Error {
         using T = std::decay_t<decltype(c)>;
-        if constexpr (std::is_same_v<T, AddTempoChange>) {
+        if constexpr (std::is_same_v<T, SetLoopRangeMusical>) {
+            const musical::MusicalLoopRange next{c.start, c.end};
+            operation.payload = history::LoopRangeEdit{candidate.loopRange(), next};
+        } else if constexpr (std::is_same_v<T, AddTempoChange>) {
             if (map.tempo.events.size() >= maximumEvents || map.tempo.nextId.value == UINT64_MAX) return Error::capacityExceeded;
             TempoEvent e{map.tempo.nextId, c.tick, c.bpm};
             operation.payload = history::TempoEdit{{}, e};

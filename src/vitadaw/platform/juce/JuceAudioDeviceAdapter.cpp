@@ -76,6 +76,13 @@ bool JuceAudioDeviceAdapter::initialise() {
         publishState();
         return false;
     }
+    if (!reprepareTemporalForCurrentDevice(preparationError)) {
+        realtimeEngine_.deviceError();
+        stateModel_.markError(std::move(preparationError));
+        publishState();
+        return false;
+    }
+    realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
     attachAudioCallback();
     refreshState();
     return stateModel_.state().status == audio::AudioDeviceStatus::active;
@@ -97,6 +104,13 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
             publishState();
             return;
         }
+        if (!reprepareTemporalForCurrentDevice(error)) {
+            realtimeEngine_.deviceError();
+            stateModel_.markError(std::move(error));
+            publishState();
+            return;
+        }
+        realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
         if (callbackWasRegistered) {
             attachAudioCallback();
         }
@@ -151,7 +165,8 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
         const auto nativePath = filePath.wstring();
         const juce::File file{juce::String(nativePath.c_str())};
         if (!file.hasFileExtension("wav")) {
-            return {nullptr, "Only WAV files are supported"};
+            return {nullptr, "Only WAV files are supported", {},
+                    audio::AudioFilePreparationFailure::unsupportedFormat};
         }
         const auto activeBytes = preparedBytes();
         if (activeBytes > preparationMemoryBudgetBytes || candidateBytes > preparationMemoryBudgetBytes - activeBytes)
@@ -167,10 +182,12 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
         std::unique_ptr<juce::AudioFormatReader> reader{
             wavFormat.createReaderFor(inputStream.release(), true)};
         if (reader == nullptr || reader->lengthInSamples <= 0) {
-            return {nullptr, "WAV is invalid or is not mono/stereo PCM or float"};
+            return {nullptr, "WAV is invalid or is not mono/stereo PCM or float", {},
+                    audio::AudioFilePreparationFailure::decodeFailed};
         }
         if (reader->lengthInSamples > std::numeric_limits<int>::max()) {
-            return {nullptr, "WAV file is too large to prepare safely"};
+            return {nullptr, "WAV file is too large to prepare safely", {},
+                    audio::AudioFilePreparationFailure::capacityExceeded};
         }
 
         const auto frameCount = static_cast<std::uint64_t>(reader->lengthInSamples);
@@ -182,14 +199,17 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
             if (validation.error ==
                 audio::PreparationValidationError::memoryBudgetExceeded) {
                 return {nullptr,
-                        "WAV exceeds the 512 MiB preparation memory budget"};
+                        "WAV exceeds the 512 MiB preparation memory budget", {},
+                        audio::AudioFilePreparationFailure::capacityExceeded};
             }
             if (validation.error ==
                 audio::PreparationValidationError::sizeOverflow) {
                 return {nullptr,
-                        "WAV decoded size overflows the platform size type"};
+                        "WAV decoded size overflows the platform size type", {},
+                        audio::AudioFilePreparationFailure::capacityExceeded};
             }
-            return {nullptr, "WAV has invalid sample rate, channels, or length"};
+            return {nullptr, "WAV has invalid sample rate, channels, or length", {},
+                    audio::AudioFilePreparationFailure::decodeFailed};
         }
 
         auto prepared = std::make_shared<PreparedAudio>();
@@ -203,12 +223,14 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
         }
         if (!reader->read(destinationChannels.data(), static_cast<int>(channelCount),
                           0, static_cast<int>(frameCount))) {
-            return {nullptr, "WAV samples could not be decoded"};
+            return {nullptr, "WAV samples could not be decoded", {},
+                    audio::AudioFilePreparationFailure::decodeFailed};
         }
         for (const auto* samples : destinationChannels) {
             if (!audio::containsOnlyFiniteSamples(
                     {samples, static_cast<std::size_t>(frameCount)})) {
-                return {nullptr, "WAV contains non-finite float samples"};
+                return {nullptr, "WAV contains non-finite float samples", {},
+                        audio::AudioFilePreparationFailure::decodeFailed};
             }
         }
         const audio::AudioFileMetadata metadata{
@@ -223,11 +245,14 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
         result->media = {std::filesystem::absolute(filePath).lexically_normal(), {}, fingerprint};
         return {std::move(result), {}};
     } catch (const std::bad_alloc&) {
-        return {nullptr, "Not enough memory to prepare WAV"};
+        return {nullptr, "Not enough memory to prepare WAV", {},
+                audio::AudioFilePreparationFailure::capacityExceeded};
     } catch (const std::exception&) {
-        return {nullptr, "Unexpected error while preparing WAV"};
+        return {nullptr, "Unexpected error while preparing WAV", {},
+                audio::AudioFilePreparationFailure::preparationFailed};
     } catch (...) {
-        return {nullptr, "Unknown error while preparing WAV"};
+        return {nullptr, "Unknown error while preparing WAV", {},
+                audio::AudioFilePreparationFailure::preparationFailed};
     }
 }
 
@@ -455,6 +480,66 @@ bool JuceAudioDeviceAdapter::commitPreparedProcessingPlan(
     return commitPreparedProject(candidate->preparedProject, modelCommit);
 }
 
+audio::TemporalContextPreparationResult
+JuceAudioDeviceAdapter::prepareTemporalContext(
+    const musical::MusicalTimeMap& map,
+    std::optional<musical::MusicalLoopRange> loop,
+    timeline::SampleRate projectRate, std::uint64_t revision) {
+    return audio::prepareTemporalContext(
+        map, loop, projectRate,
+        deviceSampleRate_.isValid() ? deviceSampleRate_ : projectRate,
+        revision);
+}
+
+bool JuceAudioDeviceAdapter::commitPreparedTemporalContext(
+    std::unique_ptr<audio::PreparedTemporalContext> candidate,
+    audio::AudioFileCommitAction modelCommit) noexcept {
+    if (!candidate || !modelCommit.isValid()) return false;
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    const auto callbackWasRegistered = callbackRegistered_;
+    detachAudioCallback();
+    preparedTemporalContext_.swap(candidate);
+    realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
+    realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
+    modelCommit.execute();
+    if (callbackWasRegistered) {
+        try { attachAudioCallback(true); }
+        catch (...) {
+            realtimeEngine_.deviceError();
+            pendingLifecycleEvent_.store(PendingLifecycleEvent::error,
+                                         std::memory_order_release);
+        }
+    }
+    return true;
+}
+
+bool JuceAudioDeviceAdapter::commitPreparedProjectAndTemporalContext(
+    audio::PreparedProcessingPlanChangePtr project,
+    std::unique_ptr<audio::PreparedTemporalContext> temporal,
+    audio::AudioFileCommitAction modelCommit) noexcept {
+    auto* projectCandidate = dynamic_cast<PreparedJuceProcessingPlan*>(project.get());
+    if (!projectCandidate || !projectCandidate->preparedProject || !temporal ||
+        !modelCommit.isValid()) return false;
+    const auto callbackWasRegistered = callbackRegistered_;
+    detachAudioCallback();
+    preparedProject_.swap(projectCandidate->preparedProject);
+    preparedTemporalContext_.swap(temporal);
+    projectSampleRate_ = preparedProject_->specification.projectSampleRate;
+    masterMix_ = preparedProject_->specification.masterMix;
+    configureRealtimeEngine();
+    realtimeEngine_.resetTemporalSessionState();
+    modelCommit.execute();
+    if (callbackWasRegistered) {
+        try { attachAudioCallback(); }
+        catch (...) {
+            realtimeEngine_.deviceError();
+            pendingLifecycleEvent_.store(PendingLifecycleEvent::error,
+                                         std::memory_order_release);
+        }
+    }
+    return true;
+}
+
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestPlay() noexcept {
     return realtimeEngine_.tryRequestPlay();
 }
@@ -467,6 +552,16 @@ audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestStop() noexce
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestSeek(
     timeline::ProjectFramePosition position) noexcept {
     return realtimeEngine_.tryRequestSeek(position);
+}
+audio::AudioControlRequestResult JuceAudioDeviceAdapter::trySetLoopEnabled(bool enabled) noexcept {
+    return realtimeEngine_.trySetLoopEnabled(enabled);
+}
+audio::AudioControlRequestResult JuceAudioDeviceAdapter::trySetMetronomeEnabled(bool enabled) noexcept {
+    return realtimeEngine_.trySetMetronomeEnabled(enabled);
+}
+audio::AudioControlRequestResult JuceAudioDeviceAdapter::trySetMetronomeLevel(
+    audio::MetronomeLevelDb level) noexcept {
+    return realtimeEngine_.trySetMetronomeLevel(level);
 }
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
     return realtimeEngine_.transportSnapshot();
@@ -492,7 +587,10 @@ void JuceAudioDeviceAdapter::audioDeviceAboutToStart(juce::AudioIODevice* device
         // JUCE also invokes this synchronously when merely adding a callback.
         // It only enters "initializing"; actual processing is confirmed by
         // isPlaying() after registration or by callback entry.
-        realtimeEngine_.deviceInitialising();
+        if (preserveTransportDuringRegistration_.load(std::memory_order_acquire))
+            realtimeEngine_.deviceInitialisingPreservingTransport();
+        else
+            realtimeEngine_.deviceInitialising();
     } else {
         realtimeEngine_.deviceError();
     }
@@ -530,6 +628,7 @@ void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
     realtimeEngine_.deviceUnavailable();
     if (publishClosedState) {
         preparedProject_.reset();
+        preparedTemporalContext_.reset();
         projectSampleRate_ = {};
         configureRealtimeEngine();
         stateModel_.markClosed();
@@ -577,9 +676,19 @@ void JuceAudioDeviceAdapter::detachAudioCallback() noexcept {
     }
 }
 
-void JuceAudioDeviceAdapter::attachAudioCallback() {
+void JuceAudioDeviceAdapter::attachAudioCallback(bool preserveTransport) {
     if (!callbackRegistered_ && deviceManager_.getCurrentAudioDevice() != nullptr) {
-        deviceManager_.addAudioCallback(this);
+        preserveTransportDuringRegistration_.store(preserveTransport,
+                                                    std::memory_order_release);
+        try {
+            deviceManager_.addAudioCallback(this);
+        } catch (...) {
+            preserveTransportDuringRegistration_.store(false,
+                                                        std::memory_order_release);
+            throw;
+        }
+        preserveTransportDuringRegistration_.store(false,
+                                                    std::memory_order_release);
         callbackRegistered_ = true;
         auto* device = deviceManager_.getCurrentAudioDevice();
         if (device != nullptr && device->isPlaying() && deviceSampleRate_.isValid()) {
@@ -591,10 +700,12 @@ void JuceAudioDeviceAdapter::attachAudioCallback() {
 void JuceAudioDeviceAdapter::configureRealtimeEngine() noexcept {
     if (preparedProject_ == nullptr || preparedProject_->processing == nullptr) {
         realtimeEngine_.configure({projectSampleRate_, {}, {}, {}, false});
+        realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
         return;
     }
     realtimeEngine_.configure(preparedProject_->processing->plan,
                               preparedProject_->processing->runtime);
+    realtimeEngine_.configureTemporalContext(preparedTemporalContext_.get());
 }
 
 bool JuceAudioDeviceAdapter::prepareProjectPlan(
@@ -671,6 +782,25 @@ bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
     projectSampleRate_ = preparedProject_->specification.projectSampleRate;
     masterMix_ = preparedProject_->specification.masterMix;
     configureRealtimeEngine();
+    return true;
+}
+
+bool JuceAudioDeviceAdapter::reprepareTemporalForCurrentDevice(
+    std::string& errorMessage) {
+    if (!preparedTemporalContext_) return true;
+    auto candidate = audio::prepareTemporalContext(
+        preparedTemporalContext_->documentMap,
+        preparedTemporalContext_->loop
+            ? std::optional<musical::MusicalLoopRange>{
+                  preparedTemporalContext_->loop->musical}
+            : std::nullopt,
+        preparedTemporalContext_->musicalTime->sampleRate(), deviceSampleRate_,
+        preparedTemporalContext_->revision);
+    if (!candidate.success()) {
+        errorMessage = std::move(candidate.errorMessage);
+        return false;
+    }
+    preparedTemporalContext_ = std::move(candidate.prepared);
     return true;
 }
 

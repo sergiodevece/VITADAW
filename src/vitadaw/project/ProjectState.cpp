@@ -829,6 +829,7 @@ void ProjectState::swap(ProjectState& other) noexcept {
     using std::swap;
     swap(settings_, other.settings_);
     swap(musicalTime_, other.musicalTime_);
+    swap(loopRange_, other.loopRange_);
     tracks_.swap(other.tracks_);
     sources_.swap(other.sources_);
     swap(routing_, other.routing_);

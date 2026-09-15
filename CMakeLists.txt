@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.5.2 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.5.3 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -21,6 +21,7 @@ add_library(vitadaw_core
     src/vitadaw/musical/MusicalTime.cpp
     src/vitadaw/audio/AudioDeviceState.cpp
     src/vitadaw/audio/PreparedProcessingPlan.cpp
+    src/vitadaw/audio/PreparedTemporalContext.cpp
     src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
     src/vitadaw/history/UndoManager.cpp
@@ -101,6 +102,9 @@ if(VITADAW_BUILD_APP)
 endif()
 
 if(VITADAW_BUILD_TESTS)
+    add_executable(vitadaw_loop_metronome_tests tests/LoopMetronomeTests.cpp)
+    target_link_libraries(vitadaw_loop_metronome_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_loop_metronome_tests COMMAND vitadaw_loop_metronome_tests)
     add_executable(vitadaw_musical_time_tests tests/MusicalTimeTests.cpp)
     target_link_libraries(vitadaw_musical_time_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_musical_time_tests COMMAND vitadaw_musical_time_tests)

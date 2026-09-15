@@ -10,7 +10,8 @@ namespace vitadaw::history {
 std::string_view UndoableOperation::label() const noexcept {
     constexpr std::string_view labels[]{"history.moveClip", "history.duplicateClip",
         "history.splitClip", "history.trimClipLeft", "history.trimClipRight",
-        "history.deleteClip", "history.tempo", "history.timeSignature"};
+        "history.deleteClip", "history.tempo", "history.timeSignature",
+        "history.loopRange"};
     return labels[payload.index()];
 }
 
@@ -21,6 +22,11 @@ bool UndoableOperation::apply(project::ProjectState& candidate, bool forward) co
             auto map = candidate.musicalTime();
             if (!map.replace(forward ? edit.before : edit.after, forward ? edit.after : edit.before)) return false;
             candidate.setMusicalTime(std::move(map));
+            return true;
+        } else if constexpr (std::is_same_v<T, LoopRangeEdit>) {
+            const auto& expected = forward ? edit.before : edit.after;
+            if (candidate.loopRange() != expected) return false;
+            candidate.setLoopRange(forward ? edit.after : edit.before);
             return true;
         } else {
         const auto matches = [&](const clips::AudioClip& expected) {

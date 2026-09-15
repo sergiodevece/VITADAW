@@ -4,6 +4,7 @@
 #include "vitadaw/transport/PlaybackState.h"
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
 
 namespace vitadaw::audio {
@@ -23,6 +24,10 @@ struct RealtimeTransportSnapshot {
     timeline::ProjectFrameCount duration;
     AudioCommandSequence lastProcessedCommandSequence{};
     transport::PlaybackState playback{transport::PlaybackState::stopped};
+    bool loopEnabled{};
+    bool metronomeEnabled{};
+    float metronomeLevelDb{-12.0F};
+    std::uint64_t temporalRevision{};
 };
 
 // Single-writer/single-reader exchange. Every operation participates in C++20's
@@ -44,6 +49,11 @@ public:
         duration_.store(state.duration.value, std::memory_order_seq_cst);
         processedCommandSequence_.store(state.lastProcessedCommandSequence,
                                         std::memory_order_seq_cst);
+        loopEnabled_.store(state.loopEnabled, std::memory_order_seq_cst);
+        metronomeEnabled_.store(state.metronomeEnabled, std::memory_order_seq_cst);
+        metronomeLevelBits_.store(std::bit_cast<std::uint32_t>(state.metronomeLevelDb),
+                                  std::memory_order_seq_cst);
+        temporalRevision_.store(state.temporalRevision, std::memory_order_seq_cst);
         revision_.fetch_add(1, std::memory_order_seq_cst);
     }
 
@@ -62,7 +72,11 @@ public:
                 {duration_.load(std::memory_order_seq_cst)},
                 processedCommandSequence_.load(std::memory_order_seq_cst),
                 static_cast<transport::PlaybackState>(
-                    playback_.load(std::memory_order_seq_cst))};
+                    playback_.load(std::memory_order_seq_cst)),
+                loopEnabled_.load(std::memory_order_seq_cst),
+                metronomeEnabled_.load(std::memory_order_seq_cst),
+                std::bit_cast<float>(metronomeLevelBits_.load(std::memory_order_seq_cst)),
+                temporalRevision_.load(std::memory_order_seq_cst)};
 
             if (revision_.load(std::memory_order_seq_cst) == before) {
                 lastCoherentSnapshot_ = result;
@@ -82,6 +96,10 @@ private:
     std::atomic<std::int64_t> position_{};
     std::atomic<std::int64_t> duration_{};
     std::atomic<AudioCommandSequence> processedCommandSequence_{};
+    std::atomic<bool> loopEnabled_{};
+    std::atomic<bool> metronomeEnabled_{};
+    std::atomic<std::uint32_t> metronomeLevelBits_{std::bit_cast<std::uint32_t>(-12.0F)};
+    std::atomic<std::uint64_t> temporalRevision_{};
     // Read and written only by the single non-RT consumer.
     mutable RealtimeTransportSnapshot lastCoherentSnapshot_{};
 };

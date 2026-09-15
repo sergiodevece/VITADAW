@@ -20,8 +20,12 @@ std::string clipLabel(const project::ProjectState& project, media::SourceId id) 
 TimelineSnapshot makeTimelineSnapshot(const project::ProjectState& project,
                                       std::uint64_t revision,
                                       const transport::TransportState& transport) {
-    TimelineSnapshot result{project.sampleRate(), project.projectContentDuration(),
-                            transport.position, transport.playback, revision, {}, 0, {}};
+    TimelineSnapshot result;
+    result.projectSampleRate = project.sampleRate();
+    result.contentDuration = project.projectContentDuration();
+    result.transportPosition = transport.position;
+    result.playback = transport.playback;
+    result.revision = revision;
     result.tracks.reserve(project.tracks().size());
     for (const auto& track : project.tracks()) {
         TrackSnapshot lane{track.id, track.name, {}};

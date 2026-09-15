@@ -43,11 +43,9 @@ struct TransportState {
                      timeline::ProjectFramePosition newPosition,
                      timeline::ProjectFrameCount newDuration) noexcept {
         duration = newDuration;
-        position = newPosition.value <= 0
-                       ? timeline::ProjectFramePosition{0}
-                       : (newPosition.value >= newDuration.value
-                              ? timeline::ProjectFramePosition{newDuration.value}
-                              : newPosition);
+        // Content duration is descriptive; loop and run-until-stop playback may
+        // legitimately place the transport beyond the last clip.
+        position = {std::max<std::int64_t>(0, newPosition.value)};
         playback = state;
     }
 

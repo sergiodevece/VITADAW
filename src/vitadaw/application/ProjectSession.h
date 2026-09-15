@@ -1,5 +1,6 @@
 #pragma once
 #include "vitadaw/history/UndoManager.h"
+#include "vitadaw/audio/PreparedTemporalContext.h"
 
 namespace vitadaw::application {
 struct ProjectSession {
@@ -8,12 +9,20 @@ struct ProjectSession {
     history::UndoManager history;
     std::filesystem::path projectFilePath;
     history::StateToken savedStateToken{history.currentStateToken()};
+    bool loopEnabled{};
+    bool metronomeEnabled{};
+    audio::MetronomeLevelDb metronomeLevel{};
+    std::uint64_t appliedTemporalRevision{};
     [[nodiscard]] bool dirty() const noexcept { return history.currentStateToken() != savedStateToken; }
     void adopt(project::ProjectState& candidate, std::filesystem::path& path) noexcept {
         project.swap(candidate);
         projectFilePath.swap(path);
         history.commitBarrier(); // New session identity, monotonic revision, no old Undo.
         savedStateToken = history.currentStateToken();
+        loopEnabled = false;
+        metronomeEnabled = false;
+        metronomeLevel = {};
+        appliedTemporalRevision = 0;
     }
 };
 } // namespace vitadaw::application

@@ -14,6 +14,11 @@ inline constexpr std::size_t maximumEvents = 4096;
 inline constexpr std::int64_t maximumCoordinate = std::int64_t{1} << 40;
 struct MusicalTickPosition { std::int64_t value{}; bool operator==(const MusicalTickPosition&) const = default; };
 struct MusicalTickDuration { std::int64_t value{}; bool operator==(const MusicalTickDuration&) const = default; };
+struct MusicalLoopRange {
+    MusicalTickPosition start;
+    MusicalTickPosition end;
+    bool operator==(const MusicalLoopRange&) const = default;
+};
 struct QuarterNotePosition { double value{}; };
 struct BarIndex { std::int64_t value{}; bool operator==(const BarIndex&) const = default; };
 struct BeatIndex { std::int64_t value{}; bool operator==(const BeatIndex&) const = default; };
@@ -103,6 +108,9 @@ public:
     }
     [[nodiscard]] Result<timeline::Seconds> secondsAt(QuarterNotePosition) const noexcept;
     [[nodiscard]] Result<timeline::PreciseProjectFramePosition> preciseProjectFrameAt(QuarterNotePosition) const noexcept;
+    [[nodiscard]] Result<timeline::PreciseProjectFramePosition> preciseProjectFrameAtTick(MusicalTickPosition t) const noexcept {
+        return preciseProjectFrameAt(QuarterNotePosition{static_cast<double>(t.value) / ppq});
+    }
     [[nodiscard]] Result<timeline::ProjectFramePosition> projectFrameAt(MusicalTickPosition, Rounding = Rounding::nearest) const noexcept;
     [[nodiscard]] Result<timeline::ProjectFramePosition> projectFrameAt(MusicalPosition, Rounding = Rounding::nearest) const noexcept;
     [[nodiscard]] Result<MusicalTickPosition> tickAt(MusicalPosition) const noexcept;

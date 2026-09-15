@@ -21,16 +21,20 @@ struct DuplicateClip { tracks::TrackId track; clips::AudioClip created; };
 struct DeleteClip { tracks::TrackId track; clips::AudioClip removed; };
 struct TempoEdit { std::optional<musical::TempoEvent> before, after; };
 struct SignatureEdit { std::optional<musical::TimeSignatureEvent> before, after; };
+struct LoopRangeEdit { std::optional<musical::MusicalLoopRange> before, after; };
 struct SplitClip { tracks::TrackId track; clips::AudioClip original, left, right; };
 
 // Model values only. No borrowed views or prepared/runtime ownership.
 class UndoableOperation {
 public:
     using Payload = std::variant<MoveClip, DuplicateClip, SplitClip,
-                                 TrimClipLeft, TrimClipRight, DeleteClip, TempoEdit, SignatureEdit>;
+                                 TrimClipLeft, TrimClipRight, DeleteClip,
+                                 TempoEdit, SignatureEdit, LoopRangeEdit>;
     Payload payload;
     [[nodiscard]] bool isMusical() const noexcept {
-        return std::holds_alternative<TempoEdit>(payload) || std::holds_alternative<SignatureEdit>(payload);
+        return std::holds_alternative<TempoEdit>(payload) ||
+               std::holds_alternative<SignatureEdit>(payload) ||
+               std::holds_alternative<LoopRangeEdit>(payload);
     }
     [[nodiscard]] std::string_view label() const noexcept;
     // Operates on a disposable application-thread candidate, never active state.

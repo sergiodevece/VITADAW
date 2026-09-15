@@ -52,6 +52,17 @@ public:
     [[nodiscard]] bool commitPreparedProcessingPlan(
         audio::PreparedProcessingPlanChangePtr prepared,
         audio::AudioFileCommitAction modelCommit) noexcept override;
+    [[nodiscard]] audio::TemporalContextPreparationResult prepareTemporalContext(
+        const musical::MusicalTimeMap&,
+        std::optional<musical::MusicalLoopRange>,
+        timeline::SampleRate, std::uint64_t) override;
+    [[nodiscard]] bool commitPreparedTemporalContext(
+        std::unique_ptr<audio::PreparedTemporalContext>,
+        audio::AudioFileCommitAction) noexcept override;
+    [[nodiscard]] bool commitPreparedProjectAndTemporalContext(
+        audio::PreparedProcessingPlanChangePtr,
+        std::unique_ptr<audio::PreparedTemporalContext>,
+        audio::AudioFileCommitAction) noexcept override;
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track,
         mixer::PreparedTrackMixState mix,
@@ -77,6 +88,10 @@ public:
     [[nodiscard]] audio::AudioControlRequestResult tryRequestStop() noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestSeek(
         timeline::ProjectFramePosition) noexcept override;
+    [[nodiscard]] audio::AudioControlRequestResult trySetLoopEnabled(bool) noexcept override;
+    [[nodiscard]] audio::AudioControlRequestResult trySetMetronomeEnabled(bool) noexcept override;
+    [[nodiscard]] audio::AudioControlRequestResult trySetMetronomeLevel(
+        audio::MetronomeLevelDb) noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
 
@@ -102,13 +117,14 @@ private:
     void refreshState();
     void publishState();
     void detachAudioCallback() noexcept;
-    void attachAudioCallback();
+    void attachAudioCallback(bool preserveTransport = false);
     void configureRealtimeEngine() noexcept;
     [[nodiscard]] bool prepareProjectPlan(
         PreparedProject& candidate,
         const audio::ProcessingPlanSpecification& specification,
         std::string& errorMessage);
     [[nodiscard]] bool reprepareForCurrentDevice(std::string& errorMessage);
+    [[nodiscard]] bool reprepareTemporalForCurrentDevice(std::string& errorMessage);
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
         audio::AudioFileCommitAction modelCommit) noexcept;
@@ -118,12 +134,14 @@ private:
     audio::AudioDeviceStateModel stateModel_;
     StateChangedCallback stateChangedCallback_;
     std::unique_ptr<PreparedProject> preparedProject_;
+    std::unique_ptr<audio::PreparedTemporalContext> preparedTemporalContext_;
     audio::RealtimeAudioEngine realtimeEngine_;
     timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;
     mixer::PreparedMasterMixState masterMix_;
     std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
     std::atomic<bool> suppressLifecycleNotification_{};
+    std::atomic<bool> preserveTransportDuringRegistration_{};
     bool callbackRegistered_{};
     bool changeListenerRegistered_{};
 };

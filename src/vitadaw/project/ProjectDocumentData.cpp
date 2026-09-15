@@ -1,5 +1,6 @@
 #include "vitadaw/project/ProjectState.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
+#include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/processors/GainProcessor.h"
 #include <algorithm>
 #include <unordered_set>
@@ -9,11 +10,12 @@
 namespace vitadaw::project {
 ProjectState::DocumentData ProjectState::documentData() const {
     return {settings_, tracks_, sources_, routing_.documentData(), nextTrackId_,
-        nextSourceId_, nextClipId_, nextProcessorId_, masterMix_, masterInserts_, musicalTime_};
+        nextSourceId_, nextClipId_, nextProcessorId_, masterMix_, masterInserts_, musicalTime_, loopRange_};
 }
 std::unique_ptr<ProjectState> ProjectState::fromDocumentData(DocumentData data) {
     using namespace audio;
-    if (!musical::PreparedMusicalTimeMap::compile(data.musicalTime, data.settings.sampleRate)) return {};
+    if (!audio::prepareTemporalContext(data.musicalTime, data.loopRange,
+            data.settings.sampleRate, data.settings.sampleRate, 0).success()) return {};
     if (!data.settings.sampleRate.isValid() || data.settings.name.size() > 4096 ||
         data.tracks.size() > maximumTracks || data.sources.size() > maximumSources ||
         data.routing.buses.size() > maximumPreparedBuses ||
@@ -109,6 +111,7 @@ std::unique_ptr<ProjectState> ProjectState::fromDocumentData(DocumentData data) 
     result->nextClipId_ = data.nextClipId; result->nextProcessorId_ = data.nextProcessorId;
     result->masterMix_ = data.masterMix; result->masterInserts_ = std::move(data.masterInserts);
     result->musicalTime_ = std::move(data.musicalTime);
+    result->loopRange_ = data.loopRange;
     return result;
 }
 } // namespace vitadaw::project

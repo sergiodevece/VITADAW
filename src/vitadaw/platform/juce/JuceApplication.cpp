@@ -6,7 +6,6 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
-#include <array>
 #include <exception>
 #include <memory>
 #include <string>
@@ -63,7 +62,7 @@ public:
     }
 
     [[nodiscard]] const juce::String getApplicationVersion() override {
-        return "0.5.2";
+        return "0.5.3";
     }
 
     [[nodiscard]] bool moreThanOneInstanceAllowed() override {
@@ -97,71 +96,6 @@ public:
             commandDispatcher_ =
                 std::make_unique<commands::CommandDispatcher>(*dawApplication_);
             phase_ = StartupPhase::applicationCreated;
-            const std::array trackNames{"Snare", "Kick", "Guitar", "Stereo 4"};
-            for (std::size_t index = 0; index < trackNames.size(); ++index) {
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddAudioTrack{
-                        trackNames[index],
-                        index == 3 ? media::AudioChannelLayout::stereo
-                                   : media::AudioChannelLayout::mono}));
-            }
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBus{"Drum Bus"}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBus{"Music Bus"}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBus{"Plate Bus"}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBus{"Parallel Bus"}));
-            static_cast<void>(commandDispatcher_->dispatch(
-                commands::AddBus{"Room Bus"}));
-            const auto& tracks = dawApplication_->project().tracks();
-            const auto& buses = dawApplication_->project().routing().buses();
-            if (tracks.size() >= 3 && buses.size() >= 5) {
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::SetTrackOutputDestination{
-                        tracks[0].id,
-                        routing::TrackOutputDestination::toBus(buses[0].id)}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::SetTrackOutputDestination{
-                        tracks[1].id,
-                        routing::TrackOutputDestination::toBus(buses[0].id)}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::SetTrackOutputDestination{
-                        tracks[2].id,
-                        routing::TrackOutputDestination::toBus(buses[1].id)}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::SetBusOutputDestination{
-                        buses[0].id,
-                        routing::OutputDestination::toBus(buses[1].id)}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddTrackSend{
-                        tracks[0].id, buses[2].id,
-                        routing::SendTapPoint::preFaderPrePan,
-                        mixer::GainDb{-6.0F}}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddBusSend{
-                        buses[0].id, buses[3].id,
-                        routing::SendTapPoint::preFaderPrePan,
-                        mixer::GainDb{-6.0F}}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddBusSend{
-                        buses[1].id, buses[4].id,
-                        routing::SendTapPoint::postFaderPostPan,
-                        mixer::GainDb{-6.0F}}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddProcessor{
-                        tracks[0].id,
-                        {processors::internalGainProcessorType}}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddProcessor{
-                        buses[0].id,
-                        {processors::internalGainProcessorType}}));
-                static_cast<void>(commandDispatcher_->dispatch(
-                    commands::AddProcessor{
-                        processors::MasterTarget{},
-                        {processors::internalGainProcessorType}}));
-            }
             mainWindow_ = std::make_unique<MainWindow>(
                 audioDevice_->state(), *commandDispatcher_, *dawApplication_);
             phase_ = StartupPhase::windowCreated;

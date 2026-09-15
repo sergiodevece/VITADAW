@@ -35,6 +35,15 @@ struct TimelineSnapshot {
     std::vector<TrackSnapshot> tracks;
     std::uint64_t musicalRevision{};
     std::optional<musical::MusicalPosition> musicalPosition;
+    std::optional<musical::MusicalLoopRange> loopRange;
+    std::optional<::vitadaw::timeline::PreciseProjectFramePosition> loopStart;
+    std::optional<::vitadaw::timeline::PreciseProjectFramePosition> loopEnd;
+    std::optional<musical::MusicalPosition> loopStartPosition;
+    std::optional<musical::MusicalPosition> loopEndPosition;
+    bool loopEnabled{};
+    bool metronomeEnabled{};
+    audio::MetronomeLevelDb metronomeLevel;
+    std::uint64_t temporalRevision{};
     bool operator==(const TimelineSnapshot&) const = default;
 };
 

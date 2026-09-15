@@ -40,7 +40,11 @@ TimelineComponent::TimelineComponent(commands::ICommandDispatcher& dispatcher,
 }
 
 void TimelineComponent::refreshModel(bool resetViewport) {
-    if (!resetViewport && snapshot_.revision == application_.timelineRevision()) return;
+    if (!resetViewport && snapshot_.revision == application_.timelineRevision() &&
+        snapshot_.musicalRevision == application_.musicalRevision() &&
+        snapshot_.loopEnabled == application_.loopEnabled() &&
+        snapshot_.metronomeEnabled == application_.metronomeEnabled() &&
+        snapshot_.metronomeLevel == application_.metronomeLevel()) return;
     snapshot_ = application_.timelineSnapshot();
     interaction_.reconcile(snapshot_);
     transform_ = ui::timeline::CoordinateTransform{snapshot_.projectSampleRate,
@@ -127,6 +131,40 @@ void TimelineComponent::paint(juce::Graphics& g) {
     g.fillRect(headerWidth, toolbarHeight, viewport.getWidth(), rulerHeight);
     g.setColour(juce::Colour{0xff292d35});
     g.fillRect(0, toolbarHeight, headerWidth, rulerHeight);
+
+    if (snapshot_.loopStart && snapshot_.loopEnd) {
+        const auto left = static_cast<float>(headerWidth +
+            transform_.preciseProjectFrameToX(snapshot_.loopStart->value));
+        const auto right = static_cast<float>(headerWidth +
+            transform_.preciseProjectFrameToX(snapshot_.loopEnd->value));
+        const auto region = juce::Rectangle<float>{left,
+            static_cast<float>(toolbarHeight), std::max(0.0F, right-left),
+            static_cast<float>(getHeight()-toolbarHeight-scrollBarThickness)};
+        g.setColour(snapshot_.loopEnabled ? juce::Colour{0x303dcc72}
+                                          : juce::Colour{0x204b5968});
+        g.fillRect(region);
+        g.setColour(snapshot_.loopEnabled ? juce::Colour{0xff55d98a}
+                                          : juce::Colour{0xff77818d});
+        g.drawVerticalLine(static_cast<int>(std::round(left)),
+                           static_cast<float>(toolbarHeight),
+                           static_cast<float>(getHeight()-scrollBarThickness));
+        g.drawVerticalLine(static_cast<int>(std::round(right)),
+                           static_cast<float>(toolbarHeight),
+                           static_cast<float>(getHeight()-scrollBarThickness));
+        if (snapshot_.loopStartPosition && snapshot_.loopEndPosition) {
+            const auto label = [](const musical::MusicalPosition& p) {
+                return juce::String(p.bar.value + 1) + "|" +
+                       juce::String(p.beat.value + 1) + "|" +
+                       juce::String(p.tick.value);
+            };
+            g.setFont(juce::FontOptions{10.0F});
+            g.drawText("Loop " + label(*snapshot_.loopStartPosition) + " - " +
+                           label(*snapshot_.loopEndPosition),
+                       static_cast<int>(left + 4), toolbarHeight,
+                       std::max(1, static_cast<int>(right-left-8)), 14,
+                       juce::Justification::centredLeft, true);
+        }
+    }
 
     const auto pixels = transform_.pixelsPerSecond();
     constexpr std::array<double, 12> intervals{0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
@@ -241,9 +279,12 @@ void TimelineComponent::updateScrollBars() {
     const auto viewport = viewportBounds();
     const auto visibleSeconds = viewport.getWidth() > 0
         ? viewport.getWidth() / transform_.pixelsPerSecond() : 1.0;
-    const auto duration = snapshot_.projectSampleRate.isValid()
+    auto duration = snapshot_.projectSampleRate.isValid()
         ? static_cast<double>(std::max<std::int64_t>(0, snapshot_.contentDuration.value)) /
               snapshot_.projectSampleRate.hertz() : 0.0;
+    if (snapshot_.loopEnd && snapshot_.projectSampleRate.isValid())
+        duration = std::max(duration, snapshot_.loopEnd->value /
+                                      snapshot_.projectSampleRate.hertz());
     const auto totalSeconds = std::max(30.0, duration + 10.0);
     horizontal_.setRangeLimits(0.0, totalSeconds);
     horizontal_.setCurrentRange(std::min(transform_.visibleStartSeconds(),

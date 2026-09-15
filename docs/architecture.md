@@ -1372,7 +1372,98 @@ revisión musical y posición opcional; UI consulta el prepared map sin copiar
 4096 eventos a 30 Hz. Seleccionar modo de display no despacha mutaciones ni
 marca dirty. Los tres botones musicales son exclusivamente provisionales.
 
-## Evolución hasta 0.5.2
+## Loop & Metronome 0.5.3
+
+`ProjectState` conserva opcionalmente `MusicalLoopRange{startTick,endTick}` con
+semántica half-open. Ticks son la única autoridad persistente: bars son entrada
+de UI convertida una vez, mientras frames y segundos son derivados. El mínimo
+se valida sin clamp: 1024 ticks, 10 ms, un project frame y un device frame.
+Tempo o métrica recompilan el mismo rango de ticks; los clips continúan fijados
+a project frames absolutos.
+
+`PreparedTemporalContext` contiene el mapa musical, el loop preciso, una
+revisión común y las tablas normal/accent del click preparadas al sample rate
+del dispositivo. Es inmutable: el adaptador JUCE es owner y RT recibe una vista
+estable. Un cambio temporal se prepara por completo, retira el callback,
+publica contexto/modelo por swaps noexcept, restaura el checkpoint preciso y
+destruye el owner anterior fuera de RT. El re-registro controlado cierra la
+generación de comandos y exige de nuevo confirmación del consumidor, pero no
+confunde ese evento con un reinicio físico ni rebobina el checkpoint restaurado.
+Load adopta plan y contexto en una sola
+región quiescente. Un reinicio real vuelve a preparar las tablas y conserva el
+documento, aplicando el lifecycle normal de dispositivo.
+
+`RealtimeProjectClock` sigue siendo el único reloj. El callback calcula cuántos
+frames caben antes del extremo preciso, procesa `[segmentStart,segmentEnd)`,
+envuelve a `S + residual` y continúa dentro del mismo callback. No existe una
+duración de loop redondeada a device frames. Cada tramo ejecuta lookup, routing,
+inserts, sends, buses y master; los meters acumulan el callback completo y se
+publican una vez. `LoopWrap` se comunica al processor context sin resetear
+processor, bypass delay, smoother, tail ni voces. Seek/Stop son discontinuidad
+dura. Sin crossfade, una forma de onda discontinua puede producir click.
+
+La duración de contenido es descriptiva y queda separada de la política de
+playback: natural end sin loop/metro, reproducción cíclica con loop y
+run-until-stop con metrónomo. El loop puede superar el último clip; fuera de
+contenido las fuentes aportan silencio. Un proyecto vacío sin loop ni metrónomo
+rechaza Play. No se representa ejecución abierta mediante `INT64_MAX`.
+
+El metrónomo enumera beats desde `PreparedMusicalTimeMap` por tramo. Los eventos
+pertenecen a `[start,end)`, se cuantizan al primer device sample no anterior y
+una ocurrencia cuantizada al frame posterior se conserva en un slot pending
+preasignado. Loop end queda excluido y loop start se emite una vez por vuelta.
+Cuatro voces fijas conservan clicks activos al wrap; ante agotamiento se
+sustituye determinísticamente la voz más antigua. El click se suma después de
+Master Inserts y antes de Master Gain/Meter, independiente de Solo/Mute de
+pistas y buses. Sin PDC, audio con latencia declarada puede percibirse retrasado
+respecto al click aunque el scheduling sea correcto.
+
+`SetLoopRangeMusical` es documental, Stopped-only, undoable, persistente y
+dirty. `SetLoopEnabled` es Stopped-only y de sesión. Los comandos de metrónomo
+son POD de sesión, admitidos durante Play, y usan la cola/generación/cancelación
+del transporte. Ninguno consume historial ni cambia `StateToken`; UI y read
+model observan el estado confirmado por RT.
+
+Schema3 añade `loopRange` nulo o `{startTick,endTick}` exacto. No guarda enabled,
+metrónomo, frames compilados ni fase. La migración encadena v1→v2→v3 y el
+guardado canónico sigue siendo determinista.
+
+### Corrección de primera importación en 0.5.3
+
+`New Project` es ahora el estado creado directamente por `ProjectSession`: cero
+tracks, sources, clips, buses y sends; Master, routing vacío, sample rate lógico
+y mapas musicales por defecto sí existen. Se retiró la plantilla de cuatro
+pistas que la capa JUCE añadía solo para antiguos smoke tests. No se implementa
+una operación general de alta/baja de pistas desde UI.
+
+La política mínima es **B**. `ImportAudioFile` no recibe un `TrackId`: prepara y
+valida primero el WAV fuera de RT y construye una copia del proyecto. Si no hay
+pistas, añade en esa copia una única pista cuyo layout procede del WAV y conserva
+el ID devuelto por `ProjectState::addAudioTrack`; nunca asume ID 1. Si ya existen
+pistas, devuelve `noTargetTrack`: una importación posterior debe usar el comando
+dirigido y no una heurística de “primera pista compatible”.
+`ImportAudioToTrack` permanece disponible para selección explícita y exige que
+el destino exista y tenga el layout correcto.
+
+La transacción completa es: ruta seleccionada → lectura/fingerprint/decode →
+modelo candidato → selección/creación de pista → Source+Clip → plan preparado →
+commit conjunto RT/modelo. El callback de audio nunca participa en esas fases.
+Un fallo destruye el recurso candidato fuera de RT y conserva modelo, plan,
+historial y `StateToken`. Un éxito publica exactamente un PreparedSource, hace
+la barrera no undoable existente, marca dirty y provoca un nuevo
+`TimelineSnapshot`/rebuild de la UI. El mapa musical, locators de loop y estado
+de sesión de loop/metrónomo no se alteran.
+
+El chooser asíncrono permanece owned por el componente y captura un
+`juce::Component::SafePointer`. Cancel despacha una ruta vacía y produce
+`userCancelled`; destruir la ventana invalida el SafePointer. Una selección no
+se descarta mediante `juce::File::existsAsFile()`: el backend POSIX existente es
+la autoridad y clasifica ausencia y `EACCES`/`EPERM`. Formato, decode,
+preparación y commit tienen errores de comando separados. VitaDAW no activa App
+Sandbox ni requiere security-scoped bookmarks en esta configuración, por lo que
+no se añadieron entitlements ni concesiones automáticas.
+
+## Evolución hasta 0.5.3
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1433,6 +1524,8 @@ marca dirty. Los tres botones musicales son exclusivamente provisionales.
     ruler/teclado, displays derivados y Split manual desde el playhead real.
 25. **Completado en 0.5.2:** mapas musicales portables/preparados, comandos
     undoables, display/ruler, schema2 y migración v1.
+26. **Completado en 0.5.3:** loop PPQ persistente, segmentación sample-accurate
+    sin deriva, metrónomo RT con acento y schema3/migración v2.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

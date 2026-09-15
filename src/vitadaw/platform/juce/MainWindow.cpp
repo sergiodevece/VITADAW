@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace vitadaw::platform::juce_adapter {
@@ -50,13 +51,20 @@ public:
         };
         addAndMakeVisible(timeline_);
 
-        for (const auto& track : application.project().tracks()) {
-            auto button = std::make_unique<juce::TextButton>(
-                "Import to " + juce::String(track.name));
-            const auto id = track.id;
-            button->onClick = [this, id] { chooseWav(id); };
+        if (application.project().tracks().empty()) {
+            auto button = std::make_unique<juce::TextButton>("Import WAV...");
+            button->onClick = [this] { chooseWav(std::nullopt); };
             addAndMakeVisible(*button);
             loadButtons_.push_back(std::move(button));
+        } else {
+            for (const auto& track : application.project().tracks()) {
+                auto button = std::make_unique<juce::TextButton>(
+                    "Import to " + juce::String(track.name));
+                const auto id = track.id;
+                button->onClick = [this, id] { chooseWav(id); };
+                addAndMakeVisible(*button);
+                loadButtons_.push_back(std::move(button));
+            }
         }
 
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
@@ -72,6 +80,57 @@ public:
         };
         tempoChange_.onClick = [this] { dispatch(commands::AddTempoChange{{16 * musical::ppq}, {60.0}}); };
         signatureChange_.onClick = [this] { dispatch(commands::AddTimeSignatureChange{{8}, {7,8}}); };
+        startBar_.setText("2", false);
+        endBar_.setText("4", false);
+        startBarLabel_.setText("Start Bar", juce::dontSendNotification);
+        endBarLabel_.setText("End Bar", juce::dontSendNotification);
+        for (auto* label : {&startBarLabel_, &endBarLabel_}) {
+            label->setColour(juce::Label::textColourId, juce::Colours::white);
+            addAndMakeVisible(*label);
+        }
+        startBar_.setInputRestrictions(8, "0123456789");
+        endBar_.setInputRestrictions(8, "0123456789");
+        applyLoop_.onClick = [this] {
+            const auto start = startBar_.getText().getLargeIntValue();
+            const auto end = endBar_.getText().getLargeIntValue();
+            if (start <= 0 || end <= start) {
+                showResult({commands::CommandStatus::rejected,
+                            "Loop bars must satisfy 1 <= start < end"});
+                return;
+            }
+            const auto startTick = application_.musicalTime().tickAt(
+                {{start - 1}, {0}, {0}});
+            const auto endTick = application_.musicalTime().tickAt(
+                {{end - 1}, {0}, {0}});
+            if (!startTick || !endTick) {
+                showResult({commands::CommandStatus::rejected,
+                            "Loop bars cannot be represented by the current meter map"});
+                return;
+            }
+            dispatch(commands::SetLoopRangeMusical{startTick.value,
+                                                    endTick.value});
+        };
+        loopEnabled_.setClickingTogglesState(true);
+        loopEnabled_.onClick = [this] {
+            dispatch(commands::SetLoopEnabled{loopEnabled_.getToggleState()});
+        };
+        metronomeEnabled_.setClickingTogglesState(true);
+        metronomeEnabled_.onClick = [this] {
+            dispatch(commands::SetMetronomeEnabled{
+                metronomeEnabled_.getToggleState()});
+        };
+        metronomeLevel_.setRange(-100.0, 0.0, 0.1);
+        metronomeLevel_.setValue(-12.0, juce::dontSendNotification);
+        metronomeLevel_.setTextValueSuffix(" dB");
+        metronomeLevel_.onValueChange = [this] {
+            dispatch(commands::SetMetronomeLevel{{
+                static_cast<float>(metronomeLevel_.getValue())}});
+        };
+        for (auto* editor : {&startBar_, &endBar_}) addAndMakeVisible(*editor);
+        addAndMakeVisible(applyLoop_);
+        addAndMakeVisible(loopEnabled_);
+        addAndMakeVisible(metronomeEnabled_);
+        addAndMakeVisible(metronomeLevel_);
         for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_}) addAndMakeVisible(*button);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_})
@@ -101,6 +160,17 @@ public:
         }
         for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_})
             button->setEnabled(state.playback == transport::PlaybackState::stopped);
+        const auto stopped = state.playback == transport::PlaybackState::stopped;
+        startBar_.setEnabled(stopped);
+        endBar_.setEnabled(stopped);
+        applyLoop_.setEnabled(stopped);
+        loopEnabled_.setEnabled(stopped);
+        loopEnabled_.setToggleState(application_.loopEnabled(),
+                                    juce::dontSendNotification);
+        metronomeEnabled_.setToggleState(application_.metronomeEnabled(),
+                                         juce::dontSendNotification);
+        metronomeLevel_.setValue(application_.metronomeLevel().value,
+                                 juce::dontSendNotification);
         timeline_.setTransportState(state);
         updateHistoryControls();
     }
@@ -148,6 +218,20 @@ public:
         tempoChange_.setBounds(musicalRow.removeFromLeft(240));
         signatureChange_.setBounds(musicalRow.removeFromLeft(240));
 
+        auto loopRow = bounds.removeFromTop(30);
+        startBarLabel_.setBounds(loopRow.removeFromLeft(62));
+        startBar_.setBounds(loopRow.removeFromLeft(54));
+        loopRow.removeFromLeft(4);
+        endBarLabel_.setBounds(loopRow.removeFromLeft(56));
+        endBar_.setBounds(loopRow.removeFromLeft(54));
+        loopRow.removeFromLeft(4);
+        applyLoop_.setBounds(loopRow.removeFromLeft(130));
+        loopRow.removeFromLeft(6);
+        loopEnabled_.setBounds(loopRow.removeFromLeft(105));
+        loopRow.removeFromLeft(12);
+        metronomeEnabled_.setBounds(loopRow.removeFromLeft(110));
+        metronomeLevel_.setBounds(loopRow.removeFromLeft(190));
+
         auto commandRow = bounds.removeFromTop(32);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_}) {
@@ -183,23 +267,37 @@ private:
         redoButton_.setEnabled(application_.canRedo());
     }
 
-    void chooseWav(tracks::TrackId track) {
+    void chooseWav(std::optional<tracks::TrackId> track) {
         fileChooser_ = std::make_unique<juce::FileChooser>(
             "Select a WAV file", juce::File{}, "*.wav");
         constexpr auto flags = juce::FileBrowserComponent::openMode |
                                juce::FileBrowserComponent::canSelectFiles;
-        fileChooser_->launchAsync(flags, [this, track](const juce::FileChooser& chooser) {
+        juce::Component::SafePointer<AudioStatusComponent> safe{this};
+        fileChooser_->launchAsync(flags, [safe, track](const juce::FileChooser& chooser) {
+            if (!safe) return;
             const auto file = chooser.getResult();
-            if (file.existsAsFile()) {
+            if (file == juce::File{}) {
+                if (track) {
+                    safe->dispatch(commands::ImportAudioToTrack{{}, *track, {0}});
+                } else {
+                    safe->dispatch(commands::ImportAudioFile{{}, {0}});
+                }
+            } else {
                 const auto fullPath = file.getFullPathName();
 #if JUCE_WINDOWS
                 const std::filesystem::path nativePath{fullPath.toWideCharPointer()};
 #else
                 const std::filesystem::path nativePath{fullPath.toStdString()};
 #endif
-                dispatch(commands::ImportAudioToTrack{nativePath, track, {0}});
+                if (track) {
+                    safe->dispatch(commands::ImportAudioToTrack{nativePath, *track, {0}});
+                } else {
+                    safe->dispatch(commands::ImportAudioFile{nativePath, {0}});
+                }
             }
-            fileChooser_.reset();
+            juce::MessageManager::callAsync([safe] {
+                if (safe) safe->fileChooser_.reset();
+            });
         });
     }
 
@@ -211,13 +309,19 @@ private:
                                       juce::FileBrowserComponent::warnAboutOverwriting
                                  : juce::FileBrowserComponent::openMode) |
                            juce::FileBrowserComponent::canSelectFiles;
-        fileChooser_->launchAsync(flags, [this, save](const juce::FileChooser& chooser) {
+        juce::Component::SafePointer<AudioStatusComponent> safe{this};
+        fileChooser_->launchAsync(flags, [safe, save](const juce::FileChooser& chooser) {
+            if (!safe) return;
             auto file = chooser.getResult();
-            if (file == juce::File{}) return;
-            if (save) file = file.withFileExtension(".vitadaw");
-            const auto path = std::filesystem::path{file.getFullPathName().toStdString()};
-            if (save) dispatch(commands::SaveProjectAs{path});
-            else dispatch(commands::LoadProject{path, false});
+            if (file != juce::File{}) {
+                if (save) file = file.withFileExtension(".vitadaw");
+                const auto path = std::filesystem::path{file.getFullPathName().toStdString()};
+                if (save) safe->dispatch(commands::SaveProjectAs{path});
+                else safe->dispatch(commands::LoadProject{path, false});
+            }
+            juce::MessageManager::callAsync([safe] {
+                if (safe) safe->fileChooser_.reset();
+            });
         });
     }
 
@@ -248,7 +352,8 @@ private:
         if (result.persistence.code == persistence::PersistenceCode::savePathRequired)
             chooseProject(true);
         if (result.status == commands::CommandStatus::accepted &&
-            std::holds_alternative<commands::LoadProject>(command)) {
+            (std::holds_alternative<commands::LoadProject>(command) ||
+             std::holds_alternative<commands::ImportAudioFile>(command))) {
             if (documentLoaded) documentLoaded();
         } else {
             timeline_.refreshModel(false);
@@ -269,6 +374,13 @@ private:
     juce::TextButton tempo100_{"Initial tempo: 100 BPM"};
     juce::TextButton tempoChange_{"Add 60 BPM @ quarter 17"};
     juce::TextButton signatureChange_{"Add 7/8 @ bar 9"};
+    juce::TextEditor startBar_, endBar_;
+    juce::Label startBarLabel_, endBarLabel_;
+    juce::TextButton applyLoop_{"Apply Loop Range"};
+    juce::ToggleButton loopEnabled_{"Enable Loop"};
+    juce::ToggleButton metronomeEnabled_{"Metronome"};
+    juce::Slider metronomeLevel_{juce::Slider::LinearHorizontal,
+                                 juce::Slider::TextBoxRight};
     std::unique_ptr<juce::FileChooser> fileChooser_;
 };
 

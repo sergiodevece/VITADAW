@@ -12,6 +12,11 @@ namespace vitadaw::processors {
 
 enum class ChannelLayout : std::uint8_t { mono = 1, stereo = 2 };
 enum class ProcessingMode : std::uint8_t { realtime, offline };
+enum class TemporalDiscontinuity : std::uint8_t {
+    continuous,
+    hardDiscontinuity,
+    loopWrap,
+};
 
 struct ProcessingFrameCount {
     std::uint64_t value{};
@@ -63,7 +68,7 @@ struct ProcessorProcessContext {
     std::size_t frameCount{};
     ProcessingMode mode{ProcessingMode::realtime};
     bool transportPlaying{};
-    bool discontinuity{};
+    TemporalDiscontinuity discontinuity{TemporalDiscontinuity::continuous};
 };
 
 enum class ProcessStatus : std::uint8_t { processed, silent, failed };

@@ -1,4 +1,4 @@
-# VitaDAW 0.5.2 — Musical Time Foundation
+# VitaDAW 0.5.3 — Loop & Metronome
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -113,6 +113,30 @@ Save escribe **schemaVersion 2**; Load valida y migra v1 en memoria a 120 BPM,
 Consulta los contratos y límites en `docs/architecture.md` y la prueba real en
 [`docs/validation-0.5.2.md`](docs/validation-0.5.2.md).
 
+VitaDAW 0.5.3 añade un rango documental de loop `[startTick,endTick)` cuya
+única autoridad son ticks PPQ15360. Se compila fuera de RT junto al mapa musical
+y ambos se publican como una sola revisión inmutable. Loop enabled es estado de
+sesión: no se guarda, no entra en Undo y no marca dirty. El callback divide cada
+bloque en tramos temporales monótonos y conserva el exceso fraccional al
+envolver, sin redondear la duración a frames de dispositivo por vuelta.
+
+El metrónomo enumera beats desde el mismo mapa, prepara dos bursts internos al
+sample rate del dispositivo y los reproduce desde un pool fijo de cuatro voces.
+El acento aparece solo al inicio de compás. El click se suma tras Master Inserts
+y antes de Master Gain/Meter. Enabled y nivel son estado de sesión aplicado por
+la cola RT y pueden cambiar durante Play sin alterar historial. La política de
+playback queda separada de la duración de clips, por lo que loop o metrónomo
+pueden mantener activo un proyecto vacío o una región más allá del contenido.
+Save escribe **schemaVersion 3** y v2 migra a un rango nulo. Detalles:
+[`docs/validation-0.5.3.md`](docs/validation-0.5.3.md).
+
+El release blocker de importación manual de 0.5.3 queda corregido sin cambiar
+de versión. El callback asíncrono del selector usa `SafePointer`, conserva el
+chooser durante la operación y trata Cancel como un resultado explícito. Una
+ruta elegida siempre llega al backend de archivos; cualquier fallo produce un
+diagnóstico provisional visible y conserva el proyecto y su `StateToken`.
+Import sigue siendo una barrera no undoable: solo el commit exitoso marca dirty.
+
 ## Tecnología propuesta
 
 - **C++20** para el núcleo y el callback de audio.
@@ -190,10 +214,18 @@ linearización; el índice de cola se publica después. El cierre de lifecycle
 compite sobre el mismo gate: si queda después de la aceptación, su watermark
 incluye la secuencia; si queda antes, el CAS de aceptación falla.
 
-Los cuatro botones provisionales de importación aceptan únicamente archivos `.wav`
-que `juce::WavAudioFormat` pueda decodificar. La interfaz crea cuatro pistas al
-arrancar para el smoke test; el dominio y el motor admiten una colección
-variable. Cada import crea `AudioSource` + `AudioClip` en el frame cero;
+Un proyecto nuevo contiene cero pistas, cero fuentes y cero buses, además del
+Master, el routing vacío y los mapas musicales por defecto. La interfaz muestra
+un único botón provisional `Import WAV...`. La primera importación válida crea
+transaccionalmente una pista mono o estéreo según el medio, además de
+`AudioSource` + `AudioClip`; no presupone que su `TrackId` sea 1. Tras el commit,
+la UI se reconstruye y ofrece importación dirigida a las pistas existentes.
+
+El chooser acepta únicamente archivos `.wav` que `juce::WavAudioFormat` pueda
+decodificar. No filtra la selección con una segunda consulta silenciosa de
+existencia: entrega la ruta al adaptador, que distingue cancelación, ausencia,
+permiso denegado, formato no soportado, fallo de decode, preparación y commit.
+Cada import crea el clip en el frame cero;
 importaciones posteriores pueden solaparse en la misma pista. `Play` reproduce
 simultáneamente todas las pistas disponibles y
 `Stop` detiene y vuelve al inicio. Si ninguna pista
@@ -483,6 +515,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.2 — Musical Time Foundation:** mapas portables de tempo/métrica,
   conversiones precisas y redondeos explícitos, comandos con Undo/Redo sin
   mover audio, ruler musical, schema v2 y migración real v1→v2.
+- **0.5.3 — Loop & Metronome:** loop musical persistente, wrap fraccional por
+  segmentos continuos, metrónomo sample-accurate y schema v3 con migración
+  v2→v3.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -506,4 +541,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.4.3.md`](docs/validation-0.4.3.md) y
 [`docs/validation-0.5.0.md`](docs/validation-0.5.0.md) y
 [`docs/validation-0.5.1.md`](docs/validation-0.5.1.md) y
-[`docs/validation-0.5.2.md`](docs/validation-0.5.2.md).
+[`docs/validation-0.5.2.md`](docs/validation-0.5.2.md) y
+[`docs/validation-0.5.3.md`](docs/validation-0.5.3.md).

@@ -1,5 +1,6 @@
 #pragma once
 #include "vitadaw/musical/MusicalTime.h"
+#include "vitadaw/audio/PreparedTemporalContext.h"
 #include <type_traits>
 
 #include "vitadaw/tracks/AudioTrack.h"
@@ -30,6 +31,13 @@ struct LoadAudioFile {
 struct ImportAudioToTrack {
     std::filesystem::path file;
     tracks::TrackId track;
+    timeline::ProjectFramePosition projectStart{0};
+};
+
+// First import without a pre-existing target. The application creates the
+// initial track transactionally only when the project has no audio tracks.
+struct ImportAudioFile {
+    std::filesystem::path file;
     timeline::ProjectFramePosition projectStart{0};
 };
 
@@ -74,11 +82,16 @@ struct AddTimeSignatureChange { musical::BarIndex bar; musical::TimeSignature si
 struct MoveTimeSignatureChange { musical::TimeSignatureEventId id; musical::BarIndex bar; };
 struct SetTimeSignature { musical::TimeSignatureEventId id; musical::TimeSignature signature; };
 struct RemoveTimeSignatureChange { musical::TimeSignatureEventId id; };
+struct SetLoopRangeMusical { musical::MusicalTickPosition start, end; };
+struct SetLoopEnabled { bool enabled{}; };
+struct SetMetronomeEnabled { bool enabled{}; };
+struct SetMetronomeLevel { audio::MetronomeLevelDb level; };
 template<class T> inline constexpr bool isMusicalCommand =
     std::is_same_v<T, AddTempoChange> || std::is_same_v<T, MoveTempoChange> ||
     std::is_same_v<T, SetTempo> || std::is_same_v<T, RemoveTempoChange> ||
     std::is_same_v<T, AddTimeSignatureChange> || std::is_same_v<T, MoveTimeSignatureChange> ||
-    std::is_same_v<T, SetTimeSignature> || std::is_same_v<T, RemoveTimeSignatureChange>;
+    std::is_same_v<T, SetTimeSignature> || std::is_same_v<T, RemoveTimeSignatureChange> ||
+    std::is_same_v<T, SetLoopRangeMusical>;
 struct Pause {};
 struct Stop {};
 struct SeekToProjectFrame { timeline::ProjectFramePosition position; };
@@ -146,11 +159,14 @@ struct SetProcessorParameter {
 };
 
 using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile,
-                             ImportAudioToTrack, AddClip, RemoveClip,
+                             ImportAudioToTrack, ImportAudioFile,
+                             AddClip, RemoveClip,
                              RemoveSource, MoveClip, DuplicateClip, SplitClip,
                              TrimClipLeft, TrimClipRight, DeleteClip,
                              AddTempoChange, MoveTempoChange, SetTempo, RemoveTempoChange,
                              AddTimeSignatureChange, MoveTimeSignatureChange, SetTimeSignature, RemoveTimeSignatureChange,
+                             SetLoopRangeMusical, SetLoopEnabled,
+                             SetMetronomeEnabled, SetMetronomeLevel,
                              Play, Pause, Stop, SeekToProjectFrame, GoToStart,
                              GoToEnd, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
                              SetTrackGain, SetTrackPan, SetTrackMute,
@@ -185,6 +201,13 @@ enum class CommandError {
     seekRejectedWhilePlaying,
     preparationFailed,
     capacityExceeded,
+    userCancelled,
+    fileNotFound,
+    permissionDenied,
+    unsupportedFormat,
+    decodeFailed,
+    noTargetTrack,
+    commitFailed,
 };
 
 struct CommandResult {

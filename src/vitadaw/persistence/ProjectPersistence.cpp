@@ -236,7 +236,14 @@ void migrateV1ToV2(J& root) {
         {"signatureEvents",J::array({{{"id","1"},{"barIndex","0"},{"numerator",4},{"denominator",4}}})}};
     root["schemaVersion"] = 2u;
 }
-constexpr std::array<Migration,1> migrations{migrateV1ToV2};
+void migrateV2ToV3(J& root) {
+    auto legacy = decode(root);
+    if (!project::ProjectState::fromDocumentData(std::move(legacy.model)))
+        invalid("v2", PersistenceCode::semanticValidationFailed);
+    root["loopRange"] = nullptr;
+    root["schemaVersion"] = 3u;
+}
+constexpr std::array<Migration,2> migrations{migrateV1ToV2,migrateV2ToV3};
 void migrate(J& root) {
     if (!root.contains("schemaVersion") || !root.at("schemaVersion").is_number_unsigned()) invalid("schemaVersion");
     auto version=root.at("schemaVersion").get<std::uint64_t>();
@@ -254,13 +261,16 @@ ProjectDocument decode(const J& root) {
     else if (version == 2)
         fields(root,{"format","schemaVersion","projectSettings","nextIds","sources","tracks","routing","buses","sends","master","musicalTime"},
                {"writerAppVersion"});
+    else if (version == 3)
+        fields(root,{"format","schemaVersion","projectSettings","nextIds","sources","tracks","routing","buses","sends","master","musicalTime","loopRange"},
+               {"writerAppVersion"});
     else invalid("schemaVersion",PersistenceCode::unsupportedSchema);
     if (string(root.at("format"))!="VitaDAWProject") invalid("format");
     ProjectDocument doc;
     doc.schemaVersion=version;
     if (root.contains("writerAppVersion")) doc.writerAppVersion=string(root.at("writerAppVersion"));
     auto& data=doc.model;
-    if (version == 2) {
+    if (version >= 2) {
         const auto& m=root.at("musicalTime");
         fields(m,{"ppq","nextTempoEventId","nextTimeSignatureEventId","tempoEvents","signatureEvents"});
         if (!m.at("ppq").is_number_integer() || m.at("ppq") != musical::ppq) invalid("musicalTime/ppq");
@@ -287,6 +297,17 @@ ProjectDocument decode(const J& root) {
             map.signatures.events.push_back({{integer(e.at("id"))},{static_cast<std::int64_t>(bar)},
                 {e.at("numerator").get<unsigned>(),e.at("denominator").get<unsigned>()}});
         }
+    }
+    if (version >= 3 && !root.at("loopRange").is_null()) {
+        const auto& loop = root.at("loopRange");
+        fields(loop,{"startTick","endTick"});
+        const auto start = integer(loop.at("startTick"), true);
+        const auto end = integer(loop.at("endTick"), true);
+        if (start > musical::maximumCoordinate || end > musical::maximumCoordinate ||
+            end <= start) invalid("loopRange");
+        data.loopRange = musical::MusicalLoopRange{
+            {static_cast<std::int64_t>(start)},
+            {static_cast<std::int64_t>(end)}};
     }
     const auto& settings=root.at("projectSettings"); fields(settings,{"name","sampleRateHz"});
     data.settings={string(settings.at("name")),timeline::SampleRate{number(settings.at("sampleRateHz"))}};
@@ -366,6 +387,10 @@ J encode(ProjectDocument doc,const std::filesystem::path& path) {
     root["musicalTime"]={{"ppq",map.resolution},{"nextTempoEventId",std::to_string(map.tempo.nextId.value)},
         {"nextTimeSignatureEventId",std::to_string(map.signatures.nextId.value)},
         {"tempoEvents",std::move(tempos)},{"signatureEvents",std::move(signatures)}};
+    root["loopRange"] = d.loopRange
+        ? J{{"startTick",std::to_string(d.loopRange->start.value)},
+            {"endTick",std::to_string(d.loopRange->end.value)}}
+        : J(nullptr);
     for(auto key:{"sources","tracks","buses","sends"}) root[key]=J::array();
     std::sort(d.sources.begin(),d.sources.end(),[](const auto& a,const auto& b){return a.id<b.id;});
     for(const auto& s:d.sources) root["sources"].push_back({{"id",std::to_string(s.id.value)},
@@ -419,7 +444,7 @@ SerializationResult serializeProject(const project::ProjectState& project,const 
         if(!path.is_absolute()) return {{PersistenceCode::schemaValidationFailed,PersistencePhase::validate},{}};
         auto data=project.documentData();
         if(!project::ProjectState::fromDocumentData(data)) return {{PersistenceCode::semanticValidationFailed,PersistencePhase::validate},{}};
-        DocumentTree tree{encode({ProjectDocument::currentSchemaVersion,"0.5.2",std::move(data)},path)};
+        DocumentTree tree{encode({ProjectDocument::currentSchemaVersion,"0.5.3",std::move(data)},path)};
         auto& root=tree.value;
         // Explicit schema validation on Save also catches unsupported media fields.
         static_cast<void>(decode(root));
