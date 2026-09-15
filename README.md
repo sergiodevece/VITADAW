@@ -1,4 +1,4 @@
-# VitaDAW 0.5.5 — Waveform Foundation
+# VitaDAW 0.5.6 — Editing & Transport Hardening
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -170,6 +170,22 @@ el audio sigue preparado y se muestra un placeholder/diagnóstico. Load crea una
 caché candidata aislada y la intercambia junto al proyecto; schemaVersion sigue
 siendo 3 y el waveform no se persiste. Detalles y pruebas:
 [`docs/validation-0.5.5.md`](docs/validation-0.5.5.md).
+
+VitaDAW 0.5.6 no añade funciones de producto. Endurece transporte, loops,
+edición, Undo/Redo y persistencia mediante un harness hardware-free que utiliza
+el `RealtimeAudioEngine`, el compilador de planes y `processBlock` reales. La
+matriz existente permanece intacta: Seek durante Playing se rechaza; durante
+Paused se admite; el primer Stop conserva posición y el segundo vuelve a cero;
+las ediciones de clip en la misma pista y Undo/Redo pueden ejecutarse en Paused,
+pero Move entre pistas, Add/Delete Track y Save/Load requieren Stopped.
+
+La nueva cobertura combina comandos pendientes, FIFO lleno, cancelación por
+lifecycle, loop mínimo válido, loops a través de tempo/métrica, fronteras de
+bloque, splits extremos, cadenas largas de historial, round-trip documental y
+64 pistas/1000 clips positivos con pistas vacías y huecos. El hardening detectó
+y corrigió una discrepancia de tolerancia entre `ProjectState` y la preparación
+del plan para duraciones 44,1↔48 kHz; no se modificó el callback ni el render.
+Detalles: [`docs/validation-0.5.6.md`](docs/validation-0.5.6.md).
 
 ## Tecnología propuesta
 
@@ -558,6 +574,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.5 — Waveform Foundation:** caché multirresolución por SourceId, picos
   min/max mono/estéreo, mapping project/source, render visible y reconstrucción
   transaccional al cargar proyectos.
+- **0.5.6 — Editing & Transport Hardening:** matriz de transporte y edición,
+  loops y límites de bloque, historial/persistencia bajo secuencias largas,
+  escala combinada y validación coherente del round-trip 44,1↔48 kHz.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -584,4 +603,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.2.md`](docs/validation-0.5.2.md) y
 [`docs/validation-0.5.3.md`](docs/validation-0.5.3.md) y
 [`docs/validation-0.5.4.md`](docs/validation-0.5.4.md) y
-[`docs/validation-0.5.5.md`](docs/validation-0.5.5.md).
+[`docs/validation-0.5.5.md`](docs/validation-0.5.5.md) y
+[`docs/validation-0.5.6.md`](docs/validation-0.5.6.md).

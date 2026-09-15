@@ -1583,7 +1583,42 @@ la carga WAV/plan ya es una operación síncrona fuera de RT. Una cola de trabaj
 cancelable será necesaria antes de admitir streaming o medios suficientemente
 grandes como para bloquear perceptiblemente la UI, pero no se introduce aún.
 
-## Evolución hasta 0.5.5
+## Editing & Transport Hardening 0.5.6
+
+Este incremento congela, en lugar de ampliar, la máquina de estados existente.
+El hilo de aplicación puede reflejar optimistamente un comando aceptado, pero
+solo adopta progreso RT cuando el snapshot ha resuelto al menos la última
+secuencia pendiente. La cola conserva FIFO y un cierre de lifecycle resuelve
+explícitamente las solicitudes aceptadas. Seek en Playing continúa rechazado;
+Pause no avanza ni produce audio; Stop conserva posición desde Playing/Paused y
+rebobina únicamente cuando ya estaba Stopped.
+
+La política estructural también queda fijada: Playing rechaza edición e
+historial; Paused permite operaciones de clip dentro de la misma pista y
+Undo/Redo mediante commit quiescente con checkpoint, pero no Move entre pistas,
+Add/Delete Track ni persistencia. Stopped permite todas las operaciones ya
+existentes. Ningún rechazo puede cambiar ProjectState, historial, plan o
+posición.
+
+Los loops mantienen los requisitos previos de al menos 1024 ticks, 10 ms, un
+project frame y un device frame. Se tratan como `[start,end)`, incluso al cruzar
+cambios de tempo o métrica, y el render debe ser independiente del particionado
+del callback. Los clips conservan duración estrictamente positiva y límites
+semiabiertos.
+
+`ProjectState` ya toleraba el error numérico acotado de convertir una duración
+fuente a `double` de proyecto y volver a frames fuente. El compilador del plan
+aplica ahora exactamente la misma tolerancia relativa (64 epsilon de `double`):
+esto acepta únicamente el residuo del round-trip, mientras un exceso real sigue
+rechazándose. El cambio vive fuera de RT y no modifica render, interpolación ni
+límites de acceso.
+
+La suite de hardening usa PCM sintético propiedad de un adaptador hardware-free,
+pero compila `PreparedProcessingPlan` y ejecuta colas, reloj, mezcla, snapshots y
+`RealtimeAudioEngine::processBlock` de producción. Los dobles se limitan a
+decodificación y filesystem deterministas.
+
+## Evolución hasta 0.5.6
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1653,6 +1688,10 @@ grandes como para bloquear perceptiblemente la UI, pero no se introduce aún.
 28. **Completado en 0.5.5:** caché derivada multirresolución por SourceId,
     preparación desde PCM existente, mapping project/source, render visible y
     reconstrucción aislada/transaccional tras Load.
+
+29. **Completado en 0.5.6:** hardening combinado de transporte, loop, edición,
+    historial, persistencia, fronteras de bloque y escala sobre processBlock
+    real, sin añadir funciones ni cambiar la matriz de comportamiento.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

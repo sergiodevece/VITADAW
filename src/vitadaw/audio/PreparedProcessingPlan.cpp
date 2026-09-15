@@ -677,12 +677,21 @@ static ProcessingPlanPreparationResult prepareProcessingPlanImpl(
                         static_cast<long double>(sourceFound->sampleRate.hertz()) /
                         static_cast<long double>(
                             specification.projectSampleRate.hertz());
+                const auto sourceLimit = static_cast<long double>(
+                    sourceFound->frameCount.value);
+                // ProjectState admits the tiny round-trip error introduced when
+                // an exact source length is represented as a double project
+                // duration. Plan preparation must use the same bound or a valid
+                // 44.1/48 kHz clip can be rejected after an otherwise no-op edit.
+                const auto roundTripTolerance =
+                    std::numeric_limits<double>::epsilon() * 64.0L *
+                    std::max(1.0L,
+                             std::max(std::abs(sourceEnd), sourceLimit));
                 if (!std::isfinite(projectEnd) ||
                     projectEnd > static_cast<double>(
                                      std::numeric_limits<std::int64_t>::max()) ||
                     !std::isfinite(sourceEnd) ||
-                    sourceEnd > static_cast<long double>(
-                                    sourceFound->frameCount.value)) {
+                    sourceEnd > sourceLimit + roundTripTolerance) {
                     return {nullptr, "Prepared clip exceeds project/source bounds"};
                 }
                 if (!plan.clips.empty() &&
