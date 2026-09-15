@@ -41,6 +41,16 @@ int main() {
           "natural end should transition transport to stopped");
     check(state.position.value == state.duration.value,
           "natural end should remain at the end position");
+    state.seek({24000});
+    state.markPlaying();
+    state.markPaused();
+    state.stop();
+    check(state.playback == transport::PlaybackState::stopped &&
+              state.position.value == 24000,
+          "first Stop after Pause should preserve position");
+    state.stop();
+    check(state.position.value == 0,
+          "Stop while already Stopped should rewind by state, not timing");
     state.stopAndRewind();
     check(state.playback == transport::PlaybackState::stopped && state.position.value == 0,
           "explicit Stop should rewind to zero");

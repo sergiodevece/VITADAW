@@ -8,7 +8,7 @@ inline constexpr std::size_t maximumDocumentMemory = 128 * 1024 * 1024;
 struct ProjectDocument {
     static constexpr unsigned currentSchemaVersion = 1;
     unsigned schemaVersion{currentSchemaVersion};
-    std::string writerAppVersion{"0.5.0"};
+    std::string writerAppVersion{"0.5.1"};
     project::ProjectState::DocumentData model;
 };
 struct DocumentResult {

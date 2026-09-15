@@ -2,12 +2,33 @@
 #include "vitadaw/platform/juce/TimelineComponent.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <vector>
 
 namespace vitadaw::platform::juce_adapter {
+
+namespace {
+const char* playbackName(transport::PlaybackState state) noexcept {
+    if (state == transport::PlaybackState::playing) return "Playing";
+    if (state == transport::PlaybackState::paused) return "Paused";
+    return "Stopped";
+}
+
+juce::String positionText(timeline::Seconds position) {
+    const auto totalMilliseconds = static_cast<std::int64_t>(
+        std::max(0.0, std::round(position.value * 1000.0)));
+    const auto minutes = totalMilliseconds / 60000;
+    const auto seconds = (totalMilliseconds / 1000) % 60;
+    const auto milliseconds = totalMilliseconds % 1000;
+    return juce::String(minutes).paddedLeft('0', 2) + ":" +
+           juce::String(seconds).paddedLeft('0', 2) + "." +
+           juce::String(milliseconds).paddedLeft('0', 3);
+}
+} // namespace
 
 class AudioStatusComponent final : public juce::Component {
 public:
@@ -39,13 +60,14 @@ public:
         }
 
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
+        pauseButton_.onClick = [this] { dispatch(commands::Pause{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
         undoButton_.onClick = [this] { dispatch(commands::Undo{}); };
         redoButton_.onClick = [this] { dispatch(commands::Redo{}); };
         saveButton_.onClick = [this] { dispatch(commands::SaveProject{}); };
         saveAsButton_.onClick = [this] { chooseProject(true); };
         loadProjectButton_.onClick = [this] { chooseProject(false); };
-        for (auto* button : {&playButton_, &stopButton_, &undoButton_, &redoButton_,
+        for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_})
             addAndMakeVisible(*button);
         updateHistoryControls();
@@ -59,9 +81,10 @@ public:
                                                                 projectSampleRate);
         juce::String text;
         text << "Transport: "
-             << (state.playback == transport::PlaybackState::playing ? "Playing" : "Stopped")
-             << " | " << juce::String(position.value, 3) << " / "
+             << playbackName(state.playback)
+             << " | " << positionText(position) << " / "
              << juce::String(duration.value, 3) << " s"
+             << " | Frames: " << juce::String(state.position.value)
              << " | Project: " << juce::String(projectSampleRate.hertz(), 0) << " Hz";
         transportLabel_.setText(text, juce::dontSendNotification);
         timeline_.setTransportState(state);
@@ -108,7 +131,7 @@ public:
         meterLabel_.setBounds(bounds.removeFromTop(22));
 
         auto commandRow = bounds.removeFromTop(32);
-        for (auto* button : {&playButton_, &stopButton_, &undoButton_, &redoButton_,
+        for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_}) {
             const auto width = button == &loadProjectButton_ ? 126 :
                                button == &saveAsButton_ ? 88 : 76;
@@ -221,7 +244,7 @@ private:
     juce::Label statusLabel_, transportLabel_, meterLabel_, resultLabel_;
     TimelineComponent timeline_;
     std::vector<std::unique_ptr<juce::TextButton>> loadButtons_;
-    juce::TextButton playButton_{"Play"}, stopButton_{"Stop"};
+    juce::TextButton playButton_{"Play"}, pauseButton_{"Pause"}, stopButton_{"Stop"};
     juce::TextButton undoButton_{"Undo"}, redoButton_{"Redo"};
     juce::TextButton saveButton_{"Save"}, saveAsButton_{"Save As..."};
     juce::TextButton loadProjectButton_{"Load Project..."};

@@ -452,6 +452,9 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                             "Clip update could not be prepared"};
                 }
             } else if constexpr (std::is_same_v<T, commands::Play>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::accepted, "Already playing"};
+                }
                 const auto request = audioEngine_.tryRequestPlay();
                 if (!request.accepted) {
                     return {commands::CommandStatus::rejected,
@@ -460,14 +463,64 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                 pendingAudioCommandSequence_ = request.sequence;
                 transport_.markPlaying();
                 return {commands::CommandStatus::accepted, "Playing"};
+            } else if constexpr (std::is_same_v<T, commands::Pause>) {
+                if (transport_.playback != transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::accepted,
+                            transport_.playback == transport::PlaybackState::paused
+                                ? "Already paused" : "Already stopped"};
+                }
+                const auto request = audioEngine_.tryRequestPause();
+                if (!request.accepted) {
+                    return {commands::CommandStatus::rejected,
+                            "Transport is unavailable",
+                            commands::CommandError::transportUnavailable};
+                }
+                pendingAudioCommandSequence_ = request.sequence;
+                transport_.markPaused();
+                return {commands::CommandStatus::accepted, "Paused"};
             } else if constexpr (std::is_same_v<T, commands::Stop>) {
                 const auto request = audioEngine_.tryRequestStop();
                 if (!request.accepted) {
                     return {commands::CommandStatus::rejected, "Audio command queue is full"};
                 }
                 pendingAudioCommandSequence_ = request.sequence;
-                transport_.stopAndRewind();
-                return {commands::CommandStatus::accepted, "Stopped at start"};
+                const auto rewinding =
+                    transport_.playback == transport::PlaybackState::stopped;
+                transport_.stop();
+                return {commands::CommandStatus::accepted,
+                        rewinding ? "Stopped at start" : "Stopped"};
+            } else if constexpr (
+                std::is_same_v<T, commands::SeekToProjectFrame> ||
+                std::is_same_v<T, commands::GoToStart> ||
+                std::is_same_v<T, commands::GoToEnd>) {
+                if (transport_.playback == transport::PlaybackState::playing) {
+                    return {commands::CommandStatus::rejected,
+                            "Seek while Playing is not supported in 0.5.1",
+                            commands::CommandError::seekRejectedWhilePlaying};
+                }
+                const auto target = [&] {
+                    if constexpr (std::is_same_v<T, commands::GoToStart>)
+                        return timeline::ProjectFramePosition{0};
+                    else if constexpr (std::is_same_v<T, commands::GoToEnd>)
+                        return timeline::ProjectFramePosition{
+                            session_.project.projectContentDuration().value};
+                    else return value.position;
+                }();
+                const auto duration = session_.project.projectContentDuration();
+                if (target.value < 0 || target.value > duration.value) {
+                    return {commands::CommandStatus::rejected,
+                            "Seek position is outside project content",
+                            commands::CommandError::invalidPosition};
+                }
+                const auto request = audioEngine_.tryRequestSeek(target);
+                if (!request.accepted) {
+                    return {commands::CommandStatus::rejected,
+                            "Transport is unavailable or its queue is full",
+                            commands::CommandError::transportUnavailable};
+                }
+                pendingAudioCommandSequence_ = request.sequence;
+                transport_.seek(target);
+                return {commands::CommandStatus::accepted, "Playhead moved"};
             } else if constexpr (
                 std::is_same_v<T, commands::SetTrackGain> ||
                 std::is_same_v<T, commands::SetTrackPan> ||
@@ -937,7 +990,11 @@ void DawApplication::synchroniseTransport() noexcept {
         return;
     }
 
-    transport_.synchronise(snapshot.playing, snapshot.position, snapshot.duration);
+    const auto playback = snapshot.playback == transport::PlaybackState::stopped &&
+                                  snapshot.playing
+                              ? transport::PlaybackState::playing
+                              : snapshot.playback;
+    transport_.synchronise(playback, snapshot.position, snapshot.duration);
 }
 
 const project::ProjectState& DawApplication::project() const noexcept {

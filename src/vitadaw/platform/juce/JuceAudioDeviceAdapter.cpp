@@ -458,8 +458,15 @@ bool JuceAudioDeviceAdapter::commitPreparedProcessingPlan(
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestPlay() noexcept {
     return realtimeEngine_.tryRequestPlay();
 }
+audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestPause() noexcept {
+    return realtimeEngine_.tryRequestPause();
+}
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestStop() noexcept {
     return realtimeEngine_.tryRequestStop();
+}
+audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestSeek(
+    timeline::ProjectFramePosition position) noexcept {
+    return realtimeEngine_.tryRequestSeek(position);
 }
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
     return realtimeEngine_.transportSnapshot();

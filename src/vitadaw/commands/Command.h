@@ -64,7 +64,11 @@ struct TrimClipRight {
 struct DeleteClip { clips::ClipId clip; };
 
 struct Play {};
+struct Pause {};
 struct Stop {};
+struct SeekToProjectFrame { timeline::ProjectFramePosition position; };
+struct GoToStart {};
+struct GoToEnd {};
 struct Undo {};
 struct Redo {};
 struct SaveProject {};
@@ -130,7 +134,8 @@ using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile,
                              ImportAudioToTrack, AddClip, RemoveClip,
                              RemoveSource, MoveClip, DuplicateClip, SplitClip,
                              TrimClipLeft, TrimClipRight, DeleteClip,
-                             Play, Stop, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
+                             Play, Pause, Stop, SeekToProjectFrame, GoToStart,
+                             GoToEnd, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
                              SetTrackGain, SetTrackPan, SetTrackMute,
                              SetTrackSolo, SetMasterGain,
                              SetBusGain, SetBusPan, SetBusMute, SetBusSolo,
@@ -158,6 +163,9 @@ enum class CommandError {
     zeroLengthClip,
     sourceBoundsExceeded,
     transportMustBeStopped,
+    invalidState,
+    transportUnavailable,
+    seekRejectedWhilePlaying,
     preparationFailed,
     capacityExceeded,
 };

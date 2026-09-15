@@ -73,7 +73,10 @@ public:
         float desiredValue,
         float preparedValue) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestPlay() noexcept override;
+    [[nodiscard]] audio::AudioControlRequestResult tryRequestPause() noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult tryRequestStop() noexcept override;
+    [[nodiscard]] audio::AudioControlRequestResult tryRequestSeek(
+        timeline::ProjectFramePosition) noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
 

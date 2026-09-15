@@ -137,6 +137,7 @@ public:
         }
         liveSpecification = std::move(candidate->specification);
         snapshot.playing = false;
+        snapshot.playback = vitadaw::transport::PlaybackState::stopped;
         snapshot.position = {0};
         snapshot.duration = {};
         for (const auto& track : liveSpecification.tracks) {
@@ -217,6 +218,7 @@ public:
             snapshot.position = {0};
         }
         snapshot.playing = true;
+        snapshot.playback = vitadaw::transport::PlaybackState::playing;
         snapshot.lastProcessedCommandSequence = sequence;
         return {true, sequence};
     }
@@ -227,8 +229,28 @@ public:
             return {};
         }
         const auto sequence = nextSequence++;
+        const auto wasStopped = snapshot.playback ==
+                                vitadaw::transport::PlaybackState::stopped;
         snapshot.playing = false;
-        snapshot.position = {0};
+        snapshot.playback = vitadaw::transport::PlaybackState::stopped;
+        if (wasStopped) snapshot.position = {0};
+        snapshot.lastProcessedCommandSequence = sequence;
+        return {true, sequence};
+    }
+
+    vitadaw::audio::AudioControlRequestResult tryRequestPause() noexcept override {
+        const auto sequence = nextSequence++;
+        snapshot.playing = false;
+        snapshot.playback = vitadaw::transport::PlaybackState::paused;
+        snapshot.lastProcessedCommandSequence = sequence;
+        return {true, sequence};
+    }
+
+    vitadaw::audio::AudioControlRequestResult tryRequestSeek(
+        vitadaw::timeline::ProjectFramePosition position) noexcept override {
+        if (position.value < 0 || position.value > snapshot.duration.value) return {};
+        const auto sequence = nextSequence++;
+        snapshot.position = position;
         snapshot.lastProcessedCommandSequence = sequence;
         return {true, sequence};
     }
@@ -244,6 +266,8 @@ public:
     void publishProgress(std::int64_t frame, bool playing) noexcept {
         snapshot.position = {frame};
         snapshot.playing = playing;
+        snapshot.playback = playing ? vitadaw::transport::PlaybackState::playing
+                                    : vitadaw::transport::PlaybackState::stopped;
     }
 
     void close() noexcept { live.clear(); }
@@ -669,8 +693,43 @@ int main() {
 
     check(dispatcher.dispatch(commands::Stop{}).status ==
               commands::CommandStatus::accepted &&
+              app.transport().position.value == 96000,
+          "first Stop should preserve the master clock");
+    const auto navigationToken = app.history().currentStateToken();
+    const auto navigationCursor = app.history().cursor();
+    check(dispatcher.dispatch(commands::SeekToProjectFrame{{48000}}).status ==
+              commands::CommandStatus::accepted &&
+              app.transport().position.value == 48000,
+          "Seek while Stopped should update the application mirror");
+    check(dispatcher.dispatch(commands::Play{}).status ==
+              commands::CommandStatus::accepted &&
+              dispatcher.dispatch(commands::SeekToProjectFrame{{24000}}).error ==
+                  commands::CommandError::seekRejectedWhilePlaying,
+          "Seek while Playing must be rejected explicitly");
+    check(dispatcher.dispatch(commands::Pause{}).status ==
+              commands::CommandStatus::accepted &&
+              app.transport().playback == transport::PlaybackState::paused &&
+              dispatcher.dispatch(commands::SeekToProjectFrame{{24000}}).status ==
+                  commands::CommandStatus::accepted &&
+              app.transport().position.value == 24000,
+          "Pause and Seek should preserve the Paused state");
+    check(dispatcher.dispatch(commands::Stop{}).status ==
+              commands::CommandStatus::accepted &&
+              app.transport().position.value == 24000 &&
+              dispatcher.dispatch(commands::Stop{}).status ==
+                  commands::CommandStatus::accepted &&
               app.transport().position.value == 0,
-          "Stop should rewind the master clock");
+          "first Stop preserves position and second Stop rewinds");
+    check(dispatcher.dispatch(commands::GoToEnd{}).status ==
+              commands::CommandStatus::accepted &&
+              app.transport().position.value == app.transport().duration.value &&
+              dispatcher.dispatch(commands::GoToStart{}).status ==
+                  commands::CommandStatus::accepted &&
+              app.transport().position.value == 0,
+          "GoToEnd and GoToStart must use project-frame Seek");
+    check(app.history().currentStateToken() == navigationToken &&
+              app.history().cursor() == navigationCursor,
+          "transport navigation must not alter Undo or dirty state");
     const auto sharedSource = app.project().findTrack(first)->clips.front().source;
     const auto clipsBeforeFailure = app.project().findTrack(first)->clips.size();
     audio.rejectNextStructuralPreparation = true;

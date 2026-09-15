@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/timeline/Time.h"
+#include "vitadaw/transport/PlaybackState.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,18 +25,38 @@ public:
             position_ = {0.0};
             compensation_ = 0.0;
         }
-        playing_ = true;
+        playback_ = transport::PlaybackState::playing;
+        return true;
+    }
+
+    void pause() noexcept {
+        if (playback_ == transport::PlaybackState::playing)
+            playback_ = transport::PlaybackState::paused;
+    }
+
+    void stop() noexcept {
+        if (playback_ == transport::PlaybackState::stopped) {
+            position_ = {0.0};
+            compensation_ = 0.0;
+        }
+        playback_ = transport::PlaybackState::stopped;
+    }
+
+    [[nodiscard]] bool seek(timeline::ProjectFramePosition target) noexcept {
+        if (target.value < 0 || target.value > duration_.value || isPlaying()) return false;
+        position_ = {static_cast<double>(target.value)};
+        compensation_ = 0.0;
         return true;
     }
 
     void stopAndRewind() noexcept {
-        playing_ = false;
+        playback_ = transport::PlaybackState::stopped;
         position_ = {0.0};
         compensation_ = 0.0;
     }
 
     void advance(timeline::ProjectFrameDuration frames) noexcept {
-        if (!playing_) {
+        if (!isPlaying()) {
             return;
         }
 
@@ -49,11 +70,14 @@ public:
         if (position_.value >= end - tolerance) {
             position_.value = end;
             compensation_ = 0.0;
-            playing_ = false;
+            playback_ = transport::PlaybackState::stopped;
         }
     }
 
-    [[nodiscard]] bool isPlaying() const noexcept { return playing_; }
+    [[nodiscard]] bool isPlaying() const noexcept {
+        return playback_ == transport::PlaybackState::playing;
+    }
+    [[nodiscard]] transport::PlaybackState playback() const noexcept { return playback_; }
     [[nodiscard]] timeline::PreciseProjectFramePosition position() const noexcept {
         return position_;
     }
@@ -69,7 +93,7 @@ private:
     timeline::PreciseProjectFramePosition position_;
     timeline::ProjectFrameCount duration_;
     double compensation_{};
-    bool playing_{};
+    transport::PlaybackState playback_{transport::PlaybackState::stopped};
 };
 
 } // namespace vitadaw::audio

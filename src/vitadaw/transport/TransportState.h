@@ -1,13 +1,11 @@
 #pragma once
 
 #include "vitadaw/timeline/Timeline.h"
+#include "vitadaw/transport/PlaybackState.h"
+
+#include <algorithm>
 
 namespace vitadaw::transport {
-
-enum class PlaybackState {
-    stopped,
-    playing,
-};
 
 // Application-thread state. The audio thread will expose a separate atomic view.
 struct TransportState {
@@ -18,6 +16,8 @@ struct TransportState {
     void markPlaying() noexcept {
         playback = PlaybackState::playing;
     }
+
+    void markPaused() noexcept { playback = PlaybackState::paused; }
 
     void setDuration(timeline::ProjectFrameCount newDuration) noexcept {
         duration = newDuration;
@@ -30,7 +30,16 @@ struct TransportState {
         position = {0};
     }
 
-    void synchronise(bool isPlaying,
+    void stop() noexcept {
+        if (playback == PlaybackState::stopped) position = {0};
+        playback = PlaybackState::stopped;
+    }
+
+    void seek(timeline::ProjectFramePosition target) noexcept {
+        position = {std::clamp(target.value, std::int64_t{0}, duration.value)};
+    }
+
+    void synchronise(PlaybackState state,
                      timeline::ProjectFramePosition newPosition,
                      timeline::ProjectFrameCount newDuration) noexcept {
         duration = newDuration;
@@ -39,7 +48,14 @@ struct TransportState {
                        : (newPosition.value >= newDuration.value
                               ? timeline::ProjectFramePosition{newDuration.value}
                               : newPosition);
-        playback = isPlaying ? PlaybackState::playing : PlaybackState::stopped;
+        playback = state;
+    }
+
+    void synchronise(bool isPlaying,
+                     timeline::ProjectFramePosition newPosition,
+                     timeline::ProjectFrameCount newDuration) noexcept {
+        synchronise(isPlaying ? PlaybackState::playing : PlaybackState::stopped,
+                    newPosition, newDuration);
     }
 };
 

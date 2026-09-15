@@ -12,7 +12,7 @@ TimelineComponent::TimelineComponent(commands::ICommandDispatcher& dispatcher,
     : dispatcher_(dispatcher), application_(application),
       snapshot_(application.timelineSnapshot()),
       transform_(snapshot_.projectSampleRate) {
-    transport_.synchronise(snapshot_.playback == transport::PlaybackState::playing,
+    transport_.synchronise(snapshot_.playback,
                            snapshot_.transportPosition,
                            snapshot_.contentDuration);
     setWantsKeyboardFocus(true);
@@ -46,7 +46,7 @@ void TimelineComponent::refreshModel(bool resetViewport) {
 
 void TimelineComponent::setTransportState(const transport::TransportState& state) {
     transport_ = state;
-    const auto editable = state.playback == transport::PlaybackState::stopped;
+    const auto editable = state.playback != transport::PlaybackState::playing;
     split_.setEnabled(editable);
     duplicate_.setEnabled(editable);
     delete_.setEnabled(editable);
@@ -229,7 +229,7 @@ void TimelineComponent::setZoom(double zoom, double anchorX) {
 }
 
 void TimelineComponent::dispatch(std::optional<commands::Command> command) {
-    if (!command || transport_.playback == transport::PlaybackState::playing) {
+    if (!command) {
         repaint();
         return;
     }
@@ -243,6 +243,14 @@ void TimelineComponent::dispatch(std::optional<commands::Command> command) {
 void TimelineComponent::mouseDown(const juce::MouseEvent& event) {
     grabKeyboardFocus();
     if (transport_.playback == transport::PlaybackState::playing) return;
+    if (event.position.y >= toolbarHeight &&
+        event.position.y < toolbarHeight + rulerHeight &&
+        event.position.x >= headerWidth &&
+        event.position.x <= viewportBounds().getRight()) {
+        const auto target = transform_.xToProjectFrame(event.position.x - headerWidth);
+        dispatch(commands::SeekToProjectFrame{target});
+        return;
+    }
     const auto hit = timelineHitTest(event.position);
     if (!hit.clip) {
         interaction_.select({});
@@ -275,6 +283,18 @@ void TimelineComponent::mouseWheelMove(const juce::MouseEvent& event,
     }
 }
 bool TimelineComponent::keyPressed(const juce::KeyPress& key) {
+    if (key.getKeyCode() == juce::KeyPress::spaceKey) {
+        dispatch(transport_.playback == transport::PlaybackState::playing
+                     ? std::optional<commands::Command>{commands::Pause{}}
+                     : std::optional<commands::Command>{commands::Play{}});
+        return true;
+    }
+    if (key.getKeyCode() == juce::KeyPress::homeKey) {
+        dispatch(commands::GoToStart{}); return true;
+    }
+    if (key.getKeyCode() == juce::KeyPress::endKey) {
+        dispatch(commands::GoToEnd{}); return true;
+    }
     if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'Z') {
         dispatch(key.getModifiers().isShiftDown() ? std::optional<commands::Command>{commands::Redo{}}
                                                   : std::optional<commands::Command>{commands::Undo{}});

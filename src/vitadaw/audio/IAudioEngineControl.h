@@ -141,7 +141,10 @@ public:
         processors::ProcessorInstanceId,
         processors::ParameterId, float, float) noexcept { return false; }
     [[nodiscard]] virtual AudioControlRequestResult tryRequestPlay() noexcept = 0;
+    [[nodiscard]] virtual AudioControlRequestResult tryRequestPause() noexcept { return {}; }
     [[nodiscard]] virtual AudioControlRequestResult tryRequestStop() noexcept = 0;
+    [[nodiscard]] virtual AudioControlRequestResult tryRequestSeek(
+        timeline::ProjectFramePosition) noexcept { return {}; }
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;
     [[nodiscard]] virtual mixer::MeterSnapshot meterSnapshot() const noexcept = 0;
 };

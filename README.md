@@ -1,4 +1,4 @@
-# VitaDAW 0.5.0 — Timeline UI Foundation
+# VitaDAW 0.5.1 — Seek & Transport Navigation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -83,6 +83,13 @@ detener productores de eventos, retirar callbacks, aquietar el dispositivo,
 destruir UI/dispatcher/aplicación y destruir finalmente el adaptador. Los
 diagnósticos distinguen arranque completo, fallo de dispositivo, fallo de
 startup y cierre parcial, siempre fuera del callback RT.
+
+VitaDAW 0.5.1 completa el transporte inicial con `Stopped`, `Playing` y
+`Paused`, Seek por project frame, primer Stop conservando posición y segundo
+Stop volviendo a cero. Play continúa desde la posición actual; desde el final
+natural reinicia a cero. La regla permite click-to-seek y la UI muestra
+`mm:ss.xxx` y el frame lógico. Space alterna Play/Pause y Home/End navegan al
+inicio/final. Seek durante Playing se rechaza deliberadamente en esta versión.
 
 El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fija
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
@@ -454,6 +461,8 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.0 — Timeline UI Foundation:** read model portable, tracks/clips dibujados,
   selección por `ClipId`, gestos Move/Trim, acciones Split/Duplicate/Delete,
   playhead, zoom/scroll y reconstrucción tras Undo/Redo/Load.
+- **0.5.1 — Seek & Transport Navigation:** estado Paused, Seek RT-safe,
+  doble Stop semántico, navegación por ruler/teclado y Split manual real.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -475,4 +484,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.4.1.md`](docs/validation-0.4.1.md) y
 [`docs/validation-0.4.2.md`](docs/validation-0.4.2.md) y
 [`docs/validation-0.4.3.md`](docs/validation-0.4.3.md) y
-[`docs/validation-0.5.0.md`](docs/validation-0.5.0.md).
+[`docs/validation-0.5.0.md`](docs/validation-0.5.0.md) y
+[`docs/validation-0.5.1.md`](docs/validation-0.5.1.md).

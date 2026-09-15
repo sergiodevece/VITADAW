@@ -1227,7 +1227,38 @@ JUCE y consulta `mainWindow_`; se retira antes de que la ventana pueda morir.
 componente entregado mediante `setContentOwned()` y lo sustituye de forma
 síncrona. No se añade logging al hilo de audio.
 
-## Evolución hasta 0.5.0
+## Seek & Transport Navigation 0.5.1
+
+`ProjectFramePosition` sigue siendo la única autoridad temporal. El reloj RT
+tiene tres estados: Stopped, Playing y Paused. Play continúa desde la posición
+actual; Pause conserva posición y estado interno de processors; el primer Stop
+desde Playing/Paused conserva posición y reinicia processors/dry delays, y Stop
+estando ya Stopped vuelve a cero. El final natural queda Stopped en el límite
+exclusivo y Play desde ese límite reinicia a cero.
+
+Pause y Seek viajan por el mismo ring SPSC y `CommandLifecycleGate` que Play y
+Stop. El CAS final de aceptación sigue siendo el punto de linearización; RT
+consume el comando antes del render del siguiente callback/subbloque. Seek
+Stopped/Paused acepta `[0, contentEnd]`, rechaza valores negativos, posteriores
+al final, y `DawApplication` rechaza cualquier Seek durante Playing. El motor
+no consulta un snapshot atrasado al encolar: así un `Pause → Seek` aceptado por
+el productor conserva su orden FIFO aunque RT aún no haya consumido Pause. Si
+un Seek interno alcanzase al consumidor todavía Playing, el reloj lo rechaza.
+Su latencia máxima normal es un callback de dispositivo. Seek resetea processors
+y bypass delays y marca
+`discontinuity=true`; Pause no procesa audio, no avanza el reloj y no resetea.
+
+La regla convierte pixel a frame mediante `CoordinateTransform` y despacha
+`SeekToProjectFrame`; nunca escribe transporte. La posición visible y Split
+usan el mirror confirmado de `TransportState`. Segundos (`mm:ss.xxx`) y frames
+son vistas derivadas del mismo frame y sample rate lógico. Space alterna
+Play/Pause y Home/End despachan navegación. El transporte no se persiste, no
+entra en Undo, no cambia `StateToken` y Load conserva Stopped/0.
+
+No hay tempo, beats, loop ni metronome. El roadmap inmediato reserva 0.5.2 para
+Musical Time Foundation y 0.5.3 para Loop & Metronome.
+
+## Evolución hasta 0.5.1
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1283,6 +1314,9 @@ síncrona. No se añade logging al hilo de audio.
 23. **Completado en 0.5.0:** timeline JUCE sobre un snapshot portable, geometría
     derivada del reloj lógico, edición por gestos/comandos, playhead, zoom/scroll
     y refresh por revisión sin introducir estado musical duplicado.
+
+24. **Completado en 0.5.1:** Pause, Seek por frame, doble Stop, navegación
+    ruler/teclado, displays derivados y Split manual desde el playhead real.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

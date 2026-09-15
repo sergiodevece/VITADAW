@@ -157,6 +157,11 @@ AudioControlRequestResult RealtimeAudioEngine::tryRequestPlay() noexcept {
     return enqueue(CommandType::play);
 }
 
+AudioControlRequestResult RealtimeAudioEngine::tryRequestPause() noexcept {
+    if (deviceState() != DeviceProcessingState::operational) return {};
+    return enqueue(CommandType::pause);
+}
+
 AudioControlRequestResult RealtimeAudioEngine::tryRequestStop() noexcept {
     if (deviceState() != DeviceProcessingState::operational) {
         // The lifecycle transition has already stopped and published the clock.
@@ -165,6 +170,13 @@ AudioControlRequestResult RealtimeAudioEngine::tryRequestStop() noexcept {
         return {true, transportExchange_.snapshot().lastProcessedCommandSequence};
     }
     return enqueue(CommandType::stop);
+}
+
+AudioControlRequestResult RealtimeAudioEngine::tryRequestSeek(
+    timeline::ProjectFramePosition position) noexcept {
+    if (deviceState() != DeviceProcessingState::operational ||
+        position.value < 0 || position.value > projectDuration_.value) return {};
+    return enqueue(CommandType::seek, position);
 }
 
 bool RealtimeAudioEngine::tryUpdateTrackMix(
@@ -740,7 +752,8 @@ void RealtimeAudioEngine::advanceSmoothers(std::size_t frameCount) noexcept {
     }
 }
 
-AudioControlRequestResult RealtimeAudioEngine::enqueue(CommandType type) noexcept {
+AudioControlRequestResult RealtimeAudioEngine::enqueue(
+    CommandType type, timeline::ProjectFramePosition target) noexcept {
     const auto claim = lifecycleGate_.tryClaim();
     if (!claim.active) {
         return {};
@@ -758,7 +771,7 @@ AudioControlRequestResult RealtimeAudioEngine::enqueue(CommandType type) noexcep
         lifecycleGate_.reject(claim);
         return {};
     }
-    commands_[write] = {type, sequence, claim.generation};
+    commands_[write] = {type, sequence, claim.generation, target};
 
     if (!lifecycleGate_.tryAccept(claim)) {
         return {};
@@ -777,8 +790,12 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
         read = (read + 1) % commandCapacity;
         if (queued.generation == generation) {
             if (queued.type == CommandType::stop) {
-                clock_.stopAndRewind();
+                clock_.stop();
                 resetProcessors();
+            } else if (queued.type == CommandType::pause) {
+                clock_.pause();
+            } else if (queued.type == CommandType::seek) {
+                if (clock_.seek(queued.target)) resetProcessors();
             } else {
                 static_cast<void>(clock_.play());
             }
@@ -792,7 +809,8 @@ void RealtimeAudioEngine::publishTransport() noexcept {
     transportExchange_.publish({clock_.isPlaying(), clock_.publicPosition(),
                                 clock_.duration(),
                                 lastResolvedCommandSequence_.load(
-                                    std::memory_order_acquire)});
+                                    std::memory_order_acquire),
+                                clock_.playback()});
 }
 
 void RealtimeAudioEngine::resolveCommandsThrough(

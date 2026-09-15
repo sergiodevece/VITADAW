@@ -77,10 +77,73 @@ void testShortResource(std::size_t sourceFrames, double sourceRate,
     check(!ended.playing && ended.position.value == duration.value,
           "short resource should stop exactly at its logical duration");
 }
+
+void transportNavigationTests() {
+    using namespace vitadaw;
+    const std::vector<float> signal{0.0F, 0.25F, 0.5F, 0.75F, 1.0F};
+    audio::RealtimeAudioEngine engine;
+    const std::array tracks{mono({1}, signal, 5.0, 5.0)};
+    engine.configure({timeline::SampleRate{5.0}, {5}, tracks});
+    enterOperational(engine, 5.0);
+    std::vector<float> left(1), right(1);
+
+    check(engine.tryRequestSeek({2}).accepted, "Stopped Seek should enqueue");
+    render(engine, left, right, 5.0);
+    check(engine.transportSnapshot().position.value == 2 && left[0] == 0.0F,
+          "Stopped Seek should take effect before a silent callback");
+    check(engine.tryRequestPlay().accepted, "Play from seek target should enqueue");
+    render(engine, left, right, 5.0);
+    check(std::abs(left[0] - 0.35355339F) < 1.0e-6F &&
+              engine.transportSnapshot().position.value == 3,
+          "Play must random-access source audio at the master seek position");
+
+    check(engine.tryRequestPause().accepted, "Pause should enqueue");
+    check(engine.tryRequestSeek({1}).accepted,
+          "Seek queued after Pause must preserve producer order");
+    render(engine, left, right, 5.0);
+    auto paused = engine.transportSnapshot();
+    check(paused.playback == transport::PlaybackState::paused &&
+              paused.position.value == 1 && left[0] == 0.0F,
+          "Pause then Seek before one callback must pause, seek and render silence");
+    check(engine.tryRequestPlay().accepted, "Play should resume after Paused Seek");
+    render(engine, left, right, 5.0);
+    check(std::abs(left[0] - 0.17677669F) < 1.0e-6F,
+          "resume must render directly from the new random-access position");
+
+    check(engine.tryRequestStop().accepted, "first Stop should enqueue");
+    render(engine, left, right, 5.0);
+    check(engine.transportSnapshot().position.value == 2,
+          "first Stop must preserve position");
+    check(engine.tryRequestStop().accepted, "second Stop should enqueue");
+    render(engine, left, right, 5.0);
+    check(engine.transportSnapshot().position.value == 0,
+          "second Stop must rewind without a timing heuristic");
+    check(!engine.tryRequestSeek({-1}).accepted &&
+              !engine.tryRequestSeek({6}).accepted,
+          "Seek must reject negative and beyond-end positions");
+    check(engine.tryRequestSeek({5}).accepted, "contentEnd is a valid Seek boundary");
+    render(engine, left, right, 5.0);
+    check(engine.tryRequestPlay().accepted, "Play at contentEnd should enqueue");
+    render(engine, left, right, 5.0);
+    check(engine.transportSnapshot().position.value == 1,
+          "Play at natural end must restart from zero");
+
+    check(engine.tryRequestPause().accepted, "pause before repeated seeks");
+    render(engine, left, right, 5.0);
+    for (int index = 0; index < 300; ++index) {
+        check(engine.tryRequestSeek({index % 6}).accepted,
+              "repeated bounded Seek should remain accepted");
+        render(engine, left, right, 5.0);
+        check(engine.transportSnapshot().position.value == index % 6,
+              "repeated Seek must not retain a stale generation");
+    }
+}
 } // namespace
 
 int main() {
     using namespace vitadaw;
+
+    transportNavigationTests();
 
     audio::RealtimeAudioEngine emptyEngine;
     const std::vector<audio::PreparedTrackView> noTracks;
@@ -126,8 +189,12 @@ int main() {
           "variable block sizes should share one continuous clock");
     check(engine.tryRequestStop().accepted, "Stop should enqueue");
     render(engine, variableA, variableB, 4.0);
+    check(engine.transportSnapshot().position.value == 3,
+          "first processed Stop should preserve the portable clock");
+    check(engine.tryRequestStop().accepted, "second Stop should enqueue");
+    render(engine, variableA, variableB, 4.0);
     check(engine.transportSnapshot().position.value == 0,
-          "processed Stop should rewind the portable engine");
+          "second processed Stop should rewind the portable engine");
 
     const std::vector<float> half(2, 0.5F);
     engine.deviceUnavailable();

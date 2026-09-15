@@ -361,7 +361,7 @@ SerializationResult serializeProject(const project::ProjectState& project,const 
         if(!path.is_absolute()) return {{PersistenceCode::schemaValidationFailed,PersistencePhase::validate},{}};
         auto data=project.documentData();
         if(!project::ProjectState::fromDocumentData(data)) return {{PersistenceCode::semanticValidationFailed,PersistencePhase::validate},{}};
-        DocumentTree tree{encode({1,"0.5.0",std::move(data)},path)};
+        DocumentTree tree{encode({1,"0.5.1",std::move(data)},path)};
         auto& root=tree.value;
         // Explicit schema validation on Save also catches unsupported media fields.
         static_cast<void>(decode(root));

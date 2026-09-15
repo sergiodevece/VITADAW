@@ -46,7 +46,10 @@ public:
     [[nodiscard]] DeviceProcessingState deviceState() const noexcept;
 
     [[nodiscard]] AudioControlRequestResult tryRequestPlay() noexcept;
+    [[nodiscard]] AudioControlRequestResult tryRequestPause() noexcept;
     [[nodiscard]] AudioControlRequestResult tryRequestStop() noexcept;
+    [[nodiscard]] AudioControlRequestResult tryRequestSeek(
+        timeline::ProjectFramePosition) noexcept;
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track, mixer::PreparedTrackMixState mix,
         PreparedAudibilityState audibility) noexcept;
@@ -73,11 +76,12 @@ private:
     static_assert(std::atomic<std::size_t>::is_always_lock_free);
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
-    enum class CommandType : std::uint8_t { play, stop };
+    enum class CommandType : std::uint8_t { play, pause, stop, seek };
     struct QueuedCommand {
         CommandType type{CommandType::stop};
         AudioCommandSequence sequence{};
         std::uint64_t generation{};
+        timeline::ProjectFramePosition target;
     };
     struct TrackMixCommand {
         std::size_t trackIndex{};
@@ -114,7 +118,8 @@ private:
                      ProcessorParameterCommand>;
     static_assert(std::is_trivially_copyable_v<ParameterCommand>);
 
-    [[nodiscard]] AudioControlRequestResult enqueue(CommandType type) noexcept;
+    [[nodiscard]] AudioControlRequestResult enqueue(
+        CommandType type, timeline::ProjectFramePosition target = {}) noexcept;
     void consumeCommands() noexcept;
     void consumeParameterCommands(
         timeline::SampleRate deviceSampleRate) noexcept;

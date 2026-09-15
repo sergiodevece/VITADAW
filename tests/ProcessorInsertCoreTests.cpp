@@ -434,12 +434,13 @@ int main() {
           "host bypass must run the processor and delay dry by declared latency");
 
     check(bypassHarness.engine.tryRequestStop().accepted &&
+              bypassHarness.engine.tryRequestStop().accepted &&
               bypassHarness.engine.tryRequestPlay().accepted,
-          "rapid Stop then Play must enqueue as an ordered reset barrier");
+          "rapid double Stop then Play must enqueue as an ordered reset barrier");
     const auto replayed = bypassHarness.render(4);
     check(replayed.first[0] == 0.0F && replayed.first[1] == 0.0F &&
               replayed.first[2] == 1.0F && latencyProbe.resetCalls > 0,
-          "Stop then Play must reset processor and bypass-delay state");
+          "double Stop then Play must reset processor and bypass-delay state");
     bypassHarness.engine.deviceStopped();
     bypassHarness.engine.deviceInitialising();
     std::array<float*, 0> noChannels{};
