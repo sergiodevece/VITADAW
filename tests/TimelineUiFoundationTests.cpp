@@ -125,6 +125,59 @@ void gestureTests() {
           "preview arithmetic must saturate instead of overflowing frame positions");
 }
 
+void crossTrackInteractionTests() {
+    auto project = oneClipProject();
+    const auto monoTarget = project.addAudioTrack(
+        "Mono Target", media::AudioChannelLayout::mono);
+    const auto stereoTarget = project.addAudioTrack(
+        "Stereo Target", media::AudioChannelLayout::stereo);
+    const auto snapshot = makeTimelineSnapshot(project, 20);
+    const auto& sourceTrack = snapshot.tracks[0];
+    const auto& clip = sourceTrack.clips[0];
+    check(TimelineInteraction::trackAtVerticalPosition(
+              snapshot, 62.0, 62.0, 58.0, 0.0) == sourceTrack.id &&
+          TimelineInteraction::trackAtVerticalPosition(
+              snapshot, 62.0, 62.0, 58.0, 58.0) == monoTarget &&
+          !TimelineInteraction::trackAtVerticalPosition(
+              snapshot, -1.0, 62.0, 58.0, 0.0),
+          "portable lane geometry resolves TrackId with vertical scroll");
+
+    TimelineInteraction interaction;
+    interaction.selectTrack(monoTarget);
+    check(interaction.selectedTrack() == monoTarget && !interaction.selection(),
+          "track selection is independent from clip selection");
+    interaction.selectClip(sourceTrack.id, clip.id);
+    check(interaction.selectedTrack() == sourceTrack.id &&
+              interaction.selection() == clip.id,
+          "clip selection coordinates its owning track");
+    CoordinateTransform transform{snapshot.projectSampleRate, 100.0, 0.0};
+    check(interaction.beginGesture(GestureKind::move, sourceTrack, clip, 100.0),
+          "cross-track gesture begins without editing the model");
+    interaction.updateGesture(300.0, transform, snapshot, monoTarget);
+    check(interaction.preview() && interaction.preview()->validTarget &&
+              interaction.preview()->track == monoTarget &&
+              project.trackContainingClip(clip.id) == sourceTrack.id,
+          "compatible vertical preview changes only ephemeral TrackId");
+    const auto command = interaction.endGesture();
+    const auto& move = std::get<commands::MoveClip>(*command);
+    check(move.targetTrack == monoTarget && move.projectStart.value == 144000,
+          "mouse-up emits one atomic horizontal and vertical MoveClip");
+
+    check(interaction.beginGesture(GestureKind::move, sourceTrack, clip, 100.0),
+          "incompatible gesture begins");
+    interaction.updateGesture(100.0, transform, snapshot, stereoTarget);
+    check(interaction.preview() && !interaction.preview()->validTarget &&
+              !interaction.endGesture(),
+          "incompatible lane preview cannot emit a model command");
+
+    interaction.selectTrack(monoTarget);
+    check(project.removeAudioTrack(monoTarget).has_value(),
+          "selected track deletion fixture succeeds");
+    interaction.reconcile(makeTimelineSnapshot(project, 21));
+    check(!interaction.selectedTrack(),
+          "selection is invalidated when its TrackId disappears");
+}
+
 void actionsAndRefreshTests() {
     auto project = oneClipProject();
     auto snapshot = makeTimelineSnapshot(project, 1);
@@ -197,6 +250,7 @@ int main() {
     coordinateTests();
     snapshotAndSelectionTests();
     gestureTests();
+    crossTrackInteractionTests();
     actionsAndRefreshTests();
     largeSessionTest();
     std::cout << "Timeline UI foundation tests passed\n";

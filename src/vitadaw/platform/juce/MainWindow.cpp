@@ -51,21 +51,38 @@ public:
         };
         addAndMakeVisible(timeline_);
 
-        if (application.project().tracks().empty()) {
-            auto button = std::make_unique<juce::TextButton>("Import WAV...");
-            button->onClick = [this] { chooseWav(std::nullopt); };
-            addAndMakeVisible(*button);
-            loadButtons_.push_back(std::move(button));
-        } else {
-            for (const auto& track : application.project().tracks()) {
-                auto button = std::make_unique<juce::TextButton>(
-                    "Import to " + juce::String(track.name));
-                const auto id = track.id;
-                button->onClick = [this, id] { chooseWav(id); };
-                addAndMakeVisible(*button);
-                loadButtons_.push_back(std::move(button));
+        importButton_.onClick = [this] {
+            if (application_.project().tracks().empty()) {
+                chooseWav(std::nullopt);
+            } else if (const auto selected = timeline_.selectedTrackId()) {
+                chooseWav(*selected);
+            } else {
+                showResult({commands::CommandStatus::rejected,
+                            "Select a target track before importing audio",
+                            commands::CommandError::selectTargetTrack});
             }
-        }
+        };
+        addMonoTrack_.onClick = [this] {
+            dispatch(commands::AddAudioTrack{
+                {}, media::AudioChannelLayout::mono});
+        };
+        addStereoTrack_.onClick = [this] {
+            dispatch(commands::AddAudioTrack{
+                {}, media::AudioChannelLayout::stereo});
+        };
+        deleteTrack_.onClick = [this] {
+            const auto selected = timeline_.selectedTrackId();
+            if (!selected) {
+                showResult({commands::CommandStatus::rejected,
+                            "Select a track before deleting it",
+                            commands::CommandError::selectTargetTrack});
+                return;
+            }
+            dispatch(commands::DeleteAudioTrack{*selected});
+        };
+        for (auto* button : {&importButton_, &addMonoTrack_,
+                             &addStereoTrack_, &deleteTrack_})
+            addAndMakeVisible(*button);
 
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         pauseButton_.onClick = [this] { dispatch(commands::Pause{}); };
@@ -161,6 +178,10 @@ public:
         for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_})
             button->setEnabled(state.playback == transport::PlaybackState::stopped);
         const auto stopped = state.playback == transport::PlaybackState::stopped;
+        addMonoTrack_.setEnabled(stopped);
+        addStereoTrack_.setEnabled(stopped);
+        deleteTrack_.setEnabled(stopped);
+        importButton_.setEnabled(stopped);
         startBar_.setEnabled(stopped);
         endBar_.setEnabled(stopped);
         applyLoop_.setEnabled(stopped);
@@ -242,11 +263,9 @@ public:
         }
         bounds.removeFromTop(5);
         auto importRow = bounds.removeFromTop(32);
-        const auto count = static_cast<int>(loadButtons_.size());
-        const auto width = count == 0 ? 0 :
-            std::max(90, (importRow.getWidth() - 5 * (count - 1)) / count);
-        for (auto& button : loadButtons_) {
-            button->setBounds(importRow.removeFromLeft(width));
+        for (auto* button : {&importButton_, &addMonoTrack_,
+                             &addStereoTrack_, &deleteTrack_}) {
+            button->setBounds(importRow.removeFromLeft(150));
             importRow.removeFromLeft(5);
         }
         bounds.removeFromTop(8);
@@ -366,7 +385,10 @@ private:
     application::DawApplication& application_;
     juce::Label statusLabel_, transportLabel_, meterLabel_, resultLabel_;
     TimelineComponent timeline_;
-    std::vector<std::unique_ptr<juce::TextButton>> loadButtons_;
+    juce::TextButton importButton_{"Import WAV..."};
+    juce::TextButton addMonoTrack_{"+ Mono Track"};
+    juce::TextButton addStereoTrack_{"+ Stereo Track"};
+    juce::TextButton deleteTrack_{"Delete Track"};
     juce::TextButton playButton_{"Play"}, pauseButton_{"Pause"}, stopButton_{"Stop"};
     juce::TextButton undoButton_{"Undo"}, redoButton_{"Redo"};
     juce::TextButton saveButton_{"Save"}, saveAsButton_{"Save As..."};

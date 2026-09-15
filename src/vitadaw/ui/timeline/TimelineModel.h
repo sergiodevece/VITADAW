@@ -22,6 +22,7 @@ struct ClipSnapshot {
 struct TrackSnapshot {
     tracks::TrackId id;
     std::string name;
+    media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
     std::vector<ClipSnapshot> clips;
     bool operator==(const TrackSnapshot&) const = default;
 };
@@ -82,20 +83,37 @@ enum class GestureKind { none, move, trimLeft, trimRight };
 
 struct ClipPreview {
     clips::ClipId id;
+    tracks::TrackId track;
     ::vitadaw::timeline::ProjectFramePosition projectStart;
     ::vitadaw::timeline::ProjectFrameDuration duration;
+    bool validTarget{true};
 };
 
 // Ephemeral presentation state only. It never owns or mutates ProjectState.
 class TimelineInteraction {
 public:
     [[nodiscard]] std::optional<clips::ClipId> selection() const noexcept { return selection_; }
+    [[nodiscard]] std::optional<tracks::TrackId> selectedTrack() const noexcept {
+        return selectedTrack_;
+    }
     [[nodiscard]] const std::optional<ClipPreview>& preview() const noexcept { return preview_; }
     void select(std::optional<clips::ClipId> clip) noexcept;
+    void selectTrack(std::optional<tracks::TrackId> track) noexcept;
+    void selectClip(tracks::TrackId track, clips::ClipId clip) noexcept;
     void reconcile(const TimelineSnapshot& snapshot) noexcept;
     [[nodiscard]] bool beginGesture(GestureKind kind, const ClipSnapshot& clip,
                                     double pointerX) noexcept;
+    [[nodiscard]] bool beginGesture(GestureKind kind,
+                                    const TrackSnapshot& track,
+                                    const ClipSnapshot& clip,
+                                    double pointerX) noexcept;
     void updateGesture(double pointerX, const CoordinateTransform& transform) noexcept;
+    void updateGesture(double pointerX, const CoordinateTransform& transform,
+                       const TimelineSnapshot& snapshot,
+                       std::optional<tracks::TrackId> targetTrack) noexcept;
+    [[nodiscard]] static std::optional<tracks::TrackId> trackAtVerticalPosition(
+        const TimelineSnapshot& snapshot, double pointerY,
+        double contentTop, double laneHeight, double verticalOffset) noexcept;
     [[nodiscard]] std::optional<commands::Command> endGesture() noexcept;
     void cancelGesture() noexcept;
     [[nodiscard]] std::optional<commands::Command> duplicateCommand(
@@ -109,8 +127,10 @@ private:
     [[nodiscard]] static const ClipSnapshot* find(
         const TimelineSnapshot&, clips::ClipId) noexcept;
     std::optional<clips::ClipId> selection_;
+    std::optional<tracks::TrackId> selectedTrack_;
     GestureKind gesture_{GestureKind::none};
     ClipPreview original_{};
+    media::AudioChannelLayout originalLayout_{media::AudioChannelLayout::mono};
     std::optional<ClipPreview> preview_;
     double pointerOriginX_{};
 };

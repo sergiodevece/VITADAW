@@ -15,9 +15,10 @@
 namespace vitadaw::commands {
 
 struct AddAudioTrack {
-    std::string name;
+    std::string name{};
     media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
 };
+struct DeleteAudioTrack { tracks::TrackId track; };
 
 struct AddBus {
     std::string name;
@@ -53,7 +54,15 @@ struct RemoveClip { clips::ClipId clip; };
 struct RemoveSource { media::SourceId source; };
 struct MoveClip {
     clips::ClipId clip;
+    tracks::TrackId targetTrack;
     timeline::ProjectFramePosition projectStart;
+
+    MoveClip(clips::ClipId id,
+             timeline::ProjectFramePosition position) noexcept
+        : clip(id), projectStart(position) {}
+    MoveClip(clips::ClipId id, tracks::TrackId track,
+             timeline::ProjectFramePosition position) noexcept
+        : clip(id), targetTrack(track), projectStart(position) {}
 };
 struct DuplicateClip {
     clips::ClipId clip;
@@ -158,7 +167,7 @@ struct SetProcessorParameter {
     float value{};
 };
 
-using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile,
+using Command = std::variant<AddAudioTrack, DeleteAudioTrack, AddBus, LoadAudioFile,
                              ImportAudioToTrack, ImportAudioFile,
                              AddClip, RemoveClip,
                              RemoveSource, MoveClip, DuplicateClip, SplitClip,
@@ -206,6 +215,9 @@ enum class CommandError {
     permissionDenied,
     unsupportedFormat,
     decodeFailed,
+    trackNotFound,
+    layoutMismatch,
+    selectTargetTrack,
     noTargetTrack,
     commitFailed,
 };

@@ -46,6 +46,7 @@ tracks::TrackId ProjectState::addAudioTrack(
         throw std::overflow_error{"Audio track identity space exhausted"};
     }
     const auto id = nextTrackId_;
+    if (name.empty()) name = "Audio " + std::to_string(id.value);
     tracks_.push_back({id, std::move(name), layout, {}, {}, {}});
     try {
         routing_.addTrack(id);
@@ -55,6 +56,50 @@ tracks::TrackId ProjectState::addAudioTrack(
     }
     ++nextTrackId_.value;
     return id;
+}
+
+std::optional<ProjectState::TrackHistoryState>
+ProjectState::captureTrackHistoryState(tracks::TrackId track) const {
+    const auto trackFound = std::find_if(
+        tracks_.begin(), tracks_.end(),
+        [track](const auto& candidate) { return candidate.id == track; });
+    const auto routeFound = std::find_if(
+        routing_.trackRoutes_.begin(), routing_.trackRoutes_.end(),
+        [track](const auto& candidate) { return candidate.track == track; });
+    if (trackFound == tracks_.end() || routeFound == routing_.trackRoutes_.end()) {
+        return std::nullopt;
+    }
+    TrackHistoryState result{
+        static_cast<std::size_t>(trackFound - tracks_.begin()), *trackFound,
+        static_cast<std::size_t>(routeFound - routing_.trackRoutes_.begin()),
+        *routeFound, {}};
+    for (std::size_t index = 0; index < routing_.sends_.size(); ++index) {
+        const auto* source =
+            std::get_if<tracks::TrackId>(&routing_.sends_[index].source);
+        if (source != nullptr && *source == track) {
+            result.sends.push_back({index, routing_.sends_[index]});
+        }
+    }
+    return result;
+}
+
+std::optional<ProjectState::TrackHistoryState>
+ProjectState::removeAudioTrack(tracks::TrackId track) {
+    auto snapshot = captureTrackHistoryState(track);
+    if (!snapshot) return std::nullopt;
+    routing_.sends_.erase(
+        std::remove_if(routing_.sends_.begin(), routing_.sends_.end(),
+            [track](const auto& send) {
+                const auto* source = std::get_if<tracks::TrackId>(&send.source);
+                return source != nullptr && *source == track;
+            }),
+        routing_.sends_.end());
+    routing_.trackRoutes_.erase(
+        routing_.trackRoutes_.begin() +
+        static_cast<std::ptrdiff_t>(snapshot->routeIndex));
+    tracks_.erase(tracks_.begin() +
+                  static_cast<std::ptrdiff_t>(snapshot->trackIndex));
+    return snapshot;
 }
 
 routing::BusId ProjectState::addBus(std::string name) {
@@ -147,6 +192,19 @@ const clips::AudioClip* ProjectState::findClip(
         }
     }
     return nullptr;
+}
+
+tracks::TrackId ProjectState::trackContainingClip(
+    clips::ClipId clip) const noexcept {
+    for (const auto& track : tracks_) {
+        if (std::any_of(track.clips.begin(), track.clips.end(),
+                        [clip](const auto& candidate) {
+                            return candidate.id == clip;
+                        })) {
+            return track.id;
+        }
+    }
+    return {};
 }
 
 std::span<const clips::AudioClip> ProjectState::clipsForTrack(
@@ -599,6 +657,49 @@ ProjectState::ClipEditResult ProjectState::moveClip(
     return {ClipEditStatus::success, clip, {}};
 }
 
+ProjectState::ClipEditResult ProjectState::moveClip(
+    clips::ClipId clip, tracks::TrackId targetTrack,
+    timeline::ProjectFramePosition projectStart) {
+    if (projectStart.value < 0) {
+        return {ClipEditStatus::invalidPosition, clip, {}};
+    }
+    auto* sourceTrack = findTrackContainingClip(clip);
+    if (sourceTrack == nullptr) {
+        return {ClipEditStatus::clipNotFound, clip, {}};
+    }
+    auto* destinationTrack = findTrackMutable(targetTrack);
+    if (destinationTrack == nullptr) {
+        return {ClipEditStatus::trackNotFound, clip, {}};
+    }
+    if (sourceTrack->id == destinationTrack->id) {
+        return moveClip(clip, projectStart);
+    }
+    const auto found = std::find_if(
+        sourceTrack->clips.begin(), sourceTrack->clips.end(),
+        [clip](const auto& candidate) { return candidate.id == clip; });
+    const auto* source = findSource(found->source);
+    if (source == nullptr || destinationTrack->layout != source->layout) {
+        return {ClipEditStatus::layoutMismatch, clip, {}};
+    }
+    if (destinationTrack->clips.size() >= maximumClipsPerTrack) {
+        return {ClipEditStatus::capacityExceeded, clip, {}};
+    }
+    auto moved = *found;
+    moved.projectStart = projectStart;
+    if (!validateClip(*destinationTrack, *source, moved.projectStart,
+                      moved.duration, moved.sourceOffset)) {
+        return {ClipEditStatus::invalidPosition, clip, {}};
+    }
+    destinationTrack->clips.push_back(moved);
+    sortTrackClips(*destinationTrack);
+    sourceTrack = findTrackMutable(sourceTrack->id);
+    const auto sourceFound = std::find_if(
+        sourceTrack->clips.begin(), sourceTrack->clips.end(),
+        [clip](const auto& candidate) { return candidate.id == clip; });
+    sourceTrack->clips.erase(sourceFound);
+    return {ClipEditStatus::success, clip, {}};
+}
+
 ProjectState::ClipEditResult ProjectState::duplicateClip(
     clips::ClipId clip, timeline::ProjectFramePosition projectStart) {
     if (projectStart.value < 0) {
@@ -783,6 +884,108 @@ bool ProjectState::restoreHistoryClip(tracks::TrackId id,
         return false;
     track->clips.push_back(clip);
     sortTrackClips(*track);
+    return true;
+}
+
+bool ProjectState::restoreHistoryTrack(const TrackHistoryState& state) {
+    if (!state.track.id.isValid() || state.track.id.value >= nextTrackId_.value ||
+        findTrack(state.track.id) != nullptr ||
+        state.trackIndex > tracks_.size() ||
+        state.routeIndex > routing_.trackRoutes_.size() ||
+        state.route.track != state.track.id ||
+        !state.route.destination.isValid() ||
+        state.track.clips.size() > maximumClipsPerTrack ||
+        (state.track.layout != media::AudioChannelLayout::mono &&
+         state.track.layout != media::AudioChannelLayout::stereo)) {
+        return false;
+    }
+    if (state.route.destination.kind == routing::DestinationKind::bus &&
+        !routing_.containsBus(state.route.destination.bus)) {
+        return false;
+    }
+    std::size_t totalClips{};
+    for (const auto& track : tracks_) totalClips += track.clips.size();
+    if (totalClips > maximumClips - state.track.clips.size()) return false;
+    for (const auto& clip : state.track.clips) {
+        const auto* source = findSource(clip.source);
+        if (!clip.id.isValid() || clip.id.value >= nextClipId_.value ||
+            findClip(clip.id) != nullptr || source == nullptr ||
+            !validateClip(state.track, *source, clip.projectStart,
+                          clip.duration, clip.sourceOffset)) {
+            return false;
+        }
+    }
+    for (const auto& processor : state.track.inserts.processors) {
+        if (!processor.id.isValid() ||
+            processor.id.value >= nextProcessorId_.value ||
+            findProcessor(processor.id) != nullptr) return false;
+    }
+    for (const auto& indexed : state.sends) {
+        const auto* source =
+            std::get_if<tracks::TrackId>(&indexed.route.source);
+        if (source == nullptr || *source != state.track.id ||
+            !indexed.route.id.isValid() ||
+            indexed.route.id.value >= routing_.nextSendId_.value ||
+            findSend(indexed.route.id) != nullptr ||
+            !routing_.containsBus(indexed.route.destination) ||
+            !routing::isValid(indexed.route.tapPoint) ||
+            !indexed.route.mix.isValid()) {
+            return false;
+        }
+    }
+    tracks_.insert(tracks_.begin() + static_cast<std::ptrdiff_t>(state.trackIndex),
+                   state.track);
+    routing_.trackRoutes_.insert(
+        routing_.trackRoutes_.begin() +
+            static_cast<std::ptrdiff_t>(state.routeIndex),
+        state.route);
+    for (const auto& indexed : state.sends) {
+        const auto index = std::min(indexed.index, routing_.sends_.size());
+        routing_.sends_.insert(
+            routing_.sends_.begin() + static_cast<std::ptrdiff_t>(index),
+            indexed.route);
+    }
+    return true;
+}
+
+bool ProjectState::transferHistoryClip(
+    tracks::TrackId fromTrack, const clips::AudioClip& before,
+    tracks::TrackId toTrack, const clips::AudioClip& after) {
+    if (before.id != after.id || before.source != after.source ||
+        before.duration != after.duration ||
+        before.sourceOffset != after.sourceOffset) {
+        return false;
+    }
+    auto* sourceTrack = findTrackMutable(fromTrack);
+    auto* destinationTrack = findTrackMutable(toTrack);
+    const auto* source = findSource(before.source);
+    if (sourceTrack == nullptr || destinationTrack == nullptr || source == nullptr ||
+        !validateClip(*destinationTrack, *source, after.projectStart,
+                      after.duration, after.sourceOffset)) {
+        return false;
+    }
+    const auto found = std::find_if(
+        sourceTrack->clips.begin(), sourceTrack->clips.end(),
+        [&](const auto& clip) { return clip == before; });
+    if (found == sourceTrack->clips.end()) return false;
+    if (fromTrack == toTrack) {
+        *found = after;
+        sortTrackClips(*sourceTrack);
+        return true;
+    }
+    if (destinationTrack->layout != source->layout ||
+        destinationTrack->clips.size() >= maximumClipsPerTrack ||
+        std::any_of(destinationTrack->clips.begin(), destinationTrack->clips.end(),
+                    [&](const auto& clip) { return clip.id == after.id; })) {
+        return false;
+    }
+    destinationTrack->clips.push_back(after);
+    sortTrackClips(*destinationTrack);
+    sourceTrack = findTrackMutable(fromTrack);
+    const auto foundAgain = std::find_if(
+        sourceTrack->clips.begin(), sourceTrack->clips.end(),
+        [&](const auto& clip) { return clip == before; });
+    sourceTrack->clips.erase(foundAgain);
     return true;
 }
 

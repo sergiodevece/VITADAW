@@ -27,6 +27,7 @@ struct AudioTrack {
     processors::InsertChain inserts;
 
     [[nodiscard]] bool hasAudio() const noexcept { return !clips.empty(); }
+    bool operator==(const AudioTrack&) const = default;
 };
 
 } // namespace vitadaw::tracks

@@ -3,6 +3,7 @@
 #include "vitadaw/project/ProjectState.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <variant>
@@ -14,7 +15,10 @@ struct StateToken {
     std::uint64_t value{};
     bool operator==(const StateToken&) const = default;
 };
-struct MoveClip { tracks::TrackId track; clips::AudioClip before, after; };
+struct MoveClip {
+    tracks::TrackId beforeTrack, afterTrack;
+    clips::AudioClip before, after;
+};
 struct TrimClipLeft { tracks::TrackId track; clips::AudioClip before, after; };
 struct TrimClipRight { tracks::TrackId track; clips::AudioClip before, after; };
 struct DuplicateClip { tracks::TrackId track; clips::AudioClip created; };
@@ -23,13 +27,18 @@ struct TempoEdit { std::optional<musical::TempoEvent> before, after; };
 struct SignatureEdit { std::optional<musical::TimeSignatureEvent> before, after; };
 struct LoopRangeEdit { std::optional<musical::MusicalLoopRange> before, after; };
 struct SplitClip { tracks::TrackId track; clips::AudioClip original, left, right; };
+using TrackHistoryStatePtr =
+    std::shared_ptr<const project::ProjectState::TrackHistoryState>;
+struct AddAudioTrack { TrackHistoryStatePtr created; };
+struct DeleteAudioTrack { TrackHistoryStatePtr removed; };
 
 // Model values only. No borrowed views or prepared/runtime ownership.
 class UndoableOperation {
 public:
     using Payload = std::variant<MoveClip, DuplicateClip, SplitClip,
                                  TrimClipLeft, TrimClipRight, DeleteClip,
-                                 TempoEdit, SignatureEdit, LoopRangeEdit>;
+                                 TempoEdit, SignatureEdit, LoopRangeEdit,
+                                 AddAudioTrack, DeleteAudioTrack>;
     Payload payload;
     [[nodiscard]] bool isMusical() const noexcept {
         return std::holds_alternative<TempoEdit>(payload) ||
@@ -37,6 +46,7 @@ public:
                std::holds_alternative<LoopRangeEdit>(payload);
     }
     [[nodiscard]] std::string_view label() const noexcept;
+    [[nodiscard]] std::size_t approximateMemoryBytes() const noexcept;
     // Operates on a disposable application-thread candidate, never active state.
     [[nodiscard]] bool apply(project::ProjectState& candidate, bool forward) const;
 };
@@ -44,8 +54,8 @@ public:
 struct HistoryEntry {
     UndoableOperation operation;
     StateToken beforeStateToken, afterStateToken;
-    [[nodiscard]] constexpr std::size_t approximateMemoryBytes() const noexcept {
-        return sizeof(HistoryEntry); // All payloads are fixed-size model values.
+    [[nodiscard]] std::size_t approximateMemoryBytes() const noexcept {
+        return sizeof(HistoryEntry) + operation.approximateMemoryBytes();
     }
 };
 
@@ -79,7 +89,9 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
     [[nodiscard]] std::size_t cursor() const noexcept { return cursor_; }
     [[nodiscard]] std::size_t memoryBytes() const noexcept {
-        return entries_.capacity() * sizeof(HistoryEntry);
+        std::size_t result{};
+        for (const auto& entry : entries_) result += entry.approximateMemoryBytes();
+        return result;
     }
 private:
     Limits limits_;

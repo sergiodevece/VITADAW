@@ -1,4 +1,4 @@
-# VitaDAW 0.5.3 — Loop & Metronome
+# VitaDAW 0.5.4 — Track Operations & Cross-Track Editing
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -136,6 +136,22 @@ chooser durante la operación y trata Cancel como un resultado explícito. Una
 ruta elegida siempre llega al backend de archivos; cualquier fallo produce un
 diagnóstico provisional visible y conserva el proyecto y su `StateToken`.
 Import sigue siendo una barrera no undoable: solo el commit exitoso marca dirty.
+
+VitaDAW 0.5.4 incorpora el ciclo estructural completo de pistas de audio. Los
+botones provisionales crean pistas mono o estéreo con nombre `Audio N`, identidad
+monotónica, mixer e inserts por defecto, sends vacíos y salida directa a Master.
+Delete retira atómicamente la pista, sus clips, inserts, route y sends de origen,
+pero conserva las fuentes compartidas y los buses no relacionados. Add y Delete
+son Stopped-only y undoables; Undo restaura exactamente los mismos TrackId,
+ClipId, SendId y ProcessorInstanceId sin rebobinar contadores.
+
+La selección de timeline mantiene un `selectedTrackId` efímero. Import exige esa
+selección cuando existen pistas y conserva la creación automática de la primera
+pista para un proyecto vacío. El gesto Move admite ahora tiempo y lane destino
+en un solo comando: el clip cambia de owner sin cambiar ClipId, SourceId, offset
+ni duración. Mono→mono y stereo→stereo están permitidos; no existe upmix/downmix.
+Las operaciones reconstruyen el plan fuera de RT y conservan la posición de
+transporte detenida. El formato de proyecto continúa siendo schema v3.
 
 ## Tecnología propuesta
 
@@ -518,6 +534,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.3 — Loop & Metronome:** loop musical persistente, wrap fraccional por
   segmentos continuos, metrónomo sample-accurate y schema v3 con migración
   v2→v3.
+- **0.5.4 — Track Operations & Cross-Track Editing:** Add/Delete Track con
+  Undo/Redo exacto, selección explícita para importación y Move 2D de clips con
+  ownership por TrackId y compatibilidad de layout.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -542,4 +561,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.0.md`](docs/validation-0.5.0.md) y
 [`docs/validation-0.5.1.md`](docs/validation-0.5.1.md) y
 [`docs/validation-0.5.2.md`](docs/validation-0.5.2.md) y
-[`docs/validation-0.5.3.md`](docs/validation-0.5.3.md).
+[`docs/validation-0.5.3.md`](docs/validation-0.5.3.md) y
+[`docs/validation-0.5.4.md`](docs/validation-0.5.4.md).

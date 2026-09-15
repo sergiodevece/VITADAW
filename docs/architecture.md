@@ -1463,7 +1463,69 @@ preparación y commit tienen errores de comando separados. VitaDAW no activa App
 Sandbox ni requiere security-scoped bookmarks en esta configuración, por lo que
 no se añadieron entitlements ni concesiones automáticas.
 
-## Evolución hasta 0.5.3
+## Track Operations & Cross-Track Editing 0.5.4
+
+`AudioTrack` continúa siendo un agregado portable identificado por `TrackId` y
+con layout mono o estéreo fijo. `addAudioTrack` asigna IDs monotónicos, usa
+`Audio N` cuando el nombre viene vacío, añade al final y crea exactamente una
+`TrackRoute` hacia Master. Mixer queda en defaults, la cadena de inserts y los
+sends están vacíos. No se crean buses ni rutas auxiliares implícitas. El límite
+permanece en 256 pistas.
+
+Add y Delete son operaciones estructurales Stopped-only. Se construye primero
+un `ProjectState` candidato, después el plan completo y finalmente se publica
+modelo, plan e historial en la región quiescente existente. El commit conserva
+la posición detenida del transporte; si preparación o publicación fallan,
+modelo, plan, historial y token activo no cambian.
+
+El payload de historial no copia el proyecto entero. `TrackHistoryState` posee
+solo el índice visual, `AudioTrack` completo, su `TrackRoute` y los sends cuyo
+origen es esa pista, cada uno con su posición. No contiene PCM, objetos DSP ni
+vistas prestadas. La memoria variable de clips, processors y sends participa en
+el presupuesto de Undo. Undo de Add elimina exactamente la pista creada; Redo
+la restaura con el mismo TrackId. Delete/Undo conserva nombre, layout, ClipId,
+mix, ProcessorInstanceId, route, SendId, tap y parámetros deseados. Los
+contadores monotónicos nunca retroceden ni reutilizan identidades abandonadas.
+
+Delete elimina los clips, inserts, mixer y output que viven dentro de la pista,
+además de sus sends de origen. No elimina `AudioSource`: puede seguir referenciada
+por clips de otras pistas y, aunque quede sin referencias, conserva la política
+explícita de lifetime de Sources. Tampoco modifica buses, sends de otros
+orígenes, master ni el DAG no relacionado. El plan nuevo retira instancias DSP
+y vistas del plan anterior únicamente después de la quiescencia RT.
+
+`MoveClip` representa ahora una transición atómica
+`(oldTrackId,oldProjectStart) → (newTrackId,newProjectStart)`. ClipId, SourceId,
+sourceOffset y duration permanecen invariantes. El destino se valida contra el
+layout de `AudioSource`: mono→mono y stereo→stereo están soportados; cualquier
+otra combinación devuelve `layoutMismatch`, sin upmix/downmix. Los overlaps son
+válidos y continúan sumándose antes de los inserts de la pista destino. Un Move
+dentro de la misma pista reutiliza la semántica horizontal anterior; un Move
+vertical requiere transporte completamente Stopped.
+
+`TimelineInteraction` conserva selección efímera e independiente mediante
+`optional<TrackId>` y `optional<ClipId>`. Click en header selecciona la pista;
+click en clip selecciona ambos IDs. La geometría vertical traduce coordenada y
+scroll a un TrackId procedente del snapshot, nunca a un índice persistente. El
+drag solo modifica un preview: mouseUp genera un único `MoveClip`; una lane
+incompatible se muestra inválida y no despacha mutación. Add/Delete/Load
+reconcilian la selección por identidad y mantienen visibles las pistas vacías.
+
+La importación de un proyecto vacío conserva la política 0.5.3 y crea su primera
+pista transaccionalmente. Si existen pistas, la UI exige selección y usa
+`ImportAudioToTrack`; nunca elige la primera pista. Import continúa siendo una
+barrera no undoable y no se amplía en este incremento.
+
+El modelo documental ya almacenaba múltiples pistas, orden, nombres, layouts,
+clips, routing, sends, inserts y contadores; por ello 0.5.4 conserva schema v3.
+TempoMap, TimeSignatureMap, PPQ y loop locators no cambian con operaciones de
+pista. Loop enabled, metrónomo y su nivel siguen siendo estado de sesión.
+
+Limitaciones deliberadas: no hay reorder, multi-selection, auto-scroll durante
+drag, confirmación modal de Delete, upmix/downmix, drag externo, waveform ni UI
+de routing avanzada.
+
+## Evolución hasta 0.5.4
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1526,6 +1588,9 @@ no se añadieron entitlements ni concesiones automáticas.
     undoables, display/ruler, schema2 y migración v1.
 26. **Completado en 0.5.3:** loop PPQ persistente, segmentación sample-accurate
     sin deriva, metrónomo RT con acento y schema3/migración v2.
+
+27. **Completado en 0.5.4:** ciclo Add/Delete de pistas con historial de
+    submodelo, selección de destino, importación dirigida y Move 2D atómico.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

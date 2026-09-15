@@ -11,8 +11,31 @@ std::string_view UndoableOperation::label() const noexcept {
     constexpr std::string_view labels[]{"history.moveClip", "history.duplicateClip",
         "history.splitClip", "history.trimClipLeft", "history.trimClipRight",
         "history.deleteClip", "history.tempo", "history.timeSignature",
-        "history.loopRange"};
+        "history.loopRange", "history.addAudioTrack", "history.deleteAudioTrack"};
     return labels[payload.index()];
+}
+
+std::size_t UndoableOperation::approximateMemoryBytes() const noexcept {
+    const auto trackBytes = [](const project::ProjectState::TrackHistoryState& state) {
+        std::size_t bytes = sizeof(state) + state.track.name.capacity() +
+            state.track.clips.capacity() * sizeof(clips::AudioClip) +
+            state.track.inserts.processors.capacity() * sizeof(processors::ProcessorState) +
+            state.sends.capacity() * sizeof(project::ProjectState::IndexedSendRoute);
+        for (const auto& processor : state.track.inserts.processors) {
+            bytes += processor.type.identifier.capacity() +
+                processor.parameters.capacity() * sizeof(processors::ProcessorParameterState) +
+                processor.serializedState.capacity();
+        }
+        return bytes;
+    };
+    return std::visit([&](const auto& edit) -> std::size_t {
+        using T = std::decay_t<decltype(edit)>;
+        if constexpr (std::is_same_v<T, AddAudioTrack>)
+            return edit.created ? trackBytes(*edit.created) : 0;
+        else if constexpr (std::is_same_v<T, DeleteAudioTrack>)
+            return edit.removed ? trackBytes(*edit.removed) : 0;
+        return 0;
+    }, payload);
 }
 
 bool UndoableOperation::apply(project::ProjectState& candidate, bool forward) const {
@@ -28,6 +51,22 @@ bool UndoableOperation::apply(project::ProjectState& candidate, bool forward) co
             if (candidate.loopRange() != expected) return false;
             candidate.setLoopRange(forward ? edit.after : edit.before);
             return true;
+        } else if constexpr (std::is_same_v<T, AddAudioTrack>) {
+            if (!edit.created) return false;
+            if (forward) return candidate.restoreHistoryTrack(*edit.created);
+            const auto removed = candidate.removeAudioTrack(edit.created->track.id);
+            return removed && *removed == *edit.created;
+        } else if constexpr (std::is_same_v<T, DeleteAudioTrack>) {
+            if (!edit.removed) return false;
+            if (!forward) return candidate.restoreHistoryTrack(*edit.removed);
+            const auto removed = candidate.removeAudioTrack(edit.removed->track.id);
+            return removed && *removed == *edit.removed;
+        } else if constexpr (std::is_same_v<T, MoveClip>) {
+            return candidate.transferHistoryClip(
+                forward ? edit.beforeTrack : edit.afterTrack,
+                forward ? edit.before : edit.after,
+                forward ? edit.afterTrack : edit.beforeTrack,
+                forward ? edit.after : edit.before);
         } else {
         const auto matches = [&](const clips::AudioClip& expected) {
             const auto* track = candidate.findTrack(edit.track);
@@ -78,16 +117,27 @@ bool UndoManager::canCreateState() const noexcept {
            revision_ != std::numeric_limits<std::uint64_t>::max();
 }
 std::optional<UndoManager::PendingAppend> UndoManager::stage(UndoableOperation operation) const {
-    const auto capacity = std::min({limits_.entries, maximumEntries,
-        limits_.bytes / sizeof(HistoryEntry), memoryBudget / sizeof(HistoryEntry)});
-    if (capacity == 0 || !canCreateState()) return std::nullopt;
-    const auto retained = std::min(cursor_, capacity - 1);
+    const auto capacity = std::min(limits_.entries, maximumEntries);
+    const auto byteCapacity = std::min(limits_.bytes, memoryBudget);
+    if (capacity == 0 || byteCapacity < sizeof(HistoryEntry) ||
+        !canCreateState()) return std::nullopt;
+    HistoryEntry next{std::move(operation), current_, {nextToken_}};
+    const auto nextBytes = next.approximateMemoryBytes();
+    if (nextBytes > byteCapacity) return std::nullopt;
+    auto retained = std::min(cursor_, capacity - 1);
+    std::size_t retainedBytes{};
+    for (std::size_t index = cursor_ - retained; index < cursor_; ++index)
+        retainedBytes += entries_[index].approximateMemoryBytes();
+    while (retained != 0 && retainedBytes > byteCapacity - nextBytes) {
+        retainedBytes -= entries_[cursor_ - retained].approximateMemoryBytes();
+        --retained;
+    }
     PendingAppend result{{}, {nextToken_}};
     result.entries.reserve(retained + 1);
     const auto first = entries_.begin() + static_cast<std::ptrdiff_t>(cursor_ - retained);
     result.entries.insert(result.entries.end(), first,
                           entries_.begin() + static_cast<std::ptrdiff_t>(cursor_));
-    result.entries.push_back({std::move(operation), current_, result.token});
+    result.entries.push_back(std::move(next));
     return result;
 }
 void UndoManager::commit(PendingAppend&& pending) noexcept {

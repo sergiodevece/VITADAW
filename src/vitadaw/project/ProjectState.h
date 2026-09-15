@@ -52,6 +52,23 @@ public:
         clips::ClipId clip;
     };
 
+    struct IndexedSendRoute {
+        std::size_t index{};
+        routing::SendRoute route;
+        bool operator==(const IndexedSendRoute&) const = default;
+    };
+
+    // Bounded owning submodel used by track Undo/Redo. It never contains
+    // prepared DSP/runtime state or borrowed views.
+    struct TrackHistoryState {
+        std::size_t trackIndex{};
+        tracks::AudioTrack track;
+        std::size_t routeIndex{};
+        routing::TrackRoute route;
+        std::vector<IndexedSendRoute> sends;
+        bool operator==(const TrackHistoryState&) const = default;
+    };
+
     enum class ClipEditStatus {
         success,
         clipNotFound,
@@ -59,6 +76,8 @@ public:
         zeroLengthClip,
         sourceBoundsExceeded,
         capacityExceeded,
+        trackNotFound,
+        layoutMismatch,
     };
 
     struct ClipEditResult {
@@ -83,6 +102,10 @@ public:
     [[nodiscard]] tracks::TrackId addAudioTrack(
         std::string name,
         media::AudioChannelLayout layout = media::AudioChannelLayout::mono);
+    [[nodiscard]] std::optional<TrackHistoryState> captureTrackHistoryState(
+        tracks::TrackId track) const;
+    [[nodiscard]] std::optional<TrackHistoryState> removeAudioTrack(
+        tracks::TrackId track);
     [[nodiscard]] routing::BusId addBus(std::string name);
     [[nodiscard]] bool setTrackOutputDestination(
         tracks::TrackId track,
@@ -110,6 +133,8 @@ public:
     [[nodiscard]] const media::AudioSource* findSource(
         media::SourceId source) const noexcept;
     [[nodiscard]] const clips::AudioClip* findClip(
+        clips::ClipId clip) const noexcept;
+    [[nodiscard]] tracks::TrackId trackContainingClip(
         clips::ClipId clip) const noexcept;
     [[nodiscard]] std::span<const clips::AudioClip> clipsForTrack(
         tracks::TrackId track) const noexcept;
@@ -152,6 +177,9 @@ public:
     [[nodiscard]] ClipEditResult moveClip(
         clips::ClipId clip,
         timeline::ProjectFramePosition projectStart) noexcept;
+    [[nodiscard]] ClipEditResult moveClip(
+        clips::ClipId clip, tracks::TrackId targetTrack,
+        timeline::ProjectFramePosition projectStart);
     [[nodiscard]] ClipEditResult duplicateClip(
         clips::ClipId clip,
         timeline::ProjectFramePosition projectStart);
@@ -176,6 +204,10 @@ private:
     void setLoopRange(std::optional<musical::MusicalLoopRange> range) noexcept { loopRange_ = range; }
     [[nodiscard]] bool restoreHistoryClip(tracks::TrackId track,
                                           const clips::AudioClip& clip);
+    [[nodiscard]] bool restoreHistoryTrack(const TrackHistoryState& state);
+    [[nodiscard]] bool transferHistoryClip(
+        tracks::TrackId fromTrack, const clips::AudioClip& before,
+        tracks::TrackId toTrack, const clips::AudioClip& after);
     [[nodiscard]] bool replaceHistoryClip(tracks::TrackId track,
                                           const clips::AudioClip& clip) noexcept;
     [[nodiscard]] processors::InsertChain* findProcessorChain(

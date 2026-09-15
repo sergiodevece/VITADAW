@@ -480,6 +480,17 @@ bool JuceAudioDeviceAdapter::commitPreparedProcessingPlan(
     return commitPreparedProject(candidate->preparedProject, modelCommit);
 }
 
+bool JuceAudioDeviceAdapter::commitPreparedProcessingPlanPreservingTransport(
+    audio::PreparedProcessingPlanChangePtr prepared,
+    audio::AudioFileCommitAction modelCommit) noexcept {
+    auto* candidate = dynamic_cast<PreparedJuceProcessingPlan*>(prepared.get());
+    if (candidate == nullptr || candidate->preparedProject == nullptr ||
+        !modelCommit.isValid()) {
+        return false;
+    }
+    return commitPreparedProject(candidate->preparedProject, modelCommit, true);
+}
+
 audio::TemporalContextPreparationResult
 JuceAudioDeviceAdapter::prepareTemporalContext(
     const musical::MusicalTimeMap& map,
@@ -806,21 +817,25 @@ bool JuceAudioDeviceAdapter::reprepareTemporalForCurrentDevice(
 
 bool JuceAudioDeviceAdapter::commitPreparedProject(
     std::unique_ptr<PreparedProject>& candidate,
-    audio::AudioFileCommitAction modelCommit) noexcept {
+    audio::AudioFileCommitAction modelCommit,
+    bool preserveTransport) noexcept {
     if (candidate == nullptr || candidate->processing == nullptr ||
         !modelCommit.isValid()) {
         return false;
     }
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
     const auto callbackWasRegistered = callbackRegistered_;
     detachAudioCallback();
     preparedProject_.swap(candidate);
     projectSampleRate_ = preparedProject_->specification.projectSampleRate;
     masterMix_ = preparedProject_->specification.masterMix;
     configureRealtimeEngine();
+    if (preserveTransport)
+        realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
     modelCommit.execute();
     if (callbackWasRegistered) {
         try {
-            attachAudioCallback();
+            attachAudioCallback(preserveTransport);
         } catch (...) {
             realtimeEngine_.deviceError();
             pendingLifecycleEvent_.store(PendingLifecycleEvent::error,

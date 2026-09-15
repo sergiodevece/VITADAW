@@ -322,7 +322,7 @@ void managerTests() {
         timeline::SampleRate{44100}, media::AudioChannelLayout::mono);
     const auto before = *model.findClip(imported.clip);
     auto after = before; after.projectStart = {10};
-    history::UndoableOperation move{history::MoveClip{track,before,after}};
+    history::UndoableOperation move{history::MoveClip{track,track,before,after}};
     auto diverged = model;
     check(bool(diverged.moveClip(imported.clip,{20})), "diverge test model");
     const auto expected = *diverged.findClip(imported.clip);
@@ -354,6 +354,14 @@ void managerTests() {
     check(small.size()==2 && small.memoryBytes()<=2*sizeof(history::HistoryEntry), "byte budget evicts independently");
     history::UndoManager tooSmall{{512,sizeof(history::HistoryEntry)-1}};
     check(!tooSmall.stage(move) && !tooSmall.canUndo(), "oversize payload rejected before commit");
+    const auto trackState = model.captureTrackHistoryState(track);
+    check(trackState.has_value(), "track history snapshot exists");
+    history::UndoableOperation addTrack{history::AddAudioTrack{
+        std::make_shared<const project::ProjectState::TrackHistoryState>(*trackState)}};
+    history::UndoManager payloadTooSmall{{512, sizeof(history::HistoryEntry)}};
+    check(!payloadTooSmall.stage(std::move(addTrack)) &&
+              !payloadTooSmall.canUndo(),
+          "variable track payload is rejected before model/plan commit");
 }
 } // namespace
 

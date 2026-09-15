@@ -54,6 +54,7 @@ struct AudioBus {
 struct TrackRoute {
     tracks::TrackId track;
     OutputDestination destination;
+    bool operator==(const TrackRoute&) const = default;
 };
 
 struct SendId {
@@ -81,6 +82,7 @@ struct SendRoute {
     BusId destination;
     SendTapPoint tapPoint{SendTapPoint::postFaderPostPan};
     mixer::SendMixState mix;
+    bool operator==(const SendRoute&) const = default;
 };
 
 class RoutingState {

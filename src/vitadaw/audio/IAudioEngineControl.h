@@ -157,6 +157,13 @@ public:
     [[nodiscard]] virtual bool commitPreparedProcessingPlan(
         PreparedProcessingPlanChangePtr prepared,
         AudioFileCommitAction modelCommit) noexcept = 0;
+    // Structural timeline/track edits may preserve a stopped/paused checkpoint.
+    // Import and project replacement retain their explicit transport semantics.
+    [[nodiscard]] virtual bool commitPreparedProcessingPlanPreservingTransport(
+        PreparedProcessingPlanChangePtr prepared,
+        AudioFileCommitAction modelCommit) noexcept {
+        return commitPreparedProcessingPlan(std::move(prepared), modelCommit);
+    }
     [[nodiscard]] virtual TemporalContextPreparationResult prepareTemporalContext(
         const musical::MusicalTimeMap& map,
         std::optional<musical::MusicalLoopRange> loop,

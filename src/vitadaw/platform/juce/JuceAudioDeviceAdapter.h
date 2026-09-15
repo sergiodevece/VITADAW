@@ -52,6 +52,9 @@ public:
     [[nodiscard]] bool commitPreparedProcessingPlan(
         audio::PreparedProcessingPlanChangePtr prepared,
         audio::AudioFileCommitAction modelCommit) noexcept override;
+    [[nodiscard]] bool commitPreparedProcessingPlanPreservingTransport(
+        audio::PreparedProcessingPlanChangePtr prepared,
+        audio::AudioFileCommitAction modelCommit) noexcept override;
     [[nodiscard]] audio::TemporalContextPreparationResult prepareTemporalContext(
         const musical::MusicalTimeMap&,
         std::optional<musical::MusicalLoopRange>,
@@ -127,7 +130,8 @@ private:
     [[nodiscard]] bool reprepareTemporalForCurrentDevice(std::string& errorMessage);
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
-        audio::AudioFileCommitAction modelCommit) noexcept;
+        audio::AudioFileCommitAction modelCommit,
+        bool preserveTransport = false) noexcept;
     [[nodiscard]] std::size_t preparedBytes() const noexcept;
 
     juce::AudioDeviceManager deviceManager_;

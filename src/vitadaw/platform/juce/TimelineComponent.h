@@ -26,9 +26,13 @@ public:
     void mouseWheelMove(const juce::MouseEvent&,
                         const juce::MouseWheelDetails&) override;
     bool keyPressed(const juce::KeyPress&) override;
+    [[nodiscard]] std::optional<tracks::TrackId> selectedTrackId() const noexcept {
+        return interaction_.selectedTrack();
+    }
 
 private:
-    struct Hit { const ui::timeline::ClipSnapshot* clip{};
+    struct Hit { const ui::timeline::TrackSnapshot* track{};
+                 const ui::timeline::ClipSnapshot* clip{};
                  ui::timeline::GestureKind kind{ui::timeline::GestureKind::none}; };
     static constexpr int headerWidth = 144;
     static constexpr int toolbarHeight = 34;

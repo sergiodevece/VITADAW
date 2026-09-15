@@ -29,6 +29,10 @@ const char* clipEditError(project::ProjectState::ClipEditStatus status) noexcept
         return "Edit exceeds source bounds";
     case Status::capacityExceeded:
         return "Clip capacity exceeded";
+    case Status::trackNotFound:
+        return "Target track not found";
+    case Status::layoutMismatch:
+        return "Clip and target track layouts do not match";
     case Status::success:
         return "";
     }
@@ -50,6 +54,10 @@ commands::CommandError clipCommandError(
         return Error::sourceBoundsExceeded;
     case Edit::capacityExceeded:
         return Error::capacityExceeded;
+    case Edit::trackNotFound:
+        return Error::trackNotFound;
+    case Edit::layoutMismatch:
+        return Error::layoutMismatch;
     case Edit::success:
         return Error::none;
     }
@@ -134,6 +142,51 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 return persistenceCommand(command);
             } else if constexpr (std::is_same_v<T, Undo> || std::is_same_v<T, Redo>) {
                 return traverseHistory(std::is_same_v<T, Redo>);
+            } else if constexpr (std::is_same_v<T, AddAudioTrack> ||
+                                 std::is_same_v<T, DeleteAudioTrack>) {
+                if (transport_.playback != transport::PlaybackState::stopped)
+                    return {CommandStatus::rejected, "Stop before changing tracks",
+                            CommandError::transportMustBeStopped};
+                if (!session_.history.canCreateState())
+                    return {CommandStatus::rejected, "History token capacity exceeded",
+                            CommandError::historyCapacityExceeded};
+                auto candidate = session_.project;
+                std::optional<project::ProjectState::TrackHistoryState> state;
+                if constexpr (std::is_same_v<T, AddAudioTrack>) {
+                    if (candidate.tracks().size() >= project::ProjectState::maximumTracks)
+                        return {CommandStatus::rejected, "Audio track capacity exceeded",
+                                CommandError::capacityExceeded};
+                    if (value.layout != media::AudioChannelLayout::mono &&
+                        value.layout != media::AudioChannelLayout::stereo)
+                        return {CommandStatus::rejected, "Invalid audio track layout",
+                                CommandError::layoutMismatch};
+                    const auto id = candidate.addAudioTrack(value.name, value.layout);
+                    state = candidate.captureTrackHistoryState(id);
+                } else {
+                    if (session_.project.findTrack(value.track) == nullptr)
+                        return {CommandStatus::rejected, "Audio track not found",
+                                CommandError::trackNotFound};
+                    state = candidate.removeAudioTrack(value.track);
+                }
+                if (!state)
+                    return {CommandStatus::rejected, "Track operation could not be staged",
+                            CommandError::preparationFailed};
+                auto owned = std::make_shared<const project::ProjectState::TrackHistoryState>(
+                    std::move(*state));
+                history::UndoableOperation operation;
+                if constexpr (std::is_same_v<T, AddAudioTrack>)
+                    operation.payload = history::AddAudioTrack{std::move(owned)};
+                else
+                    operation.payload = history::DeleteAudioTrack{std::move(owned)};
+                auto pending = session_.history.stage(std::move(operation));
+                if (!pending)
+                    return {CommandStatus::rejected, "History capacity exceeded",
+                            CommandError::historyCapacityExceeded};
+                return commitStructuralProject(
+                    std::move(candidate),
+                    std::is_same_v<T, AddAudioTrack> ? "Audio track added"
+                                                     : "Audio track deleted",
+                    &*pending);
             } else if constexpr (std::is_same_v<T, MoveClip> ||
                                  std::is_same_v<T, DuplicateClip> ||
                                  std::is_same_v<T, SplitClip> ||
@@ -147,15 +200,22 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 if (!original)
                     return {CommandStatus::rejected, "Clip not found", CommandError::clipNotFound};
                 const auto before = *original;
-                tracks::TrackId trackId;
-                for (const auto& track : session_.project.tracks())
-                    for (const auto& clip : track.clips)
-                        if (clip.id == value.clip) trackId = track.id;
+                const auto trackId = session_.project.trackContainingClip(value.clip);
+                tracks::TrackId targetTrack = trackId;
+                if constexpr (std::is_same_v<T, MoveClip>) {
+                    if (value.targetTrack.isValid()) targetTrack = value.targetTrack;
+                    if (targetTrack != trackId &&
+                        transport_.playback != transport::PlaybackState::stopped)
+                        return {CommandStatus::rejected,
+                                "Stop before moving a clip between tracks",
+                                CommandError::transportMustBeStopped};
+                }
                 auto candidate = session_.project;
                 project::ProjectState::ClipEditResult edit;
                 history::UndoableOperation operation;
                 if constexpr (std::is_same_v<T, MoveClip>)
-                    edit = candidate.moveClip(value.clip, value.projectStart);
+                    edit = candidate.moveClip(value.clip, targetTrack,
+                                              value.projectStart);
                 else if constexpr (std::is_same_v<T, DuplicateClip>)
                     edit = candidate.duplicateClip(value.clip, value.projectStart);
                 else if constexpr (std::is_same_v<T, SplitClip>)
@@ -177,9 +237,11 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     operation.payload = history::DeleteClip{trackId, before};
                 else {
                     const auto after = *candidate.findClip(value.clip);
-                    if (before == after) return {CommandStatus::accepted, "Clip unchanged"};
+                    if (before == after && trackId == targetTrack)
+                        return {CommandStatus::accepted, "Clip unchanged"};
                     if constexpr (std::is_same_v<T, MoveClip>)
-                        operation.payload = history::MoveClip{trackId, before, after};
+                        operation.payload = history::MoveClip{
+                            trackId, targetTrack, before, after};
                     else if constexpr (std::is_same_v<T, TrimClipLeft>)
                         operation.payload = history::TrimClipLeft{trackId, before, after};
                     else operation.payload = history::TrimClipRight{trackId, before, after};
@@ -243,22 +305,7 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
     return std::visit(
         [this, &parameterSuccess](const auto& value) -> commands::CommandResult {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, commands::AddAudioTrack>) {
-                try {
-                    auto candidate = session_.project;
-                    const auto id = candidate.addAudioTrack(value.name,
-                                                             value.layout);
-                    return commitStructuralProject(
-                        std::move(candidate),
-                        "Added audio track " + std::to_string(id.value));
-                } catch (const std::bad_alloc&) {
-                    return {commands::CommandStatus::rejected,
-                            "Not enough memory to add audio track"};
-                } catch (const std::exception&) {
-                    return {commands::CommandStatus::rejected,
-                            "Audio track could not be added"};
-                }
-            } else if constexpr (std::is_same_v<T, commands::AddBus>) {
+            if constexpr (std::is_same_v<T, commands::AddBus>) {
                 if (transport_.playback == transport::PlaybackState::playing) {
                     return {commands::CommandStatus::rejected,
                             "Routing cannot change during playback"};
@@ -983,15 +1030,18 @@ commands::CommandResult DawApplication::commitStructuralProject(
         audio::PreparedAudibilityState audibility;
         history::UndoManager::PendingAppend* pending;
         int historyDirection;
-    } context{this, &candidate, resolveAudibility(candidate), pending, historyDirection};
+        transport::PlaybackState playback;
+        timeline::ProjectFramePosition position;
+    } context{this, &candidate, resolveAudibility(candidate), pending,
+              historyDirection, transport_.playback, transport_.position};
     const audio::AudioFileCommitAction commit{
         &context,
         [](void* raw) noexcept {
             auto& value = *static_cast<CommitContext*>(raw);
             value.application->session_.project.swap(*value.candidate);
             value.application->audibility_ = value.audibility;
-            value.application->transport_.stopAndRewind();
-            value.application->transport_.setDuration(
+            value.application->transport_.synchronise(
+                value.playback, value.position,
                 value.application->session_.project.duration());
             if (value.pending)
                 value.application->session_.history.commit(std::move(*value.pending));
@@ -1001,7 +1051,7 @@ commands::CommandResult DawApplication::commitStructuralProject(
                 value.application->session_.history.commitUndo();
             else value.application->session_.history.commitBarrier();
         }};
-    if (!audioEngine_.commitPreparedProcessingPlan(
+    if (!audioEngine_.commitPreparedProcessingPlanPreservingTransport(
             std::move(preparation.prepared), commit)) {
         return {commands::CommandStatus::rejected,
                 "Prepared routing could not be committed",

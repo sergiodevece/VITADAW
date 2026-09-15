@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.5.3 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.5.4 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -239,6 +239,12 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_timeline_ui_foundation_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_timeline_ui_foundation_tests
         COMMAND vitadaw_timeline_ui_foundation_tests)
+
+    add_executable(vitadaw_track_operations_tests
+        tests/TrackOperationsTests.cpp)
+    target_link_libraries(vitadaw_track_operations_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_track_operations_tests
+        COMMAND vitadaw_track_operations_tests)
 
     add_executable(vitadaw_application_lifecycle_tests
         tests/ApplicationLifecycleTests.cpp)

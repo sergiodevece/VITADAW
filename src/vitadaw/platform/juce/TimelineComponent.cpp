@@ -74,15 +74,25 @@ juce::Rectangle<float> TimelineComponent::clipBounds(
     std::size_t trackIndex, const ui::timeline::ClipSnapshot& clip) const noexcept {
     auto start = clip.projectStart;
     auto duration = clip.duration;
+    auto displayTrackIndex = trackIndex;
     if (interaction_.preview() && interaction_.preview()->id == clip.id) {
         start = interaction_.preview()->projectStart;
         duration = interaction_.preview()->duration;
+        const auto target = std::find_if(
+            snapshot_.tracks.begin(), snapshot_.tracks.end(),
+            [&](const auto& lane) {
+                return lane.id == interaction_.preview()->track;
+            });
+        if (target != snapshot_.tracks.end()) {
+            displayTrackIndex = static_cast<std::size_t>(
+                target - snapshot_.tracks.begin());
+        }
     }
     const auto left = static_cast<float>(headerWidth + transform_.projectFrameToX(start));
     const auto right = static_cast<float>(headerWidth + transform_.preciseProjectFrameToX(
         static_cast<double>(start.value) + duration.value));
     const auto top = static_cast<float>(toolbarHeight + rulerHeight +
-        static_cast<double>(trackIndex * laneHeight) - verticalOffset_ + 7.0);
+        static_cast<double>(displayTrackIndex * laneHeight) - verticalOffset_ + 7.0);
     return {left, top, std::max(1.0F, right - left), static_cast<float>(laneHeight - 14)};
 }
 
@@ -100,9 +110,11 @@ TimelineComponent::Hit TimelineComponent::timelineHitTest(juce::Point<float> poi
         const auto bounds = clipBounds(track, *i);
         if (!bounds.intersects(viewport) || !bounds.contains(point)) continue;
         constexpr float handle = 7.0F;
-        if (point.x <= bounds.getX() + handle) return {&*i, GestureKind::trimLeft};
-        if (point.x >= bounds.getRight() - handle) return {&*i, GestureKind::trimRight};
-        return {&*i, GestureKind::move};
+        if (point.x <= bounds.getX() + handle)
+            return {&snapshot_.tracks[track], &*i, GestureKind::trimLeft};
+        if (point.x >= bounds.getRight() - handle)
+            return {&snapshot_.tracks[track], &*i, GestureKind::trimRight};
+        return {&snapshot_.tracks[track], &*i, GestureKind::move};
     }
     return {};
 }
@@ -220,6 +232,11 @@ void TimelineComponent::paint(juce::Graphics& g) {
         if (y + laneHeight < viewport.getY() || y > viewport.getBottom()) continue;
         g.setColour(track % 2 == 0 ? juce::Colour{0xff252a31} : juce::Colour{0xff21262c});
         g.fillRect(0, y, getWidth() - scrollBarThickness, laneHeight);
+        if (interaction_.selectedTrack() &&
+            *interaction_.selectedTrack() == snapshot_.tracks[track].id) {
+            g.setColour(juce::Colour{0x303f8fd2});
+            g.fillRect(0, y, headerWidth, laneHeight);
+        }
         g.setColour(juce::Colour{0xff343b45});
         g.drawHorizontalLine(y + laneHeight - 1, 0.0F, static_cast<float>(getWidth()));
         g.setColour(juce::Colours::white.withAlpha(0.88F));
@@ -231,7 +248,11 @@ void TimelineComponent::paint(juce::Graphics& g) {
             const auto bounds = clipBounds(track, clip);
             if (!bounds.intersects(viewport.toFloat())) continue; // linear ordered culling, no component tree
             const auto selected = interaction_.selection() && *interaction_.selection() == clip.id;
-            g.setColour(selected ? juce::Colour{0xffe5a84b} : juce::Colour{0xff4c87b9});
+            const auto invalidPreview = interaction_.preview() &&
+                interaction_.preview()->id == clip.id &&
+                !interaction_.preview()->validTarget;
+            g.setColour(invalidPreview ? juce::Colour{0xffb94b4b} :
+                        selected ? juce::Colour{0xffe5a84b} : juce::Colour{0xff4c87b9});
             g.fillRoundedRectangle(bounds, 4.0F);
             g.setColour(selected ? juce::Colours::white : juce::Colours::white.withAlpha(0.82F));
             g.drawRoundedRectangle(bounds, 4.0F, selected ? 2.0F : 1.0F);
@@ -329,21 +350,44 @@ void TimelineComponent::mouseDown(const juce::MouseEvent& event) {
     }
     const auto hit = timelineHitTest(event.position);
     if (!hit.clip) {
-        interaction_.select({});
+        const auto track = ui::timeline::TimelineInteraction::trackAtVerticalPosition(
+            snapshot_, event.position.y, toolbarHeight + rulerHeight,
+            laneHeight, verticalOffset_);
+        if (track && event.position.x < headerWidth)
+            interaction_.selectTrack(track);
+        else
+            interaction_.selectTrack({});
         repaint();
         return;
     }
-    interaction_.select(hit.clip->id);
-    static_cast<void>(interaction_.beginGesture(hit.kind, *hit.clip,
+    interaction_.selectClip(hit.track->id, hit.clip->id);
+    static_cast<void>(interaction_.beginGesture(hit.kind, *hit.track, *hit.clip,
                                                 event.position.x - headerWidth));
     repaint();
 }
 void TimelineComponent::mouseDrag(const juce::MouseEvent& event) {
     if (transport_.playback == transport::PlaybackState::playing) return;
-    interaction_.updateGesture(event.position.x - headerWidth, transform_);
+    const auto target = ui::timeline::TimelineInteraction::trackAtVerticalPosition(
+        snapshot_, event.position.y, toolbarHeight + rulerHeight,
+        laneHeight, verticalOffset_);
+    interaction_.updateGesture(event.position.x - headerWidth, transform_,
+                               snapshot_, target);
     repaint();
 }
 void TimelineComponent::mouseUp(const juce::MouseEvent&) {
+    if (interaction_.preview() && !interaction_.preview()->validTarget) {
+        const auto hasTarget = interaction_.preview()->track.isValid();
+        interaction_.cancelGesture();
+        repaint();
+        if (commandCompleted)
+            commandCompleted({commands::CommandStatus::rejected,
+                              hasTarget
+                                  ? "Clip and target track layouts do not match"
+                                  : "Drop the clip on an audio track",
+                              hasTarget ? commands::CommandError::layoutMismatch
+                                        : commands::CommandError::noTargetTrack});
+        return;
+    }
     dispatch(interaction_.endGesture());
 }
 void TimelineComponent::mouseWheelMove(const juce::MouseEvent& event,
