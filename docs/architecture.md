@@ -124,7 +124,7 @@ El módulo `timeline` evita valores numéricos sin unidad mediante:
 - `Seconds` y `SampleRate` para conversiones explícitas.
 
 La duración de un clip se convierte una sola vez de frames fuente a frames de
-proyecto. Desde el candidato 0.6.0 la posición autoritativa del transporte es
+proyecto. Desde 0.6.0 la posición autoritativa del transporte es
 siempre un `ProjectFramePosition` entero. Un residuo fraccionario acotado existe
 como estado del reloj RT para convertir device frames a project frames; el render
 recibe una copia efímera para conversiones locales. No se publica a la UI ni
@@ -244,7 +244,7 @@ device frame
 
 No existe un cursor por pista. Todas las posiciones se recalculan desde la misma
 posición global, por lo que el número de pistas no introduce deriva relativa. El
-reloj del candidato 0.6.0 conserva un resto racional exacto preparado si dispositivo
+reloj de 0.6.0 conserva un resto racional exacto preparado si dispositivo
 y proyecto difieren de sample rate. La duración global es el máximo `clip start + clip duration` de todas las
 pistas preparadas.
 
@@ -1624,7 +1624,7 @@ pero compila `PreparedProcessingPlan` y ejecuta colas, reloj, mezcla, snapshots 
 `RealtimeAudioEngine::processBlock` de producción. Los dobles se limitan a
 decodificación y filesystem deterministas.
 
-## Transport & Timeline Foundation 0.6.0 (candidato)
+## Transport & Timeline Foundation 0.6.0
 
 ### Autoridad y dominio navegable
 
@@ -1642,7 +1642,7 @@ persistente. El dominio actual termina provisionalmente en
 No es la definición conceptual del timeline. Las búsquedas RT de clips utilizan
 inicios y finales exclusivos enteros conservadores, no sumas absolutas double.
 
-### Representación exacta preparada (candidato, sin versionar)
+### Representación exacta preparada
 
 `TemporalInteger.h` proporciona palabras fijas UInt128 y UInt256, carry/borrow,
 shifts, los productos necesarios y divmod. El backend portable usa productos
@@ -1868,7 +1868,7 @@ políticas anteriores; no se introduce una colección de causas ni otra API de i
     historial, persistencia, fronteras de bloque y escala sobre processBlock
     real, sin añadir funciones ni cambiar la matriz de comportamiento.
 
-30. **Candidato 0.6.0:** autoridad entera de project frame, dominio navegable
+30. **Completado en 0.6.0:** autoridad entera de project frame, dominio navegable
     independiente del contenido, proyección linealizada de transporte y
     discontinuidad Seek explícita sin reset universal.
 

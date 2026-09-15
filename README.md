@@ -1,4 +1,4 @@
-# VitaDAW 0.5.6 — Editing & Transport Hardening
+# VitaDAW 0.6.0 — Transport & Timeline Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -187,14 +187,14 @@ y corrigió una discrepancia de tolerancia entre `ProjectState` y la preparació
 del plan para duraciones 44,1↔48 kHz; no se modificó el callback ni el render.
 Detalles: [`docs/validation-0.5.6.md`](docs/validation-0.5.6.md).
 
-El candidato VitaDAW 0.6.0 refuerza los fundamentos temporales sin cambiar aún
-la versión publicada 0.5.6. `ProjectFramePosition` entero es la única posición
+VitaDAW 0.6.0 refuerza los fundamentos temporales. `ProjectFramePosition`
+entero es la única posición
 autoritativa; los segundos son solo presentación y el residuo fraccionario del
 reloj queda confinado a la conversión device/project. La duración describe el
 contenido, no el dominio navegable: un Seek detenido o pausado puede situarse
 después del último clip sin crear contenido. El límite técnico provisional es
-`maximumSupportedProjectFrame()` (2^53−1), encapsulado por depender de rutas DSP
-que todavía usan `double`.
+`maximumSupportedProjectFrame()` (2^53−1), encapsulado como límite del dominio
+numérico certificado actual y no como definición conceptual del timeline.
 
 Play, Pause, Stop y Seek se proyectan mediante un reductor portable siguiendo el
 orden de comandos realmente aceptados por el motor. Así dos Stop pendientes
@@ -227,10 +227,13 @@ discretas de audio. Las configuraciones cuya integral o integración con el relo
 exceda la capacidad fija 128/256 se rechazan transaccionalmente, sin aproximación.
 El reloj base admite un denominador de hasta 125 bits y el extendido musical
 hasta 128, sujeto a certificación conjunta. El adaptador JUCE prepara plan,
-contexto y checkpoint antes de reemplazarlos; retira las referencias del motor
+contexto y checkpoint antes de reemplazarlos; el checkpoint conserva
+explícitamente la política efectiva `runUntilStop`, sin inferirla de los flags
+visibles de loop o metrónomo. El adaptador retira las referencias del motor
 antes de destruir sus propietarios. Un rechazo conserva el estado DSP anterior,
 aunque el dispositivo físico puede quedar indisponible. La validación incluye
-un harness JUCE sin hardware para bootstrap, lifetime, checkpoint y reprepare;
+un harness JUCE sin hardware para bootstrap, lifetime, checkpoint, reprepare y
+rollback de `runUntilStop`;
 no equivale a un smoke acústico ni a un benchmark RT profesional.
 Detalles: [`docs/validation-0.6.0.md`](docs/validation-0.6.0.md).
 
@@ -624,9 +627,10 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.6 — Editing & Transport Hardening:** matriz de transporte y edición,
   loops y límites de bloque, historial/persistencia bajo secuencias largas,
   escala combinada y validación coherente del round-trip 44,1↔48 kHz.
-- **0.6.0 — Transport & Timeline Foundation (candidato):** posición entera
+- **0.6.0 — Transport & Timeline Foundation:** posición entera
   autoritativa, dominio navegable separado del contenido, reducción sobre el
-  orden aceptado y discontinuidad Seek explícita sin reset universal.
+  orden aceptado, discontinuidad Seek explícita sin reset universal y preparación
+  temporal/musical exacta con rollback íntegro del checkpoint.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y

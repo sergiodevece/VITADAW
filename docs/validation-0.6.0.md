@@ -1,10 +1,13 @@
-# VitaDAW 0.6.0 — Transport & Timeline Foundation (candidato corregido)
+# VitaDAW 0.6.0 — Transport & Timeline Foundation
 
 ## Estado
 
-CMake, writerAppVersion y getApplicationVersion permanecen en 0.5.6.
-No se ha realizado commit, tag ni push. Este informe no sustituye la nueva
-auditoría del candidato.
+CMake, writerAppVersion y getApplicationVersion identifican la versión 0.6.0.
+Estos ajustes de cierre permanecen sin commit. Durante la validación se observó
+que `HEAD` ya apuntaba externamente a `c010530`, con el tag
+`v0.6.0-transport-timeline-foundation`; esta tarea no ha creado commits, tags ni
+pushes. El estado ha superado la auditoría de cierre y la validación final
+registrada en este documento.
 
 ## Correcciones y contrato
 
@@ -274,16 +277,16 @@ productor/lector únicos, lifecycle quiescente y publicación preasignada. No ha
 allocations, locks, I/O, ownership nuevo ni bucles de reintento nuevos en RT;
 la conversión añade trabajo aritmético constante por muestra.
 
-Dictamen de implementación: apto para una nueva auditoría de los tres hallazgos,
-no una autorización de versionado. CMake/writerAppVersion/getApplicationVersion
-siguen en 0.5.6 y HEAD continúa en 4df6f98e2b6b4575447cb11a2b1ece19fe3e14f6.
+En esa fase intermedia, el dictamen era apto para una nueva auditoría de los tres
+hallazgos, no una autorización de versionado. Los identificadores seguían en
+0.5.6 y HEAD continuaba en 4df6f98e2b6b4575447cb11a2b1ece19fe3e14f6.
 
 Archivos tocados en esta corrección: RealtimeAudioEngine.cpp/.h,
 RealtimeProjectClock.h, DspFramePosition.h, TrackRenderer.h,
 TransportTimelineFoundationTests.cpp, README.md, architecture.md y este documento.
 Los demás cambios del working tree pertenecen al candidato anterior.
 
-## Estado actual: migración numérica 128/256 (sin cierre ni versionado)
+## Estado durante la migración numérica 128/256
 
 Esta sección sustituye los dictámenes históricos anteriores. La migración está
 implementada en reloj/render, pero **no está completa respecto al contrato de
@@ -441,13 +444,13 @@ fallo de inicialización descrito y pasa tras la corrección localizada.
 
 `git diff --check` limpio. HEAD permanece en
 4df6f98e2b6b4575447cb11a2b1ece19fe3e14f6, tag
-v0.5.6-editing-transport-hardening. CMake, writerAppVersion y
-getApplicationVersion permanecen en 0.5.6. No se hizo commit, tag ni push.
+v0.5.6-editing-transport-hardening. En esa ejecución, CMake, writerAppVersion y
+getApplicationVersion permanecían en 0.5.6. No se hizo commit, tag ni push.
 No se realizó smoke acústico; este trabajo valida preparación y decisiones
 discretas con render offline/hardware-free. Los tiempos sanitizados no son un
 benchmark RT profesional.
 
-## Corrección localizada posterior a la auditoría final (sin versionar)
+## Corrección localizada posterior a la auditoría final
 
 ### Reproducciones antes de corregir
 
@@ -544,11 +547,11 @@ profesional y un smoke con dispositivo físico; no se infieren de los sanitizers
 
 | Configuración | Resultado |
 | --- | --- |
-| Build completo Debug, aplicación y JUCE | 43/43 (21,94 s) |
-| Build core-only Debug | 37/37 |
-| ASan + UBSan core-only | 37/37 (120,83 s), sin diagnósticos sanitizer |
-| UBSan core-only | 37/37 (98,10 s), sin diagnósticos sanitizer |
-| TSan core-only | 37/37 (181,18 s), sin diagnósticos sanitizer |
+| Build completo Debug, aplicación y JUCE | 43/43 (25,47 s) |
+| Build core-only Debug | 37/37 (24,44 s) |
+| ASan + UBSan core-only | 37/37 (115,98 s), sin diagnósticos sanitizer |
+| UBSan core-only | 37/37 (93,74 s), sin diagnósticos sanitizer |
+| TSan core-only | 37/37 (170,58 s), sin diagnósticos sanitizer |
 | ASan + UBSan integración JUCE | 6/6, sin diagnósticos sanitizer |
 | Oráculos temporales normal / portable / fast-math | 8688 por binario |
 | Oráculos musicales normal / portable / fast-math | 216 por binario |
@@ -563,9 +566,9 @@ En build-asan-juce se construyeron los targets
 repitieron con `ctest --test-dir build-core -R oracle -V`.
 No se extrapola TSan core-only a los callbacks del driver nativo.
 
-Dictamen de implementación: **APTO PARA VERSIONADO**, no congelado ni
-versionado. HEAD sigue en 4df6f98e2b6b4575447cb11a2b1ece19fe3e14f6 y las tres
-identificaciones de versión permanecen en 0.5.6. No se ha hecho commit/tag/push.
+Dictamen de implementación: **APTO PARA VERSIONADO**. Los ajustes documentales
+y los tres identificadores 0.6.0 permanecen en el working tree sobre `c010530`;
+esta tarea no ha hecho commit, tag ni push.
 
 ## Cierre de la política runUntilStop
 
