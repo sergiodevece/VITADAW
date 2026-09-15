@@ -1,4 +1,6 @@
 #pragma once
+#include "vitadaw/musical/MusicalTime.h"
+#include <type_traits>
 
 #include "vitadaw/tracks/AudioTrack.h"
 #include "vitadaw/routing/RoutingState.h"
@@ -64,6 +66,19 @@ struct TrimClipRight {
 struct DeleteClip { clips::ClipId clip; };
 
 struct Play {};
+struct AddTempoChange { musical::MusicalTickPosition tick; musical::TempoBpm bpm; };
+struct MoveTempoChange { musical::TempoEventId id; musical::MusicalTickPosition tick; };
+struct SetTempo { musical::TempoEventId id; musical::TempoBpm bpm; };
+struct RemoveTempoChange { musical::TempoEventId id; };
+struct AddTimeSignatureChange { musical::BarIndex bar; musical::TimeSignature signature; };
+struct MoveTimeSignatureChange { musical::TimeSignatureEventId id; musical::BarIndex bar; };
+struct SetTimeSignature { musical::TimeSignatureEventId id; musical::TimeSignature signature; };
+struct RemoveTimeSignatureChange { musical::TimeSignatureEventId id; };
+template<class T> inline constexpr bool isMusicalCommand =
+    std::is_same_v<T, AddTempoChange> || std::is_same_v<T, MoveTempoChange> ||
+    std::is_same_v<T, SetTempo> || std::is_same_v<T, RemoveTempoChange> ||
+    std::is_same_v<T, AddTimeSignatureChange> || std::is_same_v<T, MoveTimeSignatureChange> ||
+    std::is_same_v<T, SetTimeSignature> || std::is_same_v<T, RemoveTimeSignatureChange>;
 struct Pause {};
 struct Stop {};
 struct SeekToProjectFrame { timeline::ProjectFramePosition position; };
@@ -134,6 +149,8 @@ using Command = std::variant<AddAudioTrack, AddBus, LoadAudioFile,
                              ImportAudioToTrack, AddClip, RemoveClip,
                              RemoveSource, MoveClip, DuplicateClip, SplitClip,
                              TrimClipLeft, TrimClipRight, DeleteClip,
+                             AddTempoChange, MoveTempoChange, SetTempo, RemoveTempoChange,
+                             AddTimeSignatureChange, MoveTimeSignatureChange, SetTimeSignature, RemoveTimeSignatureChange,
                              Play, Pause, Stop, SeekToProjectFrame, GoToStart,
                              GoToEnd, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
                              SetTrackGain, SetTrackPan, SetTrackMute,

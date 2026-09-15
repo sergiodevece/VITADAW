@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.5.1 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.5.2 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -17,6 +17,8 @@ option(VITADAW_FETCH_JUCE "Download the pinned JUCE version when it is not insta
 add_library(vitadaw_core
     src/vitadaw/application/DawApplication.cpp
     src/vitadaw/application/ProjectPersistenceCommands.cpp
+    src/vitadaw/application/MusicalTimeCommands.cpp
+    src/vitadaw/musical/MusicalTime.cpp
     src/vitadaw/audio/AudioDeviceState.cpp
     src/vitadaw/audio/PreparedProcessingPlan.cpp
     src/vitadaw/audio/RealtimeAudioEngine.cpp
@@ -99,9 +101,12 @@ if(VITADAW_BUILD_APP)
 endif()
 
 if(VITADAW_BUILD_TESTS)
+    add_executable(vitadaw_musical_time_tests tests/MusicalTimeTests.cpp)
+    target_link_libraries(vitadaw_musical_time_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_musical_time_tests COMMAND vitadaw_musical_time_tests)
     enable_testing()
     add_executable(vitadaw_project_persistence_tests tests/ProjectPersistenceTests.cpp)
-    target_link_libraries(vitadaw_project_persistence_tests PRIVATE vitadaw_core)
+    target_link_libraries(vitadaw_project_persistence_tests PRIVATE vitadaw_core nlohmann_json::nlohmann_json)
     target_compile_definitions(vitadaw_project_persistence_tests PRIVATE
         VITADAW_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/persistence")
     add_test(NAME vitadaw_project_persistence_tests COMMAND vitadaw_project_persistence_tests)

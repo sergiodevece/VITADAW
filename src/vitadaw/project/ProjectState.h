@@ -4,6 +4,7 @@
 #include "vitadaw/media/AudioSource.h"
 #include "vitadaw/routing/RoutingState.h"
 #include "vitadaw/processors/InsertTarget.h"
+#include "vitadaw/musical/MusicalTime.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -38,6 +39,7 @@ public:
         processors::ProcessorInstanceId nextProcessorId{1};
         mixer::MasterMixState masterMix;
         processors::InsertChain masterInserts;
+        musical::MusicalTimeMap musicalTime;
     };
     [[nodiscard]] DocumentData documentData() const;
     // Validates a complete detached model. IDs/counters are adopted, never generated.
@@ -163,9 +165,11 @@ public:
     [[nodiscard]] bool removeSource(media::SourceId source) noexcept;
     [[nodiscard]] timeline::ProjectFrameCount projectContentDuration() const noexcept;
     void swap(ProjectState& other) noexcept;
-
+    [[nodiscard]] const musical::MusicalTimeMap& musicalTime() const noexcept { return musicalTime_; }
 private:
     friend class history::UndoableOperation;
+    // Candidate mutation is restricted to history; active publication is a swap.
+    void setMusicalTime(musical::MusicalTimeMap map) noexcept { musicalTime_ = std::move(map); }
     [[nodiscard]] bool restoreHistoryClip(tracks::TrackId track,
                                           const clips::AudioClip& clip);
     [[nodiscard]] bool replaceHistoryClip(tracks::TrackId track,
@@ -187,6 +191,7 @@ private:
     void sortTrackClips(tracks::AudioTrack& track) noexcept;
 
     ProjectSettings settings_;
+    musical::MusicalTimeMap musicalTime_;
     std::vector<tracks::AudioTrack> tracks_;
     std::vector<media::AudioSource> sources_;
     routing::RoutingState routing_;

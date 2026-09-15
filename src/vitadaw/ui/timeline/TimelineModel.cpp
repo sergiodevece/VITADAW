@@ -21,7 +21,7 @@ TimelineSnapshot makeTimelineSnapshot(const project::ProjectState& project,
                                       std::uint64_t revision,
                                       const transport::TransportState& transport) {
     TimelineSnapshot result{project.sampleRate(), project.projectContentDuration(),
-                            transport.position, transport.playback, revision, {}};
+                            transport.position, transport.playback, revision, {}, 0, {}};
     result.tracks.reserve(project.tracks().size());
     for (const auto& track : project.tracks()) {
         TrackSnapshot lane{track.id, track.name, {}};

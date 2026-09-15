@@ -11,6 +11,7 @@
 #include <map>
 #include <new>
 #include <unistd.h>
+#include <nlohmann/json.hpp>
 
 namespace {
 using namespace vitadaw;
@@ -119,6 +120,8 @@ public:
     bool tryUpdateMasterMix(mixer::PreparedMasterMixState m) noexcept override { return rt.tryUpdateMasterMix(m); }
     audio::AudioControlRequestResult tryRequestPlay() noexcept override { return rt.tryRequestPlay(); }
     audio::AudioControlRequestResult tryRequestStop() noexcept override { return rt.tryRequestStop(); }
+    audio::AudioControlRequestResult tryRequestSeek(timeline::ProjectFramePosition p) noexcept override { return rt.tryRequestSeek(p); }
+    audio::AudioControlRequestResult tryRequestPause() noexcept override { return rt.tryRequestPause(); }
     audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override { return rt.transportSnapshot(); }
     mixer::MeterSnapshot meterSnapshot() const noexcept override { return rt.meterSnapshot(); }
     float render() {
@@ -183,9 +186,9 @@ void codecTests() {
     };
     reject(original.substr(0, original.size()/2), PersistenceCode::parseError);
     reject(changed(original,"VitaDAWProject","WrongProject"), PersistenceCode::schemaValidationFailed);
-    reject(changed(original,"\"schemaVersion\": 1","\"schemaVersion\": 2"), PersistenceCode::unsupportedSchema);
-    reject(changed(original,"\"schemaVersion\": 1","\"schemaVersion\": 1,\"schemaVersion\":1"), PersistenceCode::schemaValidationFailed);
-    reject(changed(original,"\"schemaVersion\": 1","\"schemaVersion\": 1,\"futureField\":true"), PersistenceCode::schemaValidationFailed);
+    reject(changed(original,"\"schemaVersion\": 2","\"schemaVersion\": 3"), PersistenceCode::unsupportedSchema);
+    reject(changed(original,"\"schemaVersion\": 2","\"schemaVersion\": 2,\"schemaVersion\":2"), PersistenceCode::schemaValidationFailed);
+    reject(changed(original,"\"schemaVersion\": 2","\"schemaVersion\": 2,\"futureField\":true"), PersistenceCode::schemaValidationFailed);
     reject(changed(original,"\"id\": \"1\"","\"id\": \"01\""), PersistenceCode::schemaValidationFailed);
     reject(changed(original,"\"id\": \"1\"","\"id\": \"18446744073709551616\""), PersistenceCode::schemaValidationFailed);
     reject(changed(original,"\"clip\": \"11\"","\"clip\": \"1\""), PersistenceCode::semanticValidationFailed);
@@ -212,7 +215,35 @@ void codecTests() {
         std::ifstream file(std::filesystem::path{VITADAW_FIXTURES}/name);
         std::string fixture{std::istreambuf_iterator<char>(file), {}};
         auto r=deserializeProject(fixture);check(r.result.success(), "fixture loads");
-        if(std::string_view(name).starts_with("minimal"))check(encode(*r.project)==fixture, "golden minimal exact bytes");
+        const auto canonical=encode(*r.project);
+        auto roundtrip=deserializeProject(canonical);
+        check(roundtrip.result.success() && encode(*roundtrip.project)==canonical, "migrated v2 canonical bytes");
+        check(r.project->musicalTime()==musical::MusicalTimeMap{}, "v1 migrated musical defaults");
+        const auto legacy=nlohmann::json::parse(fixture), migrated=nlohmann::json::parse(canonical);
+        // Mixer fields were float before migration: compare that exact stored
+        // domain value, not decimal JSON versus its expanded float spelling.
+        auto equivalent=[](auto&& self,const nlohmann::json& a,const nlohmann::json& b)->bool {
+            if(a.is_number()&&b.is_number())return a.get<float>()==b.get<float>();
+            if(a.is_object()&&b.is_object()){
+                if(a.size()!=b.size())return false;
+                for(auto i=a.begin();i!=a.end();++i)if(!b.contains(i.key())||!self(self,i.value(),b.at(i.key())))return false;
+                return true;
+            }
+            if(a.is_array()&&b.is_array()){
+                if(a.size()!=b.size())return false;
+                for(std::size_t i=0;i<a.size();++i)if(!self(self,a[i],b[i]))return false;
+                return true;
+            }
+            return a==b;
+        };
+        for(auto key:{"tracks","buses","sends","routing","master","nextIds","projectSettings"})
+            check(equivalent(equivalent,legacy.at(key),migrated.at(key)),"real v1 fixture audio document unchanged");
+        for(std::size_t i=0;i<legacy["tracks"].size();++i)
+            check(legacy["tracks"][i]["clips"]==migrated["tracks"][i]["clips"],"clip positions durations offsets and IDs exact");
+        check(legacy.at("sources").size()==migrated.at("sources").size(),"v1 source count");
+        for(std::size_t i=0;i<legacy.at("sources").size();++i)
+            for(auto key:{"id","sampleRateHz","frameCount","layout"})
+                check(legacy["sources"][i][key]==migrated["sources"][i][key],"v1 source identities/shape exact");
     }
     for (auto [name, code] : {std::pair{"future-version.vitadaw", PersistenceCode::unsupportedSchema},
         {"invalid-duplicate-key.vitadaw", PersistenceCode::schemaValidationFailed},
@@ -287,6 +318,82 @@ void sessionTests() {
         "reconnect failure after commit keeps loaded document clean and stopped");
 }
 
+void musicalTransactions() {
+    using namespace commands;
+    Files f; f.content["/session/media/a.wav"]="A";
+    f.content["/session/a.vitadaw"]=encode(complex());
+    auto legacyAudio=nlohmann::json::parse(f.content["/session/a.vitadaw"]);
+    legacyAudio.erase("musicalTime");legacyAudio["schemaVersion"]=1;
+    f.content["/session/legacy-a.vitadaw"]=legacyAudio.dump();
+    Engine e{f};application::DawApplication app{e,timeline::SampleRate{48000},f};
+    auto invoke=[&](Command c,bool accepted=true){check((app.handle(c).status==CommandStatus::accepted)==accepted,"musical command result");};
+    invoke(LoadProject{"/session/a.vitadaw"});
+    const auto* plan=e.active.get();const auto duration=app.project().duration();
+    auto process=[&]{e.rt.processBlock({nullptr,0,0},timeline::SampleRate{44100});app.synchroniseTransport();};
+    invoke(SeekToProjectFrame{{123}});process();check(app.transport().position.value==123,"seek before musical edit");
+    invoke(SetTempo{{1},{100}});
+    check(app.transport().position.value==123&&app.project().duration()==duration&&e.active.get()==plan,"musical commit preserves audio frame plan duration");
+    check(app.session().dirty()&&app.musicalTime().revision()==app.musicalRevision(),"dirty revision");
+    invoke(Undo{});check(app.project().musicalTime().tempo.events[0].bpm.value==120&&!app.session().dirty(),"undo initial tempo clean");
+    invoke(Redo{});check(app.project().musicalTime().tempo.events[0].bpm.value==100,"redo tempo");
+    invoke(AddTempoChange{{777},{123.456}});invoke(Undo{});invoke(Redo{});
+    check(app.project().musicalTime().tempo.events.back().id.value==2,"redo same tempo ID");
+    invoke(MoveTempoChange{{2},{999}});invoke(Undo{});check(app.project().musicalTime().tempo.events.back().tick.value==777,"undo move");invoke(Redo{});
+    invoke(RemoveTempoChange{{2}});invoke(Undo{});invoke(Redo{});invoke(AddTempoChange{{1200},{180}});
+    check(app.project().musicalTime().tempo.events.back().id.value==3,"tempo IDs not reused");
+    invoke(SetTimeSignature{{1},{6,8}});invoke(Undo{});invoke(Redo{});
+    invoke(AddTimeSignatureChange{{4},{3,4}});invoke(Undo{});invoke(Redo{});
+    invoke(MoveTimeSignatureChange{{2},{5}});invoke(Undo{});invoke(Redo{});
+    invoke(RemoveTimeSignatureChange{{2}});invoke(Undo{});invoke(Redo{});
+    invoke(AddTimeSignatureChange{{8},{7,8}});
+    check(app.project().musicalTime().signatures.events.back().id.value==3,"signature IDs not reused");
+    const auto bytesBefore=encode(app.project());const auto token=app.history().currentStateToken();const auto revision=app.musicalRevision();
+    for(Command c:{Command{MoveTempoChange{{1},{0}}},Command{RemoveTempoChange{{1}}},
+        Command{MoveTimeSignatureChange{{1},{0}}},Command{RemoveTimeSignatureChange{{1}}},
+        Command{AddTempoChange{{1200},{80}}},Command{SetTempo{{1},{NAN}}},
+        Command{AddTimeSignatureChange{{8},{4,4}}},Command{SetTimeSignature{{1},{3,3}}}})invoke(c,false);
+    check(encode(app.project())==bytesBefore&&app.history().currentStateToken()==token&&app.musicalRevision()==revision,"invalid edit all states unchanged");
+    // Fail every fallible allocation before a real musical commit.
+    unsigned failures=0;bool succeeded=false;
+    for(long n=0;n<2000;++n){
+        failAllocation=n;auto r=app.handle(SetTempo{{1},{123.456}});failAllocation=-1;
+        if(r.status==CommandStatus::accepted){succeeded=true;break;}
+        ++failures;check(encode(app.project())==bytesBefore&&app.musicalRevision()==revision&&app.history().currentStateToken()==token&&e.active.get()==plan,"musical transaction allocation rollback");
+    }
+    check(succeeded&&failures>10,"musical allocation sweep");
+    invoke(Play{});process();invoke(SetTempo{{1},{90}},false);
+    invoke(Pause{});process();invoke(SetTempo{{1},{90}},false);
+    invoke(Stop{});process();
+    // Audio output remains bit-identical through musical edits, real processBlock.
+    invoke(SeekToProjectFrame{{123}});process();
+    const auto after=e.render();app.synchroniseTransport();
+    invoke(LoadProject{"/session/a.vitadaw",true});invoke(SeekToProjectFrame{{123}});process();
+    const auto before=e.render();app.synchroniseTransport();
+    check(before==after,"musical edits do not change rendered audio");
+    invoke(LoadProject{"/session/legacy-a.vitadaw",true});invoke(SeekToProjectFrame{{123}});process();
+    check(e.render()==before,"migrated v1 audio bit-identical through real processBlock");app.synchroniseTransport();
+    const auto saved=encode(app.project());const auto* active=e.active.get();const auto rev=app.musicalRevision();
+    const auto document=nlohmann::json::parse(saved);
+    auto rejectMusical=[&](nlohmann::json j){
+        f.content["/invalid-musical.vitadaw"]=j.dump();invoke(LoadProject{"/invalid-musical.vitadaw",true},false);
+        check(encode(app.project())==saved&&e.active.get()==active&&app.musicalRevision()==rev,"invalid load leaves both maps and audio untouched");
+    };
+    for(auto field:{"tick","id"}){auto j=document;j["musicalTime"]["tempoEvents"][0][field]="18446744073709551615";rejectMusical(j);}
+    for(double bpm:{19.,401.}){auto j=document;j["musicalTime"]["tempoEvents"][0]["bpm"]=bpm;rejectMusical(j);}
+    {auto j=document;j["musicalTime"]["tempoEvents"][0]["curve"]="ramp";rejectMusical(j);}
+    {auto j=document;j["musicalTime"]["tempoEvents"]=nlohmann::json::array();rejectMusical(j);}
+    {auto j=document;j["musicalTime"]["signatureEvents"][0]["denominator"]=3;rejectMusical(j);}
+    {auto j=document;j["musicalTime"]["signatureEvents"][0]["barIndex"]="1";rejectMusical(j);}
+    std::ifstream legacyFile(std::filesystem::path{VITADAW_FIXTURES}/"minimal-project-v1.vitadaw");
+    const std::string legacy{std::istreambuf_iterator<char>{legacyFile},{}};
+    f.content["/legacy.vitadaw"]=legacy;invoke(LoadProject{"/legacy.vitadaw",true});
+    check(!app.session().dirty()&&!app.canUndo()&&app.project().musicalTime()==musical::MusicalTimeMap{},"migrated session clean");
+    invoke(SetTempo{{1},{123.456}});invoke(Undo{});check(!app.session().dirty(),"undo after migration clean");invoke(Redo{});
+    invoke(SaveProjectAs{"/new.vitadaw"});
+    check(f.content["/legacy.vitadaw"]==legacy&&f.content["/new.vitadaw"].find("\"schemaVersion\": 2")!=std::string::npos,"v1 untouched save v2");
+    invoke(LoadProject{"/new.vitadaw"});check(app.musicalTime().tempoAt(timeline::ProjectFramePosition{0}).value.value==123.456,"load prepared musical map");
+}
+
 void nativeFiles() {
 #ifdef __APPLE__
     std::array<char,64> pattern{};std::string prefix="/tmp/vitadaw-persistence-XXXXXX";std::copy(prefix.begin(),prefix.end(),pattern.begin());
@@ -335,4 +442,4 @@ void* operator new(std::size_t bytes) {
 void operator delete(void* p) noexcept {if(realtime&&p)++rtDestructions;std::free(p);}
 void* operator new[](std::size_t n){return ::operator new(n);}
 void operator delete[](void*p)noexcept{::operator delete(p);}
-int main(){codecTests();sessionTests();nativeFiles();allocationRollback();std::cout<<"Project persistence passed\n";}
+int main(){codecTests();sessionTests();musicalTransactions();nativeFiles();allocationRollback();std::cout<<"Project persistence passed\n";}

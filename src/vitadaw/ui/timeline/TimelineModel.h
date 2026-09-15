@@ -33,6 +33,8 @@ struct TimelineSnapshot {
     transport::PlaybackState playback{transport::PlaybackState::stopped};
     std::uint64_t revision{};
     std::vector<TrackSnapshot> tracks;
+    std::uint64_t musicalRevision{};
+    std::optional<musical::MusicalPosition> musicalPosition;
     bool operator==(const TimelineSnapshot&) const = default;
 };
 

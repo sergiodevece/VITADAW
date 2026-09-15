@@ -8,6 +8,7 @@
 #include <new>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -60,7 +61,11 @@ commands::CommandError clipCommandError(
 DawApplication::DawApplication(audio::IAudioEngineControl& audioEngine,
                                timeline::SampleRate projectSampleRate,
                                platform::files::IProjectFileIO& files)
-    : audioEngine_(audioEngine), session_(projectSampleRate), files_(files) {}
+    : audioEngine_(audioEngine), session_(projectSampleRate), files_(files) {
+    auto map = musical::PreparedMusicalTimeMap::compile(session_.project.musicalTime(), projectSampleRate);
+    if (!map) throw std::invalid_argument("Invalid musical time context");
+    musicalTime_ = std::move(map.value);
+}
 
 commands::CommandResult DawApplication::handle(const commands::Command& command) {
     using namespace commands;
@@ -68,7 +73,9 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
     try {
         return std::visit([&](const auto& value) -> CommandResult {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, SaveProject> || std::is_same_v<T, SaveProjectAs> ||
+            if constexpr (commands::isMusicalCommand<T>) {
+                return musicalCommand(command);
+            } else if constexpr (std::is_same_v<T, SaveProject> || std::is_same_v<T, SaveProjectAs> ||
                           std::is_same_v<T, LoadProject>) {
                 return persistenceCommand(command);
             } else if constexpr (std::is_same_v<T, Undo> || std::is_same_v<T, Redo>) {
@@ -161,6 +168,8 @@ commands::CommandResult DawApplication::traverseHistory(bool forward) {
     auto candidate = session_.project;
     if (!entry->operation.apply(candidate, forward))
         return {CommandStatus::rejected, "History entities diverged", CommandError::historyInvalid};
+    if (entry->operation.isMusical())
+        return commitMusicalProject(std::move(candidate), nullptr, forward ? 1 : -1);
     return commitStructuralProject(std::move(candidate), forward ? "Redo committed" : "Undo committed",
                                    nullptr, forward ? 1 : -1);
 }
@@ -1010,9 +1019,13 @@ mixer::MeterSnapshot DawApplication::meterSnapshot() const noexcept {
 }
 
 ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
-    return ui::timeline::makeTimelineSnapshot(session_.project,
+    auto result = ui::timeline::makeTimelineSnapshot(session_.project,
                                                session_.history.revision(),
                                                transport_);
+    result.musicalRevision = musicalRevision_;
+    const auto position = musicalTime_->musicalPositionAt(transport_.position);
+    if (position) result.musicalPosition = position.value;
+    return result;
 }
 
 } // namespace vitadaw::application

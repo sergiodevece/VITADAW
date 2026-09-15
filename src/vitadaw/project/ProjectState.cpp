@@ -828,6 +828,7 @@ timeline::ProjectFrameCount ProjectState::projectContentDuration() const noexcep
 void ProjectState::swap(ProjectState& other) noexcept {
     using std::swap;
     swap(settings_, other.settings_);
+    swap(musicalTime_, other.musicalTime_);
     tracks_.swap(other.tracks_);
     sources_.swap(other.sources_);
     swap(routing_, other.routing_);

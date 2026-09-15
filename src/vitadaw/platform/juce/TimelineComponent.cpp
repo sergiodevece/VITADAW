@@ -30,6 +30,12 @@ TimelineComponent::TimelineComponent(commands::ICommandDispatcher& dispatcher,
     delete_.onClick = [this] { dispatch(interaction_.deleteCommand()); };
     for (auto* button : {&zoomOut_, &zoomIn_, &split_, &duplicate_, &delete_})
         addAndMakeVisible(*button);
+    rulerMode_.addItem("Seconds", 1);
+    rulerMode_.addItem("Frames", 2);
+    rulerMode_.addItem("Bars / Beats", 3);
+    rulerMode_.setSelectedId(1);
+    rulerMode_.onChange = [this] { repaint(); }; // presentation only; never dirty
+    addAndMakeVisible(rulerMode_);
     updateScrollBars();
 }
 
@@ -131,14 +137,42 @@ void TimelineComponent::paint(juce::Graphics& g) {
     const auto first = std::floor(transform_.visibleStartSeconds() / tick) * tick;
     const auto visibleEnd = transform_.visibleStartSeconds() + viewport.getWidth() / pixels;
     g.setFont(juce::FontOptions{11.0F});
-    for (auto seconds = std::max(0.0, first); seconds <= visibleEnd + tick; seconds += tick) {
+    if (rulerMode_.getSelectedId() == 3) {
+        std::array<musical::GridLine, 512> lines;
+        const auto& map = application_.musicalTime(); // UI-thread query; no copied events
+        const auto rate = snapshot_.projectSampleRate.hertz();
+        const auto frame = timeline::ProjectFramePosition{static_cast<std::int64_t>(transform_.visibleStartSeconds() * rate)};
+        const auto bpm = map.tempoAt(frame);
+        const auto signature = map.timeSignatureAt(frame);
+        const auto beatPixels = bpm && signature ? pixels * 60.0 / bpm.value.value * 4 / signature.value.denominator : 0;
+        const musical::GridSubdivision density = beatPixels < 32 ? musical::GridSubdivision{musical::GridKind::bars, 1} :
+            beatPixels < 160 ? musical::GridSubdivision{musical::GridKind::beats, 1} :
+                              musical::GridSubdivision{musical::GridKind::subdivisions, 4};
+        const auto result = map.enumerateGridLines({transform_.visibleStartSeconds() * rate}, {visibleEnd * rate}, density, lines);
+        float lastLabel = -1000;
+        for (std::size_t n = 0; n < result.count; ++n) {
+            const auto& line = lines[n];
+            const auto x = static_cast<float>(headerWidth + transform_.preciseProjectFrameToX(line.frame.value));
+            g.setColour(juce::Colours::white.withAlpha(line.barStart ? 0.35F : 0.12F));
+            g.drawVerticalLine(static_cast<int>(std::round(x)), toolbarHeight + 17.0F,
+                               static_cast<float>(getHeight() - scrollBarThickness));
+            if (x - lastLabel >= 45) {
+                g.setColour(juce::Colours::white.withAlpha(0.75F));
+                g.drawText(juce::String(line.position.bar.value + 1) + "|" + juce::String(line.position.beat.value + 1),
+                    static_cast<int>(x + 3), toolbarHeight, 80, 17, juce::Justification::centredLeft);
+                lastLabel = x;
+            }
+        }
+    } else for (auto seconds = std::max(0.0, first); seconds <= visibleEnd + tick; seconds += tick) {
         const auto x = static_cast<float>(headerWidth +
             (seconds - transform_.visibleStartSeconds()) * pixels);
         g.setColour(juce::Colours::white.withAlpha(0.22F));
         g.drawVerticalLine(static_cast<int>(std::round(x)), static_cast<float>(toolbarHeight + 17),
                            static_cast<float>(getHeight() - scrollBarThickness));
         g.setColour(juce::Colours::white.withAlpha(0.75F));
-        g.drawText(juce::String(seconds, tick < 1.0 ? 1 : 0) + " s",
+        g.drawText(rulerMode_.getSelectedId() == 2 ?
+                   juce::String(static_cast<juce::int64>(std::llround(seconds * snapshot_.projectSampleRate.hertz()))) :
+                   juce::String(seconds, tick < 1.0 ? 1 : 0) + " s",
                    static_cast<int>(x + 3), toolbarHeight, 58, 17,
                    juce::Justification::centredLeft);
     }
@@ -194,6 +228,7 @@ void TimelineComponent::resized() {
     split_.setBounds(toolbar.removeFromLeft(130));
     duplicate_.setBounds(toolbar.removeFromLeft(95));
     delete_.setBounds(toolbar.removeFromLeft(75));
+    rulerMode_.setBounds(toolbar.removeFromLeft(135));
     horizontal_.setBounds(headerWidth, getHeight() - scrollBarThickness,
                           std::max(0, getWidth() - headerWidth - scrollBarThickness), scrollBarThickness);
     vertical_.setBounds(getWidth() - scrollBarThickness, toolbarHeight + rulerHeight,

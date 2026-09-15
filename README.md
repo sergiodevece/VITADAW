@@ -1,4 +1,4 @@
-# VitaDAW 0.5.1 — Seek & Transport Navigation
+# VitaDAW 0.5.2 — Musical Time Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -95,6 +95,23 @@ El proyecto mantiene ahora una escala temporal explícita. Su sample rate se fij
 al crear el proyecto: usa el del dispositivo activo y, si la apertura falla,
 usa `48000 Hz` como valor de reserva. No cambia automáticamente si después se
 reconfigura el dispositivo.
+
+VitaDAW 0.5.2 añade `MusicalTimeMap` portable: PPQ fijo 15360, tempo step
+(20–400 BPM, también fraccional) anclado a ticks y métrica anclada a compases.
+El reloj maestro de project frames sigue siendo la única autoridad: cambiar
+tempo no mueve ni estira clips, no amplía la duración y conserva el playhead.
+Los ocho comandos musicales tienen Undo/Redo y requieren **Stopped** (no Paused).
+La representación preparada es inmutable, se consulta fuera de RT y no se
+reconstruye a cada refresco visual.
+
+El ruler permite Seconds, Frames y Bars / Beats sobre el mismo eje absoluto.
+El transporte muestra además `Bar|Beat|Tick` (bar/beat desde 1). Tres botones
+provisionales permiten fijar el tempo inicial a 100, añadir 60 BPM en quarter 17
+y añadir 7/8 en bar 9; repetir una adición rechaza el ancla duplicada.
+Save escribe **schemaVersion 2**; Load valida y migra v1 en memoria a 120 BPM,
+4/4 y PPQ15360, sin modificar el archivo original ni marcar dirty la sesión.
+Consulta los contratos y límites en `docs/architecture.md` y la prueba real en
+[`docs/validation-0.5.2.md`](docs/validation-0.5.2.md).
 
 ## Tecnología propuesta
 
@@ -463,6 +480,9 @@ La arquitectura y las reglas de tiempo real se describen en
   playhead, zoom/scroll y reconstrucción tras Undo/Redo/Load.
 - **0.5.1 — Seek & Transport Navigation:** estado Paused, Seek RT-safe,
   doble Stop semántico, navegación por ruler/teclado y Split manual real.
+- **0.5.2 — Musical Time Foundation:** mapas portables de tempo/métrica,
+  conversiones precisas y redondeos explícitos, comandos con Undo/Redo sin
+  mover audio, ruler musical, schema v2 y migración real v1→v2.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -485,4 +505,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.4.2.md`](docs/validation-0.4.2.md) y
 [`docs/validation-0.4.3.md`](docs/validation-0.4.3.md) y
 [`docs/validation-0.5.0.md`](docs/validation-0.5.0.md) y
-[`docs/validation-0.5.1.md`](docs/validation-0.5.1.md).
+[`docs/validation-0.5.1.md`](docs/validation-0.5.1.md) y
+[`docs/validation-0.5.2.md`](docs/validation-0.5.2.md).

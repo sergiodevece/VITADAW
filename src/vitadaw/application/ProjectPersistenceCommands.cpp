@@ -57,6 +57,9 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
     std::vector<std::byte>{}.swap(read.bytes);
     auto data = decoded.project->documentData();
     decoded.project.reset();
+    if (musicalRevision_ == UINT64_MAX) return {PersistenceCode::capacityExceeded, PersistencePhase::prepare};
+    auto musicalMap = musical::PreparedMusicalTimeMap::compile(data.musicalTime, data.settings.sampleRate, musicalRevision_ + 1);
+    if (!musicalMap) return {PersistenceCode::semanticValidationFailed, PersistencePhase::prepare};
     std::vector<audio::PreparedSourceAudio> resources;
     resources.reserve(data.sources.size());
     std::size_t candidateBytes{};
@@ -111,11 +114,14 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
         DawApplication* app;
         project::ProjectState* project;
         std::filesystem::path* path;
+        std::unique_ptr<const musical::PreparedMusicalTimeMap>* musicalMap;
         audio::PreparedAudibilityState audibility;
-    } context{this, candidate.get(), &path, resolveAudibility(*candidate)};
+    } context{this, candidate.get(), &path, &musicalMap.value, resolveAudibility(*candidate)};
     const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
         auto& c = *static_cast<Context*>(raw);
         c.app->session_.adopt(*c.project, *c.path);
+        c.app->musicalTime_.swap(*c.musicalMap);
+        ++c.app->musicalRevision_;
         c.app->audibility_ = c.audibility;
         c.app->transport_.stopAndRewind();
         c.app->transport_.setDuration(c.app->session_.project.duration());

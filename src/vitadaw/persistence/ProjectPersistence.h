@@ -6,9 +6,9 @@ namespace vitadaw::persistence {
 inline constexpr std::size_t maximumDocumentBytes = 16 * 1024 * 1024;
 inline constexpr std::size_t maximumDocumentMemory = 128 * 1024 * 1024;
 struct ProjectDocument {
-    static constexpr unsigned currentSchemaVersion = 1;
+    static constexpr unsigned currentSchemaVersion = 2;
     unsigned schemaVersion{currentSchemaVersion};
-    std::string writerAppVersion{"0.5.1"};
+    std::string writerAppVersion{"0.5.2"};
     project::ProjectState::DocumentData model;
 };
 struct DocumentResult {

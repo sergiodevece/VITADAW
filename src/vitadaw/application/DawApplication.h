@@ -34,8 +34,14 @@ public:
         return session_.history.revision();
     }
     [[nodiscard]] ui::timeline::TimelineSnapshot timelineSnapshot() const;
+    [[nodiscard]] const musical::PreparedMusicalTimeMap& musicalTime() const noexcept { return *musicalTime_; }
+    [[nodiscard]] std::uint64_t musicalRevision() const noexcept { return musicalRevision_; }
 
 private:
+    commands::CommandResult musicalCommand(const commands::Command&);
+    commands::CommandResult commitMusicalProject(project::ProjectState,
+        history::UndoManager::PendingAppend* pending = nullptr, int historyDirection = 0,
+        std::unique_ptr<const musical::PreparedMusicalTimeMap> prepared = {});
     commands::CommandResult persistenceCommand(const commands::Command& command);
     persistence::PersistenceResult saveProject(std::filesystem::path path);
     persistence::PersistenceResult loadProject(std::filesystem::path path, bool discard);
@@ -60,6 +66,8 @@ private:
     transport::TransportState transport_;
     audio::PreparedAudibilityState audibility_;
     audio::AudioCommandSequence pendingAudioCommandSequence_{};
+    std::unique_ptr<const musical::PreparedMusicalTimeMap> musicalTime_;
+    std::uint64_t musicalRevision_{};
 };
 
 } // namespace vitadaw::application

@@ -1046,7 +1046,8 @@ DSP. DawApplication coordina SaveProject, SaveProjectAs(path) y
 LoadProject(path, discardUnsaved). La UI proporciona paths portables, muestra
 errores y solicita consentimiento de descarte; no accede a audio ni JSON.
 
-`.vitadaw` es JSON UTF-8, `format=VitaDAWProject`, `schemaVersion=1` y
+`.vitadaw` es JSON UTF-8, `format=VitaDAWProject`, inicialmente `schemaVersion=1`
+(desde 0.5.2 se guarda v2 y se migra v1 en memoria) y
 writerAppVersion opcional. ProjectDocument contiene un DTO explícito; el codec
 enumera campos, no serializa automáticamente structs. Incluye settings, todos
 los IDs/counters, fuentes, pistas/clips/layout/mix/inserts, routing editable,
@@ -1067,8 +1068,8 @@ semántico; parámetros se ordenan por ParameterId. Dump usa dos espacios,
 newline final y conversión independiente de locale, sin timestamps.
 El mismo estado/destino/versión produce bytes idénticos.
 
-El registro de migraciones sobre DOM está vacío: v1 es el único esquema. No se
-inventan migraciones, no se abre parcialmente un esquema futuro y se rechazan
+El registro de migraciones sobre DOM contiene desde 0.5.2 el migrador v1→v2.
+No se inventan migraciones, no se abre parcialmente un esquema futuro y se rechazan
 campos desconocidos. `internal.gain` guarda parámetros por ID, bypass y estado
 serializado vacío. Un tipo desconocido devuelve processorUnavailable.
 
@@ -1258,7 +1259,120 @@ entra en Undo, no cambia `StateToken` y Load conserva Stopped/0.
 No hay tempo, beats, loop ni metronome. El roadmap inmediato reserva 0.5.2 para
 Musical Time Foundation y 0.5.3 para Loop & Metronome.
 
-## Evolución hasta 0.5.1
+## Musical Time Foundation 0.5.2
+
+### Autoridad, unidades y anclas
+
+`RealtimeProjectClock` / ProjectFrame es el único reloj que avanza. El mapa
+musical es una transformación consultable, no un segundo acumulador. El módulo
+`musical/` no depende de JUCE. El callback y los contratos de audio no cambian.
+La posición precisa existente permite conservar fracciones de frame cuando
+project/device sample rate difieren; el frame entero sigue siendo el destino de Seek.
+El sample rate del mapa preparado procede del proyecto, nunca del dispositivo
+ni de un recurso fuente. Load recompila con el sample rate del nuevo documento.
+
+- `MusicalTickPosition`, `MusicalTickDuration`: int64 fuerte, PPQ=15360 fijo.
+- `QuarterNotePosition`: double fuerte continuo; los ticks NO son resolución de audio.
+- `BarIndex`, `BeatIndex`, `TickWithinBeat`: int64, cero-based. Display bar/beat +1.
+- `TempoBpm`: double finito 20–400; siempre negras por minuto, incluso en 6/8.
+- `MusicalPosition` necesita un mapa de métrica para tener significado absoluto.
+
+`MusicalTimeMap` pertenece a ProjectState como submodelo documental, con
+`TempoMap` y `TimeSignatureMap`. TempoEvent ancla exclusivamente tick, BPM y
+curve=step. TimeSignatureEvent ancla exclusivamente BarIndex y N/D. El tick
+de cada cambio de métrica se deriva de los compases anteriores durante preparación.
+En N/D, ticksPerBeat=PPQ*4/D y ticksPerBar=N*ticksPerBeat. En 6/8 el display
+cuenta corcheas, sin asumir agrupaciones de metronome. N=1..32; D potencia de
+dos entre 1 y 64. Las anclas son únicas, ordenadas; duplicados se rechazan.
+
+Ambos mapas requieren evento inicial (tick/bar cero), por defecto 120 y 4/4.
+Se permite Set del inicial, nunca Move/Delete. Los IDs tipados son uint64 no
+cero y estables, con contador monotónico que no retrocede al hacer Undo.
+Se rechaza el agotamiento antes de sumar; los IDs eliminados no se reciclan.
+
+### Preparación y conversiones
+
+`PreparedMusicalTimeMap::compile` valida y prepara fuera de RT dos vectores
+separados: segmentos de tempo (tick, quarter, segundos prefijo, BPM, segundos
+por negra) y de métrica (bar, tick, N/D, ticks por beat/bar). El siguiente
+elemento proporciona el límite exclusivo; el último se extrapola dentro del
+dominio numérico. Los prefijos de segundos usan suma compensada, sin redondear
+beats ni fronteras a frames enteros.
+
+En un segmento: `seconds = startSeconds + (q-startQuarter)*60/BPM`;
+inversa `q = startQuarter + (seconds-startSeconds)*BPM/60`.
+`preciseFrame = seconds*projectSampleRate`. Consultas individuales por búsqueda
+binaria O(log n), intervalos [start,next). El display usa floor y comprueba
+las fronteras representadas en frames para normalizar el error de inversión
+sin redondear anticipadamente al siguiente tick. Las políticas son explícitas:
+nearest (empate hacia arriba) para Seek; floor para display; ceil únicamente
+para un límite exclusivo que lo requiera. No se promete reversibilidad de
+Tick→frame entero→Tick ni Frame→display→Frame. Sí se prueba el round-trip
+continuo y frame entero→quarter continuo→frame entero.
+
+Máximo 4096 eventos de cada tipo y presupuesto de segmentos de 1 MiB. Dominio
+numérico conservador: ticks y project frames no negativos hasta 2^40, además
+de comprobar todos los productos y resultados finitos. A 96 kHz representa
+unos 132 días en frames; la intersección con el límite de ticks depende del BPM.
+Las consultas fuera del dominio devuelven error, no clamp ni casts indefinidos.
+
+Grid usa span acotado, sin allocations: bars/beats/subdivisiones exactas del beat
+(divisor 1..64 que divida ticksPerBeat). Devuelve cantidad, error, hasMore y
+nextStart para continuar en la primera línea omitida. Busca el segmento inicial
+y avanza el cursor de métrica, sin recorrer desde el origen ni acumular frames
+redondeados. Para evitar escanear miles de cambios de tempo entre dos líneas,
+prepara un índice radix comprimido auxiliar (máximo 2*n-1 nodos, dentro del
+mismo presupuesto de 1 MiB). Cada bifurcación elimina un bit distinto del
+dominio fijo de ticks: búsqueda acotada a 41 pasos por línea, independiente
+del número de eventos atravesados. Conserva las dos tablas semánticas separadas.
+Así la enumeración es O(log n+k) en este dominio fijo; cada frontera de métrica
+es una línea de compás y no hay recorridos de segmentos sin salida. El índice
+es inmutable y se prepara fuera de RT; no es un reloj ni un mapa adicional.
+
+### Edición transaccional y lifetime
+
+UI→ICommandDispatcher→DawApplication. Add/Move/Set/RemoveTempoChange (Set se
+llama `SetTempo`) y equivalentes de métrica identifican eventos concretos.
+Solo Stopped. Candidato→edición→validación→compile→stage Undo→commit por swaps
+noexcept de modelo/mapa/historial. Nada se publica si falla una allocation o
+validación. El commit musical NO usa el commit de routing que rebobina.
+Conserva frame, duración, PCM y plan RT. Undo/Redo guarda before/after de eventos,
+no mapas preparados; reconstruye antes del commit, restaura IDs exactos y
+preserva contadores. StateToken cambia con cada edición confirmada y dirty
+se deriva del saved token. No se limpia el historial innecesariamente.
+
+El mapa preparado tiene owner `unique_ptr<const ...>` en DawApplication y
+revisión monotónica no persistida. UI consulta una referencia de vida limitada
+en el hilo serializado de aplicación. El mapa anterior se destruye allí tras
+el swap. En 0.5.2 **no se publica a RT**: añadir un consumidor RT en el futuro
+requerirá un protocolo explícito de publicación/reclamación; const no basta.
+Los clips siguen absolute lock en ProjectFrame. Musical lock, loop y metronome
+podrán consultar este mapa, pero no se implementan ni alteran el render actual.
+
+### Persistencia y UI
+
+Schema2 añade `musicalTime`: ppq numérico 15360, tempoEvents, signatureEvents,
+nextTempoEventId y nextTimeSignatureEventId. IDs, tick y barIndex se escriben
+como strings decimales exactos. Orden canónico por ancla/ID; sin posiciones
+derivadas, revisiones, UI, ni prepared maps en disco. Validación estricta y
+límites SAX antes de reservar arrays; curvas desconocidas y mapas inválidos
+rechazan Load sin alterar la sesión activa.
+
+El registro contiene el migrador real v1→v2: valida esquema y semántica v1,
+añade defaults solo al DOM candidato (IDs1, nextIDs2), cambia versión a2 y
+valida v2 completo. Se prepara el mapa musical ANTES del audio y se adopta
+junto al documento/plan mediante el commit transaccional de Load. El archivo
+v1 permanece intacto; sesión migrada limpia e historial vacío. Save posterior
+escribe v2. El fixture future-version ahora contiene3; los fixtures v1 se conservan.
+
+Ruler Seconds/Frames/BarsBeats cambia etiquetas/líneas, nunca el eje absoluto.
+Viewport acotado a 512 líneas; densidad bars/beats/subdivisiones según zoom,
+sin generar ticks individuales ni millones de líneas. El read model incluye
+revisión musical y posición opcional; UI consulta el prepared map sin copiar
+4096 eventos a 30 Hz. Seleccionar modo de display no despacha mutaciones ni
+marca dirty. Los tres botones musicales son exclusivamente provisionales.
+
+## Evolución hasta 0.5.2
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1317,6 +1431,8 @@ Musical Time Foundation y 0.5.3 para Loop & Metronome.
 
 24. **Completado en 0.5.1:** Pause, Seek por frame, doble Stop, navegación
     ruler/teclado, displays derivados y Split manual desde el playhead real.
+25. **Completado en 0.5.2:** mapas musicales portables/preparados, comandos
+    undoables, display/ruler, schema2 y migración v1.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

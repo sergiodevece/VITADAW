@@ -216,6 +216,7 @@ struct Guard : nlohmann::json_sax<J> {
         if (levels.size()>=32 || !value()) {failure=PersistenceCode::capacityExceeded;return false;}
         const auto limit=lastKey=="tracks" ? 256u : lastKey=="sources" ? 2048u :
             lastKey=="clips" ? 4096u : lastKey=="buses" ? 64u : lastKey=="sends" ? 1024u :
+            lastKey=="tempoEvents" || lastKey=="signatureEvents" ? 4096u :
             lastKey=="inserts" ? 16u : lastKey=="parameters" ? 1u : 32768u;
         levels.push_back({false,{},0,limit}); return true;
     }
@@ -223,7 +224,19 @@ struct Guard : nlohmann::json_sax<J> {
     bool parse_error(std::size_t,const std::string&,const nlohmann::detail::exception&) override {return false;}
 };
 using Migration = void(*)(J&);
-constexpr std::array<Migration,0> migrations{}; // No fictional legacy schemas.
+ProjectDocument decode(const J&);
+void migrateV1ToV2(J& root) {
+    // Validate the complete legacy document BEFORE adding any defaults.
+    auto legacy = decode(root);
+    if (!project::ProjectState::fromDocumentData(std::move(legacy.model)))
+        invalid("v1", PersistenceCode::semanticValidationFailed);
+    root["musicalTime"] = {{"ppq",musical::ppq},{"nextTempoEventId","2"},
+        {"nextTimeSignatureEventId","2"},
+        {"tempoEvents",J::array({{{"id","1"},{"tick","0"},{"bpm",120.0},{"curve","step"}}})},
+        {"signatureEvents",J::array({{{"id","1"},{"barIndex","0"},{"numerator",4},{"denominator",4}}})}};
+    root["schemaVersion"] = 2u;
+}
+constexpr std::array<Migration,1> migrations{migrateV1ToV2};
 void migrate(J& root) {
     if (!root.contains("schemaVersion") || !root.at("schemaVersion").is_number_unsigned()) invalid("schemaVersion");
     auto version=root.at("schemaVersion").get<std::uint64_t>();
@@ -234,12 +247,47 @@ void migrate(J& root) {
     }
 }
 ProjectDocument decode(const J& root) {
+    const auto version = root.at("schemaVersion").get<unsigned>();
+    if (version == 1)
     fields(root,{"format","schemaVersion","projectSettings","nextIds","sources","tracks","routing","buses","sends","master"},
            {"writerAppVersion"});
+    else if (version == 2)
+        fields(root,{"format","schemaVersion","projectSettings","nextIds","sources","tracks","routing","buses","sends","master","musicalTime"},
+               {"writerAppVersion"});
+    else invalid("schemaVersion",PersistenceCode::unsupportedSchema);
     if (string(root.at("format"))!="VitaDAWProject") invalid("format");
     ProjectDocument doc;
+    doc.schemaVersion=version;
     if (root.contains("writerAppVersion")) doc.writerAppVersion=string(root.at("writerAppVersion"));
     auto& data=doc.model;
+    if (version == 2) {
+        const auto& m=root.at("musicalTime");
+        fields(m,{"ppq","nextTempoEventId","nextTimeSignatureEventId","tempoEvents","signatureEvents"});
+        if (!m.at("ppq").is_number_integer() || m.at("ppq") != musical::ppq) invalid("musicalTime/ppq");
+        auto& map=data.musicalTime;
+        map.tempo.nextId={integer(m.at("nextTempoEventId"))};
+        map.signatures.nextId={integer(m.at("nextTimeSignatureEventId"))};
+        array(m.at("tempoEvents"),musical::maximumEvents);
+        array(m.at("signatureEvents"),musical::maximumEvents);
+        map.tempo.events.clear(); map.signatures.events.clear();
+        for (const auto& e:m.at("tempoEvents")) {
+            fields(e,{"id","tick","bpm","curve"});
+            const auto tick=integer(e.at("tick"),true);
+            if (tick>musical::maximumCoordinate || string(e.at("curve"))!="step") invalid("musicalTime/tempoEvents");
+            map.tempo.events.push_back({{integer(e.at("id"))},{static_cast<std::int64_t>(tick)},
+                {number(e.at("bpm"))},musical::TempoCurve::step});
+        }
+        for (const auto& e:m.at("signatureEvents")) {
+            fields(e,{"id","barIndex","numerator","denominator"});
+            const auto bar=integer(e.at("barIndex"),true);
+            if (bar>musical::maximumCoordinate || !e.at("numerator").is_number_integer() ||
+                !e.at("denominator").is_number_integer() || e.at("numerator")<1 || e.at("denominator")<1 ||
+                e.at("numerator")>32u || e.at("denominator")>64u)
+                invalid("musicalTime/signatureEvents");
+            map.signatures.events.push_back({{integer(e.at("id"))},{static_cast<std::int64_t>(bar)},
+                {e.at("numerator").get<unsigned>(),e.at("denominator").get<unsigned>()}});
+        }
+    }
     const auto& settings=root.at("projectSettings"); fields(settings,{"name","sampleRateHz"});
     data.settings={string(settings.at("name")),timeline::SampleRate{number(settings.at("sampleRateHz"))}};
     const auto& ids=root.at("nextIds"); fields(ids,{"track","source","clip","bus","send","processorInstance"});
@@ -308,6 +356,16 @@ J encode(ProjectDocument doc,const std::filesystem::path& path) {
         {"nextIds",{{"track",std::to_string(d.nextTrackId.value)},{"source",std::to_string(d.nextSourceId.value)},
         {"clip",std::to_string(d.nextClipId.value)},{"bus",std::to_string(d.routing.nextBusId.value)},
         {"send",std::to_string(d.routing.nextSendId.value)},{"processorInstance",std::to_string(d.nextProcessorId.value)}}}};
+    const auto& map=d.musicalTime;
+    J tempos=J::array(), signatures=J::array();
+    // Validated maps have unique anchors in ascending order (therefore canonical).
+    for (const auto& e:map.tempo.events) tempos.push_back({{"id",std::to_string(e.id.value)},
+        {"tick",std::to_string(e.tick.value)},{"bpm",e.bpm.value},{"curve","step"}});
+    for (const auto& e:map.signatures.events) signatures.push_back({{"id",std::to_string(e.id.value)},
+        {"barIndex",std::to_string(e.bar.value)},{"numerator",e.signature.numerator},{"denominator",e.signature.denominator}});
+    root["musicalTime"]={{"ppq",map.resolution},{"nextTempoEventId",std::to_string(map.tempo.nextId.value)},
+        {"nextTimeSignatureEventId",std::to_string(map.signatures.nextId.value)},
+        {"tempoEvents",std::move(tempos)},{"signatureEvents",std::move(signatures)}};
     for(auto key:{"sources","tracks","buses","sends"}) root[key]=J::array();
     std::sort(d.sources.begin(),d.sources.end(),[](const auto& a,const auto& b){return a.id<b.id;});
     for(const auto& s:d.sources) root["sources"].push_back({{"id",std::to_string(s.id.value)},
@@ -361,7 +419,7 @@ SerializationResult serializeProject(const project::ProjectState& project,const 
         if(!path.is_absolute()) return {{PersistenceCode::schemaValidationFailed,PersistencePhase::validate},{}};
         auto data=project.documentData();
         if(!project::ProjectState::fromDocumentData(data)) return {{PersistenceCode::semanticValidationFailed,PersistencePhase::validate},{}};
-        DocumentTree tree{encode({1,"0.5.1",std::move(data)},path)};
+        DocumentTree tree{encode({ProjectDocument::currentSchemaVersion,"0.5.2",std::move(data)},path)};
         auto& root=tree.value;
         // Explicit schema validation on Save also catches unsupported media fields.
         static_cast<void>(decode(root));

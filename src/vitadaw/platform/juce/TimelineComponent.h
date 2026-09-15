@@ -57,6 +57,7 @@ private:
     juce::ScrollBar vertical_{true};
     juce::TextButton zoomOut_{"-"}, zoomIn_{"+"};
     juce::TextButton split_{"Split @ Playhead"}, duplicate_{"Duplicate"}, delete_{"Delete"};
+    juce::ComboBox rulerMode_;
 };
 
 } // namespace vitadaw::platform::juce_adapter

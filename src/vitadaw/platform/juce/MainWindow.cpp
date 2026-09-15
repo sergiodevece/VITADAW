@@ -67,6 +67,12 @@ public:
         saveButton_.onClick = [this] { dispatch(commands::SaveProject{}); };
         saveAsButton_.onClick = [this] { chooseProject(true); };
         loadProjectButton_.onClick = [this] { chooseProject(false); };
+        tempo100_.onClick = [this] {
+            dispatch(commands::SetTempo{application_.project().musicalTime().tempo.events.front().id, {100.0}});
+        };
+        tempoChange_.onClick = [this] { dispatch(commands::AddTempoChange{{16 * musical::ppq}, {60.0}}); };
+        signatureChange_.onClick = [this] { dispatch(commands::AddTimeSignatureChange{{8}, {7,8}}); };
+        for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_}) addAndMakeVisible(*button);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_})
             addAndMakeVisible(*button);
@@ -87,6 +93,14 @@ public:
              << " | Frames: " << juce::String(state.position.value)
              << " | Project: " << juce::String(projectSampleRate.hertz(), 0) << " Hz";
         transportLabel_.setText(text, juce::dontSendNotification);
+        const auto musicalPosition = application_.musicalTime().musicalPositionAt(state.position);
+        if (musicalPosition) {
+            const auto& p = musicalPosition.value;
+            text << " | Bars: " << juce::String(p.bar.value + 1) << "|" << juce::String(p.beat.value + 1) << "|" << juce::String(p.tick.value);
+            transportLabel_.setText(text, juce::dontSendNotification);
+        }
+        for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_})
+            button->setEnabled(state.playback == transport::PlaybackState::stopped);
         timeline_.setTransportState(state);
         updateHistoryControls();
     }
@@ -129,6 +143,10 @@ public:
         statusLabel_.setBounds(bounds.removeFromTop(26));
         transportLabel_.setBounds(bounds.removeFromTop(26));
         meterLabel_.setBounds(bounds.removeFromTop(22));
+        auto musicalRow = bounds.removeFromTop(28);
+        tempo100_.setBounds(musicalRow.removeFromLeft(160));
+        tempoChange_.setBounds(musicalRow.removeFromLeft(240));
+        signatureChange_.setBounds(musicalRow.removeFromLeft(240));
 
         auto commandRow = bounds.removeFromTop(32);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
@@ -248,6 +266,9 @@ private:
     juce::TextButton undoButton_{"Undo"}, redoButton_{"Redo"};
     juce::TextButton saveButton_{"Save"}, saveAsButton_{"Save As..."};
     juce::TextButton loadProjectButton_{"Load Project..."};
+    juce::TextButton tempo100_{"Initial tempo: 100 BPM"};
+    juce::TextButton tempoChange_{"Add 60 BPM @ quarter 17"};
+    juce::TextButton signatureChange_{"Add 7/8 @ bar 9"};
     std::unique_ptr<juce::FileChooser> fileChooser_;
 };
 

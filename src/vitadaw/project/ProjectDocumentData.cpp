@@ -9,10 +9,11 @@
 namespace vitadaw::project {
 ProjectState::DocumentData ProjectState::documentData() const {
     return {settings_, tracks_, sources_, routing_.documentData(), nextTrackId_,
-        nextSourceId_, nextClipId_, nextProcessorId_, masterMix_, masterInserts_};
+        nextSourceId_, nextClipId_, nextProcessorId_, masterMix_, masterInserts_, musicalTime_};
 }
 std::unique_ptr<ProjectState> ProjectState::fromDocumentData(DocumentData data) {
     using namespace audio;
+    if (!musical::PreparedMusicalTimeMap::compile(data.musicalTime, data.settings.sampleRate)) return {};
     if (!data.settings.sampleRate.isValid() || data.settings.name.size() > 4096 ||
         data.tracks.size() > maximumTracks || data.sources.size() > maximumSources ||
         data.routing.buses.size() > maximumPreparedBuses ||
@@ -107,6 +108,7 @@ std::unique_ptr<ProjectState> ProjectState::fromDocumentData(DocumentData data) 
     result->nextTrackId_ = data.nextTrackId; result->nextSourceId_ = data.nextSourceId;
     result->nextClipId_ = data.nextClipId; result->nextProcessorId_ = data.nextProcessorId;
     result->masterMix_ = data.masterMix; result->masterInserts_ = std::move(data.masterInserts);
+    result->musicalTime_ = std::move(data.musicalTime);
     return result;
 }
 } // namespace vitadaw::project
