@@ -31,8 +31,15 @@ TimelineSnapshot makeTimelineSnapshot(const project::ProjectState& project,
         TrackSnapshot lane{track.id, track.name, track.layout, {}};
         lane.clips.reserve(track.clips.size());
         for (const auto& clip : track.clips)
+        {
+            const auto* source = project.findSource(clip.source);
+            const auto ratio = source == nullptr
+                ? 1.0 : source->sampleRate.hertz() / project.sampleRate().hertz();
             lane.clips.push_back({clip.id, clip.source, clip.projectStart,
-                                  clip.duration, clipLabel(project, clip.source)});
+                                  clip.duration, clip.sourceOffset,
+                                  ratio,
+                                  clipLabel(project, clip.source)});
+        }
         result.tracks.push_back(std::move(lane));
     }
     return result;
@@ -128,7 +135,9 @@ bool TimelineInteraction::beginGesture(GestureKind kind, const ClipSnapshot& cli
         clip.projectStart.value < 0 || clip.duration.value <= 0.0) return false;
     selection_ = clip.id;
     gesture_ = kind;
-    original_ = {clip.id, {}, clip.projectStart, clip.duration, true};
+    original_ = {clip.id, {}, clip.projectStart, clip.duration,
+                 clip.sourceOffset, true};
+    originalSourceFramesPerProjectFrame_ = clip.sourceFramesPerProjectFrame;
     preview_ = original_;
     pointerOriginX_ = pointerX;
     return true;
@@ -164,6 +173,10 @@ void TimelineInteraction::updateGesture(double pointerX,
             0.0, originalEnd - minimumDurationFrames);
         preview_->projectStart.value = static_cast<std::int64_t>(std::llround(start));
         preview_->duration.value = originalEnd - static_cast<double>(preview_->projectStart.value);
+        const auto projectDelta = static_cast<double>(preview_->projectStart.value -
+                                                      original_.projectStart.value);
+        preview_->sourceOffset.value = original_.sourceOffset.value +
+            projectDelta * originalSourceFramesPerProjectFrame_;
     } else {
         const auto maximumDuration = static_cast<double>(
             std::numeric_limits<std::int64_t>::max() - original_.projectStart.value);

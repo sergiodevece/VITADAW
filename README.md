@@ -1,4 +1,4 @@
-# VitaDAW 0.5.4 — Track Operations & Cross-Track Editing
+# VitaDAW 0.5.5 — Waveform Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -152,6 +152,24 @@ en un solo comando: el clip cambia de owner sin cambiar ClipId, SourceId, offset
 ni duración. Mono→mono y stereo→stereo están permitidos; no existe upmix/downmix.
 Las operaciones reconstruyen el plan fuera de RT y conservan la posición de
 transporte detenida. El formato de proyecto continúa siendo schema v3.
+
+VitaDAW 0.5.5 añade una caché derivada de formas de onda por `SourceId`, propiedad
+de la sesión y completamente ajena a `ProjectState`. JUCE decodifica cada WAV
+una sola vez; inmediatamente después, fuera de RT, el núcleo portable obtiene
+picos min/max por canal en buckets base de 128 source frames y construye niveles
+superiores agregando pares. Diez clips de una misma fuente comparten el mismo
+handle inmutable, incluidos Duplicate, Split, Trim, Move, Delete/Undo y cambios
+de pista.
+
+La timeline selecciona el nivel según source-frames-per-pixel, recorre solo la
+franja visible y convierte project frames a source frames usando los sample
+rates lógico y de fuente; el device rate no participa. Mono se dibuja centrado
+y estéreo conserva picos L/R independientes. `paint()` nunca lee archivos,
+decodifica ni genera caché. El presupuesto provisional es 64 MiB: si se supera,
+el audio sigue preparado y se muestra un placeholder/diagnóstico. Load crea una
+caché candidata aislada y la intercambia junto al proyecto; schemaVersion sigue
+siendo 3 y el waveform no se persiste. Detalles y pruebas:
+[`docs/validation-0.5.5.md`](docs/validation-0.5.5.md).
 
 ## Tecnología propuesta
 
@@ -537,6 +555,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.5.4 — Track Operations & Cross-Track Editing:** Add/Delete Track con
   Undo/Redo exacto, selección explícita para importación y Move 2D de clips con
   ownership por TrackId y compatibilidad de layout.
+- **0.5.5 — Waveform Foundation:** caché multirresolución por SourceId, picos
+  min/max mono/estéreo, mapping project/source, render visible y reconstrucción
+  transaccional al cargar proyectos.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -562,4 +583,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.1.md`](docs/validation-0.5.1.md) y
 [`docs/validation-0.5.2.md`](docs/validation-0.5.2.md) y
 [`docs/validation-0.5.3.md`](docs/validation-0.5.3.md) y
-[`docs/validation-0.5.4.md`](docs/validation-0.5.4.md).
+[`docs/validation-0.5.4.md`](docs/validation-0.5.4.md) y
+[`docs/validation-0.5.5.md`](docs/validation-0.5.5.md).

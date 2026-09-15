@@ -237,12 +237,23 @@ audio::AudioFilePreparationResult JuceAudioDeviceAdapter::decodeWav(
             prepared->sourceSampleRate, static_cast<std::uint32_t>(channelCount),
             {frameCount}, {static_cast<double>(frameCount) / reader->sampleRate}};
 
+        waveform::PcmView waveformView;
+        waveformView.channelCount = static_cast<std::uint32_t>(channelCount);
+        waveformView.frameCount = {frameCount};
+        waveformView.sampleRate = prepared->sourceSampleRate;
+        for (std::uint32_t channel = 0; channel < waveformView.channelCount; ++channel)
+            waveformView.channels[channel] = prepared->samples.getReadPointer(
+                static_cast<int>(channel));
+        auto waveformPreparation = waveform::prepareWaveform(waveformView);
+
         // Verify once more by streaming. PCM and fingerprint came from the same
         // immutable byte snapshot; replacing/changing the media during decode fails.
         auto verification = files::verifyFingerprint(filePath, fingerprint, &encoded.identity);
         if (!verification.success()) return {nullptr, {}, std::move(verification)};
         auto result = std::make_unique<PreparedJuceAudioFile>(metadata, std::move(prepared));
         result->media = {std::filesystem::absolute(filePath).lexically_normal(), {}, fingerprint};
+        result->waveform = std::move(waveformPreparation.prepared);
+        result->waveformDiagnostic = std::move(waveformPreparation.diagnostic);
         return {std::move(result), {}};
     } catch (const std::bad_alloc&) {
         return {nullptr, "Not enough memory to prepare WAV", {},

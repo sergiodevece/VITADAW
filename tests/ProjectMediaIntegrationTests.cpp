@@ -80,12 +80,16 @@ int main(){
           app.project().tracks().empty()&&app.project().sources().empty(),
           "real file access, format and decode failures are typed and transactional");
     ok(commands::ImportAudioFile{path("a.wav"),{0}});
+    const auto waveformA = app.waveformCache().find({1});
     check(app.project().tracks().size()==1&&app.project().sources().size()==1&&
           app.project().tracks()[0].clips.size()==1&&
           app.timelineSnapshot().tracks[0].clips.size()==1&&
-          app.project().duration().value==523,
-          "actual WAV first import creates coherent track/source/clip/timeline duration");
+          app.project().duration().value==523&&
+          waveformA&&waveformA->levels[0].channels[0][0].maximum>0.2F,
+          "actual WAV first import creates coherent source waveform and timeline duration");
     for(int i=1;i<10;++i)ok(commands::AddClip{{1},{1},{i*10},{200},{0}});
+    check(app.waveformCache().size()==1&&app.waveformCache().find({1})==waveformA,
+          "ten clips retain one source-level waveform identity");
     ok(commands::SaveProjectAs{path("a.vitadaw")});
     check(platform::juce_adapter::PersistenceIntegrationAccess::render(engine)>0,"A actual JUCE decoded render");app.synchroniseTransport();
     auto decoded=engine.prepareWav(path("b.wav"));check(decoded.success(),"B WAV decoded");
@@ -94,15 +98,24 @@ int main(){
     auto serialized=persistence::serializeProject(model,path("b.vitadaw"));check(serialized.result.success(),"B serialize");
     check(platform::files::nativeProjectFileIO().replace(path("b.vitadaw"),serialized.bytes).success(),"B save");
     ok(commands::LoadProject{path("b.vitadaw")});
+    const auto waveformB=app.waveformCache().find({1});
+    check(waveformB&&waveformB!=waveformA&&
+          waveformB->levels[0].channels[0][0].minimum<-0.4F,
+          "successful load replaces the session cache despite SourceId collision");
     check(platform::juce_adapter::PersistenceIntegrationAccess::render(engine)<0,"B collision renders B via actual adapter and processBlock");app.synchroniseTransport();
     const auto fingerprint=*app.project().sources()[0].media.fingerprint;
     check(a.copyFileTo(b),"replace media bytes");
     check(engine.prepareVerifiedWav(path("b.wav"),fingerprint,0).result.code==persistence::PersistenceCode::mediaChanged,"changed bytes rejected before decode");
     const auto token=app.history().currentStateToken();
     check(app.handle(commands::LoadProject{path("b.vitadaw")}).persistence.code==persistence::PersistenceCode::mediaChanged,"load rollback changed WAV");
-    check(app.history().currentStateToken()==token&&platform::juce_adapter::PersistenceIntegrationAccess::render(engine)<0,"old PCM survives failed load");
+    check(app.history().currentStateToken()==token&&app.waveformCache().find({1})==waveformB&&
+          platform::juce_adapter::PersistenceIntegrationAccess::render(engine)<0,
+          "old PCM and waveform survive failed load");
     app.synchroniseTransport();ok(commands::LoadProject{path("a.vitadaw")});
     check(app.project().tracks()[0].clips.size()==10&&app.project().sources().size()==1,"shared Source survives actual JUCE load");
+    check(app.waveformCache().size()==1&&app.waveformCache().find({1})&&
+          app.waveformCache().find({1})->levels[0].channels[0][0].maximum>0.2F,
+          "waveform rebuilds from verified media on project reopen");
     check(engine.preparedAudioBytes()==480*sizeof(float),"one decoded PCM for ten clips");
     engine.shutdown();check(dir.deleteRecursively(),"remove own temporary files");
     std::cout<<"JUCE media persistence integration passed without audio hardware\n";

@@ -1525,7 +1525,65 @@ Limitaciones deliberadas: no hay reorder, multi-selection, auto-scroll durante
 drag, confirmación modal de Delete, upmix/downmix, drag externo, waveform ni UI
 de routing avanzada.
 
-## Evolución hasta 0.5.4
+## Waveform Foundation 0.5.5
+
+`WaveformCache` es estado derivado de `ProjectSession`, no estado documental.
+Su clave es exclusivamente `SourceId`; no contiene TrackId ni ClipId y no se
+serializa. Cada entrada es un `shared_ptr<const PreparedWaveformData>` estable.
+Una carga de proyecto prepara una caché vacía de sesión candidata, por lo que
+dos documentos con `SourceId{1}` nunca comparten accidentalmente una entrada.
+Un fallo de lectura, fingerprint, decode, plan o commit conserva íntegra la
+caché activa anterior.
+
+El adaptador JUCE continúa siendo dueño del PCM. Tras una única decodificación
+WAV valida finitud y entrega punteros de lectura temporales a
+`waveform::prepareWaveform`; el builder portable recorre ese PCM fuera del hilo
+RT y no lo copia. El nivel base agrupa 128 source frames y guarda un par
+`{minimum,maximum}` float por canal. Cada nivel siguiente combina dos buckets
+del anterior, de modo que no vuelve a leer PCM. Mono ocupa un canal; estéreo
+mantiene L/R independientes. `sourceFrameCount` es de 64 bits y el cálculo de
+ceil usa `1 + (count-1)/128` para no desbordar.
+
+El presupuesto independiente de la caché es 64 MiB por sesión. Cada entrada
+expone `approximateBytes` (objeto y payload de picos); `WaveformCache` mantiene
+el total. La estimación se valida antes del recorrido. Si una fuente o el total
+superan el límite, la preparación de audio no falla: la fuente sigue siendo
+reproducible y la timeline muestra un placeholder con diagnóstico. No hay LRU
+ni GC agresivo; mientras la Source pertenezca a la sesión, su entrada puede
+permanecer aunque temporalmente no tenga clips.
+
+Import prepara primero PCM, waveform, modelo y plan candidatos. El commit
+quiescente intercambia `ProjectState`, plan RT y `WaveformCache` mediante swaps
+`noexcept`; el owner sustituido se destruye después, fuera de RT. Load aplica el
+mismo patrón con una caché nueva y reconstruye los picos desde medios verificados.
+Las operaciones no destructivas y Undo/Redo solo cambian clips o pistas y
+reutilizan el handle ya publicado; sus payloads no contienen picos.
+
+`TimelineSnapshot` transporta `SourceId`, `sourceOffset`, projectStart y duration,
+pero nunca arrays de peaks. `TimelineComponent` obtiene un handle const por
+SourceId y `WaveformView` transforma cada columna visible:
+
+```
+project pixel -> clip-local project frames
+              -> sourceOffset + local * sourceRate/projectRate
+              -> bucket min/max del nivel elegido
+```
+
+El sample rate del dispositivo no interviene. El selector usa el nivel más
+grueso cuyo bucket no supera aproximadamente un pixel, manteniendo alrededor
+de uno o dos buckets visitados por columna a zoom normal/bajo. A zoom alto el
+bucket base de 128 frames es el límite deliberado de detalle de 0.5.5. Los clips
+y rangos fuera del viewport se descartan antes de dibujar; `paint()` no hace
+filesystem, decode, fingerprint, generación de picos ni espera por workers.
+Mono se centra en la lane y estéreo usa mitades superior/inferior. Metering,
+loop, metrónomo, tempo y el callback de audio no dependen de esta caché.
+
+La generación continúa síncrona en 0.5.5 porque reutiliza el PCM ya residente y
+la carga WAV/plan ya es una operación síncrona fuera de RT. Una cola de trabajos
+cancelable será necesaria antes de admitir streaming o medios suficientemente
+grandes como para bloquear perceptiblemente la UI, pero no se introduce aún.
+
+## Evolución hasta 0.5.5
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -1591,6 +1649,10 @@ de routing avanzada.
 
 27. **Completado en 0.5.4:** ciclo Add/Delete de pistas con historial de
     submodelo, selección de destino, importación dirigida y Move 2D atómico.
+
+28. **Completado en 0.5.5:** caché derivada multirresolución por SourceId,
+    preparación desde PCM existente, mapping project/source, render visible y
+    reconstrucción aislada/transaccional tras Load.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

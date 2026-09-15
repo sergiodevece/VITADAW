@@ -62,7 +62,9 @@ void snapshotAndSelectionTests() {
               snapshot.transportPosition.value == 72000 &&
               snapshot.playback == transport::PlaybackState::playing &&
               snapshot.revision == 17 && clip.projectStart.value == 48000 &&
-              clip.duration.value == 192000.0 && clip.label == "voice.wav",
+              clip.duration.value == 192000.0 && clip.sourceOffset.value == 0.0 &&
+              clip.sourceFramesPerProjectFrame == 1.0 &&
+              clip.label == "voice.wav",
           "portable snapshot must contain paint data, transport and no PCM");
 
     TimelineInteraction interaction;
@@ -113,9 +115,19 @@ void gestureTests() {
     check(right.projectEnd.value == 192000,
           "right trim must emit an exclusive project end");
 
+    TimelineInteraction sourcePreview;
+    ClipSnapshot resampled{{77}, {1}, {0}, {48000}, {100}, 44100.0 / 48000.0,
+                           "resampled.wav"};
+    check(sourcePreview.beginGesture(GestureKind::trimLeft, resampled, 0.0),
+          "resampled trim preview begins");
+    sourcePreview.updateGesture(10.0,
+        CoordinateTransform{timeline::SampleRate{48000}, 100.0, 0.0});
+    check(std::abs(sourcePreview.preview()->sourceOffset.value - 4510.0) < 1.0e-9,
+          "left-trim preview maps project delta to source frames");
+
     TimelineInteraction boundary;
     const auto maximum = std::numeric_limits<std::int64_t>::max();
-    ClipSnapshot extreme{{99}, {1}, {maximum - 100}, {50.0}, "edge"};
+    ClipSnapshot extreme{{99}, {1}, {maximum - 100}, {50.0}, {0}, 1.0, "edge"};
     CoordinateTransform view{timeline::SampleRate{48000.0}, 100.0, 0.0};
     check(boundary.beginGesture(GestureKind::move, extreme, 0.0),
           "boundary gesture begins");

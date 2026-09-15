@@ -34,6 +34,9 @@ public:
         return session_.history.revision();
     }
     [[nodiscard]] ui::timeline::TimelineSnapshot timelineSnapshot() const;
+    [[nodiscard]] const waveform::WaveformCache& waveformCache() const noexcept {
+        return session_.waveforms;
+    }
     [[nodiscard]] const musical::PreparedMusicalTimeMap& musicalTime() const noexcept { return *musicalTime_; }
     [[nodiscard]] std::uint64_t musicalRevision() const noexcept { return musicalRevision_; }
     [[nodiscard]] bool loopEnabled() const noexcept { return session_.loopEnabled; }

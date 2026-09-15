@@ -66,6 +66,7 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
     if (!temporal.success())
         return {PersistenceCode::semanticValidationFailed, PersistencePhase::prepare};
     std::vector<audio::PreparedSourceAudio> resources;
+    waveform::WaveformCache candidateWaveforms;
     resources.reserve(data.sources.size());
     std::size_t candidateBytes{};
     constexpr std::size_t budget = 512U * 1024U * 1024U;
@@ -100,6 +101,21 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
             if (!bytes.isValid()) return {PersistenceCode::capacityExceeded, PersistencePhase::prepare};
             candidateBytes += static_cast<std::size_t>(source.frameCount.value) * metadata.channelCount * sizeof(float);
             source.media.originalPath = mediaPath;
+            if (media.prepared->waveform) {
+                const auto waveformStored = candidateWaveforms.store(
+                    source.id, media.prepared->waveform);
+                if (waveformStored ==
+                    waveform::WaveformCache::StoreResult::budgetExceeded)
+                    candidateWaveforms.markError(
+                        source.id, "Waveform cache budget exceeded");
+                else if (waveformStored !=
+                         waveform::WaveformCache::StoreResult::stored)
+                    candidateWaveforms.markError(
+                        source.id, "Waveform data was invalid");
+            } else {
+                candidateWaveforms.markError(
+                    source.id, media.prepared->waveformDiagnostic);
+            }
             resources.push_back({source.id, std::move(media.prepared)});
             prepared = true;
             break;
@@ -121,10 +137,12 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
         std::filesystem::path* path;
         std::unique_ptr<const musical::PreparedMusicalTimeMap>* musicalMap;
         audio::PreparedAudibilityState audibility;
-    } context{this, candidate.get(), &path, &musicalMap.value, resolveAudibility(*candidate)};
+        waveform::WaveformCache* waveforms;
+    } context{this, candidate.get(), &path, &musicalMap.value,
+              resolveAudibility(*candidate), &candidateWaveforms};
     const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
         auto& c = *static_cast<Context*>(raw);
-        c.app->session_.adopt(*c.project, *c.path);
+        c.app->session_.adopt(*c.project, *c.path, *c.waveforms);
         c.app->musicalTime_.swap(*c.musicalMap);
         ++c.app->musicalRevision_;
         c.app->audibility_ = c.audibility;

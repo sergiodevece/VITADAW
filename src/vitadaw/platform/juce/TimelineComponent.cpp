@@ -12,6 +12,7 @@ TimelineComponent::TimelineComponent(commands::ICommandDispatcher& dispatcher,
     : dispatcher_(dispatcher), application_(application),
       snapshot_(application.timelineSnapshot()),
       transform_(snapshot_.projectSampleRate) {
+    waveformRevision_ = application_.waveformCache().revision();
     transport_.synchronise(snapshot_.playback,
                            snapshot_.transportPosition,
                            snapshot_.contentDuration);
@@ -44,8 +45,10 @@ void TimelineComponent::refreshModel(bool resetViewport) {
         snapshot_.musicalRevision == application_.musicalRevision() &&
         snapshot_.loopEnabled == application_.loopEnabled() &&
         snapshot_.metronomeEnabled == application_.metronomeEnabled() &&
-        snapshot_.metronomeLevel == application_.metronomeLevel()) return;
+        snapshot_.metronomeLevel == application_.metronomeLevel() &&
+        waveformRevision_ == application_.waveformCache().revision()) return;
     snapshot_ = application_.timelineSnapshot();
+    waveformRevision_ = application_.waveformCache().revision();
     interaction_.reconcile(snapshot_);
     transform_ = ui::timeline::CoordinateTransform{snapshot_.projectSampleRate,
         transform_.pixelsPerSecond(), resetViewport ? 0.0 : transform_.visibleStartSeconds()};
@@ -256,12 +259,62 @@ void TimelineComponent::paint(juce::Graphics& g) {
             g.fillRoundedRectangle(bounds, 4.0F);
             g.setColour(selected ? juce::Colours::white : juce::Colours::white.withAlpha(0.82F));
             g.drawRoundedRectangle(bounds, 4.0F, selected ? 2.0F : 1.0F);
+            if (const auto waveform = application_.waveformCache().find(clip.source)) {
+                auto sourceOffset = clip.sourceOffset;
+                auto waveformDuration = clip.duration;
+                if (interaction_.preview() && interaction_.preview()->id == clip.id) {
+                    sourceOffset = interaction_.preview()->sourceOffset;
+                    waveformDuration = interaction_.preview()->duration;
+                }
+                const auto visibleLeft = std::max(bounds.getX(),
+                                                  static_cast<float>(viewport.getX()));
+                const auto visibleRight = std::min(bounds.getRight(),
+                                                   static_cast<float>(viewport.getRight()));
+                const auto width = static_cast<std::uint32_t>(
+                    std::max(1.0F, std::ceil(bounds.getWidth())));
+                const auto firstPixel = static_cast<std::uint32_t>(
+                    std::max(0.0F, std::floor(visibleLeft - bounds.getX())));
+                const auto pixelCount = static_cast<std::uint32_t>(
+                    std::max(0.0F, std::ceil(visibleRight - visibleLeft)));
+                g.setColour(juce::Colours::white.withAlpha(0.72F));
+                ui::timeline::visitWaveformColumns(
+                    *waveform, sourceOffset, waveformDuration,
+                    snapshot_.projectSampleRate, width, firstPixel, pixelCount,
+                    [&](const ui::timeline::WaveformColumn& column) noexcept {
+                        const auto x = bounds.getX() + column.pixel;
+                        if (waveform->channelCount == 1) {
+                            const auto centre = bounds.getCentreY();
+                            const auto scale = bounds.getHeight() * 0.40F;
+                            g.drawVerticalLine(static_cast<int>(std::round(x)),
+                                centre - column.channels[0].maximum * scale,
+                                centre - column.channels[0].minimum * scale);
+                        } else {
+                            const auto half = bounds.getHeight() * 0.5F;
+                            const auto scale = half * 0.38F;
+                            for (std::uint32_t channel = 0; channel < 2; ++channel) {
+                                const auto centre = bounds.getY() +
+                                    half * (static_cast<float>(channel) + 0.5F);
+                                g.drawVerticalLine(static_cast<int>(std::round(x)),
+                                    centre - column.channels[channel].maximum * scale,
+                                    centre - column.channels[channel].minimum * scale);
+                            }
+                        }
+                    });
+            } else if (bounds.getWidth() > 42.0F) {
+                g.setColour(juce::Colours::white.withAlpha(0.35F));
+                g.drawText("Waveform unavailable", bounds.toNearestInt().reduced(9, 2),
+                           juce::Justification::centred, true);
+            }
             g.setColour(juce::Colours::black.withAlpha(0.25F));
             g.fillRect(bounds.withWidth(std::min(7.0F, bounds.getWidth())));
             g.fillRect(bounds.withLeft(std::max(bounds.getX(), bounds.getRight() - 7.0F)));
             if (bounds.getWidth() > 26.0F) {
+                const auto labelBounds = bounds.toNearestInt().reduced(9, 2)
+                    .withHeight(17);
+                g.setColour(juce::Colours::black.withAlpha(0.52F));
+                g.fillRect(labelBounds.expanded(2, 0));
                 g.setColour(juce::Colours::white);
-                g.drawFittedText(clip.label, bounds.toNearestInt().reduced(9, 2),
+                g.drawFittedText(clip.label, labelBounds,
                                  juce::Justification::centredLeft, 1);
             }
         }

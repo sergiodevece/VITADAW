@@ -15,6 +15,8 @@ struct ClipSnapshot {
     media::SourceId source;
     ::vitadaw::timeline::ProjectFramePosition projectStart;
     ::vitadaw::timeline::ProjectFrameDuration duration;
+    ::vitadaw::timeline::SourceFramePosition sourceOffset;
+    double sourceFramesPerProjectFrame{1.0};
     std::string label;
     bool operator==(const ClipSnapshot&) const = default;
 };
@@ -86,6 +88,7 @@ struct ClipPreview {
     tracks::TrackId track;
     ::vitadaw::timeline::ProjectFramePosition projectStart;
     ::vitadaw::timeline::ProjectFrameDuration duration;
+    ::vitadaw::timeline::SourceFramePosition sourceOffset;
     bool validTarget{true};
 };
 
@@ -131,6 +134,7 @@ private:
     GestureKind gesture_{GestureKind::none};
     ClipPreview original_{};
     media::AudioChannelLayout originalLayout_{media::AudioChannelLayout::mono};
+    double originalSourceFramesPerProjectFrame_{1.0};
     std::optional<ClipPreview> preview_;
     double pointerOriginX_{};
 };

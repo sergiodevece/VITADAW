@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.5.4 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.5.5 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -33,6 +33,8 @@ add_library(vitadaw_core
     src/vitadaw/routing/RoutingState.cpp
     src/vitadaw/timeline/Time.cpp
     src/vitadaw/ui/timeline/TimelineModel.cpp
+    src/vitadaw/ui/timeline/WaveformView.cpp
+    src/vitadaw/waveform/WaveformCache.cpp
 )
 
 target_include_directories(vitadaw_core PUBLIC src)
@@ -245,6 +247,12 @@ if(VITADAW_BUILD_TESTS)
     target_link_libraries(vitadaw_track_operations_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_track_operations_tests
         COMMAND vitadaw_track_operations_tests)
+
+    add_executable(vitadaw_waveform_foundation_tests
+        tests/WaveformFoundationTests.cpp)
+    target_link_libraries(vitadaw_waveform_foundation_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_waveform_foundation_tests
+        COMMAND vitadaw_waveform_foundation_tests)
 
     add_executable(vitadaw_application_lifecycle_tests
         tests/ApplicationLifecycleTests.cpp)

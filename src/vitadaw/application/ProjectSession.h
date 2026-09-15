@@ -1,6 +1,7 @@
 #pragma once
 #include "vitadaw/history/UndoManager.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
+#include "vitadaw/waveform/WaveformCache.h"
 
 namespace vitadaw::application {
 struct ProjectSession {
@@ -12,11 +13,14 @@ struct ProjectSession {
     bool loopEnabled{};
     bool metronomeEnabled{};
     audio::MetronomeLevelDb metronomeLevel{};
+    waveform::WaveformCache waveforms;
     std::uint64_t appliedTemporalRevision{};
     [[nodiscard]] bool dirty() const noexcept { return history.currentStateToken() != savedStateToken; }
-    void adopt(project::ProjectState& candidate, std::filesystem::path& path) noexcept {
+    void adopt(project::ProjectState& candidate, std::filesystem::path& path,
+               waveform::WaveformCache& candidateWaveforms) noexcept {
         project.swap(candidate);
         projectFilePath.swap(path);
+        waveforms.swap(candidateWaveforms);
         history.commitBarrier(); // New session identity, monotonic revision, no old Undo.
         savedStateToken = history.currentStateToken();
         loopEnabled = false;

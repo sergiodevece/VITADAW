@@ -2,6 +2,7 @@
 
 #include "vitadaw/application/DawApplication.h"
 #include "vitadaw/commands/CommandDispatcher.h"
+#include "vitadaw/ui/timeline/WaveformView.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
@@ -57,6 +58,7 @@ private:
     ui::timeline::CoordinateTransform transform_;
     transport::TransportState transport_;
     double verticalOffset_{};
+    std::uint64_t waveformRevision_{};
     juce::ScrollBar horizontal_{false};
     juce::ScrollBar vertical_{true};
     juce::TextButton zoomOut_{"-"}, zoomIn_{"+"};

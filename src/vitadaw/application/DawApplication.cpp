@@ -520,7 +520,24 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                 }
 
                 audio::StructuralPlanPreparationResult planPreparation;
+                waveform::WaveformCache candidateWaveforms;
+                std::string waveformDiagnostic = preparation.prepared->waveformDiagnostic;
                 try {
+                    candidateWaveforms = session_.waveforms;
+                    if (preparation.prepared->waveform) {
+                        const auto stored = candidateWaveforms.store(
+                            imported.source, preparation.prepared->waveform);
+                        if (stored == waveform::WaveformCache::StoreResult::budgetExceeded)
+                            waveformDiagnostic = "Waveform cache budget exceeded";
+                        else if (stored != waveform::WaveformCache::StoreResult::stored)
+                            waveformDiagnostic = "Waveform data was invalid";
+                    }
+                    if (!waveformDiagnostic.empty())
+                        candidateWaveforms.markError(imported.source,
+                                                     waveformDiagnostic);
+                    else if (!preparation.prepared->waveform)
+                        candidateWaveforms.markError(
+                            imported.source, "Waveform data was not supplied");
                     planPreparation = audioEngine_.prepareProcessingPlanWithAudio(
                         makePlanSpecification(*candidate), imported.source,
                         std::move(preparation.prepared));
@@ -542,13 +559,15 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                     DawApplication* application;
                     project::ProjectState* candidate;
                     audio::PreparedAudibilityState audibility;
+                    waveform::WaveformCache* waveforms;
                 } commitContext{this, &*candidate,
-                                resolveAudibility(*candidate)};
+                                resolveAudibility(*candidate), &candidateWaveforms};
                 const audio::AudioFileCommitAction modelCommit{
                     &commitContext,
                     [](void* rawContext) noexcept {
                         auto& context = *static_cast<CommitContext*>(rawContext);
                         context.application->session_.project.swap(*context.candidate);
+                        context.application->session_.waveforms.swap(*context.waveforms);
                         context.application->audibility_ = context.audibility;
                         context.application->transport_.stopAndRewind();
                         context.application->transport_.setDuration(
@@ -565,6 +584,8 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
 
                 pendingAudioCommandSequence_ =
                     audioEngine_.transportSnapshot().lastProcessedCommandSequence;
+                if (!waveformDiagnostic.empty())
+                    successMessage += " | Waveform unavailable: " + waveformDiagnostic;
                 return {commands::CommandStatus::accepted,
                         std::move(successMessage)};
             } else if constexpr (std::is_same_v<T, commands::AddClip> ||

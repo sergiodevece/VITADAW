@@ -7,6 +7,7 @@
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/tracks/AudioTrack.h"
 #include "vitadaw/persistence/PersistenceResult.h"
+#include "vitadaw/waveform/WaveformCache.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -43,6 +44,8 @@ public:
 
     AudioFileMetadata metadata;
     media::MediaReference media;
+    std::shared_ptr<const waveform::PreparedWaveformData> waveform;
+    std::string waveformDiagnostic;
 };
 
 using PreparedAudioFilePtr = std::unique_ptr<PreparedAudioFile>;
