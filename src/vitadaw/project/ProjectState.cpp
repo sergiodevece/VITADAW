@@ -7,6 +7,28 @@
 #include <type_traits>
 
 namespace vitadaw::project {
+namespace {
+
+std::vector<clips::ClipId> canonicalClipIds(
+    std::span<const clips::ClipId> input) {
+    std::vector<clips::ClipId> result{input.begin(), input.end()};
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+std::optional<timeline::ProjectFramePosition> shiftedPosition(
+    timeline::ProjectFramePosition position, std::int64_t delta) noexcept {
+    if ((delta > 0 && position.value >
+                          std::numeric_limits<std::int64_t>::max() - delta) ||
+        (delta < 0 && position.value <
+                          std::numeric_limits<std::int64_t>::min() - delta)) {
+        return std::nullopt;
+    }
+    return timeline::ProjectFramePosition{position.value + delta};
+}
+
+} // namespace
 
 ProjectState::ProjectState(timeline::SampleRate projectSampleRate,
                            std::string name)
@@ -100,6 +122,41 @@ ProjectState::removeAudioTrack(tracks::TrackId track) {
     tracks_.erase(tracks_.begin() +
                   static_cast<std::ptrdiff_t>(snapshot->trackIndex));
     return snapshot;
+}
+
+ProjectState::TrackReorderResult ProjectState::reorderAudioTrack(
+    tracks::TrackId track, tracks::TrackId anchor, bool placeAfter) noexcept {
+    const auto moved = std::find_if(
+        tracks_.begin(), tracks_.end(),
+        [track](const auto& candidate) { return candidate.id == track; });
+    const auto anchored = std::find_if(
+        tracks_.begin(), tracks_.end(),
+        [anchor](const auto& candidate) { return candidate.id == anchor; });
+    if (moved == tracks_.end() || anchored == tracks_.end()) {
+        return {ClipEditStatus::trackNotFound};
+    }
+    const auto beforeIndex = static_cast<std::size_t>(moved - tracks_.begin());
+    if (track == anchor) {
+        return {ClipEditStatus::success, beforeIndex, beforeIndex, false};
+    }
+    const auto anchorIndex =
+        static_cast<std::size_t>(anchored - tracks_.begin());
+    const auto anchorAfterRemoval =
+        anchorIndex - (beforeIndex < anchorIndex ? 1U : 0U);
+    const auto afterIndex = anchorAfterRemoval + (placeAfter ? 1U : 0U);
+    if (afterIndex == beforeIndex) {
+        return {ClipEditStatus::success, beforeIndex, afterIndex, false};
+    }
+    if (beforeIndex < afterIndex) {
+        std::rotate(tracks_.begin() + static_cast<std::ptrdiff_t>(beforeIndex),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(beforeIndex + 1),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(afterIndex + 1));
+    } else {
+        std::rotate(tracks_.begin() + static_cast<std::ptrdiff_t>(afterIndex),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(beforeIndex),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(beforeIndex + 1));
+    }
+    return {ClipEditStatus::success, beforeIndex, afterIndex, true};
 }
 
 routing::BusId ProjectState::addBus(std::string name) {
@@ -628,6 +685,168 @@ ProjectState::ClipEditResult ProjectState::deleteClip(
     return {ClipEditStatus::success, clip, {}};
 }
 
+ProjectState::BatchClipEditResult ProjectState::moveClips(
+    std::span<const clips::ClipId> input, std::int64_t deltaFrames) {
+    BatchClipEditResult result;
+    const auto ids = canonicalClipIds(input);
+    if (ids.empty()) {
+        result.status = ClipEditStatus::clipNotFound;
+        return result;
+    }
+    result.before.reserve(ids.size());
+    result.after.reserve(ids.size());
+    for (const auto id : ids) {
+        const auto* clip = findClip(id);
+        if (clip == nullptr) {
+            result.status = ClipEditStatus::clipNotFound;
+            result.before.clear();
+            return result;
+        }
+        const auto trackId = trackContainingClip(id);
+        result.before.push_back({trackId, *clip});
+    }
+    for (const auto& before : result.before) {
+        const auto* track = findTrack(before.track);
+        const auto* source = findSource(before.clip.source);
+        const auto target = shiftedPosition(before.clip.projectStart, deltaFrames);
+        if (!target || track == nullptr || source == nullptr ||
+            !validateClip(*track, *source, *target, before.clip.duration,
+                          before.clip.sourceOffset)) {
+            result.status = ClipEditStatus::invalidPosition;
+            result.before.clear();
+            return result;
+        }
+        auto after = before.clip;
+        after.projectStart = *target;
+        result.after.push_back({before.track, after});
+    }
+    if (deltaFrames == 0) {
+        return result;
+    }
+    for (const auto& state : result.after) {
+        auto* track = findTrackMutable(state.track);
+        const auto found = std::find_if(
+            track->clips.begin(), track->clips.end(),
+            [&](const auto& clip) { return clip.id == state.clip.id; });
+        *found = state.clip;
+    }
+    for (auto& track : tracks_) sortTrackClips(track);
+    result.changed = true;
+    return result;
+}
+
+ProjectState::BatchClipEditResult ProjectState::deleteClips(
+    std::span<const clips::ClipId> input) {
+    BatchClipEditResult result;
+    const auto ids = canonicalClipIds(input);
+    if (ids.empty()) {
+        result.status = ClipEditStatus::clipNotFound;
+        return result;
+    }
+    result.before.reserve(ids.size());
+    for (const auto id : ids) {
+        const auto* clip = findClip(id);
+        if (clip == nullptr) {
+            result.status = ClipEditStatus::clipNotFound;
+            result.before.clear();
+            return result;
+        }
+        result.before.push_back({trackContainingClip(id), *clip});
+    }
+    for (const auto id : ids) {
+        const auto removed = deleteClip(id);
+        if (!removed) throw std::logic_error{"Validated clip batch diverged"};
+    }
+    result.changed = true;
+    return result;
+}
+
+ProjectState::BatchClipEditResult ProjectState::duplicateClips(
+    std::span<const clips::ClipId> input, std::int64_t deltaFrames) {
+    BatchClipEditResult result;
+    const auto ids = canonicalClipIds(input);
+    if (ids.empty()) {
+        result.status = ClipEditStatus::clipNotFound;
+        return result;
+    }
+    result.before.reserve(ids.size());
+    result.after.reserve(ids.size());
+    result.createdClips.reserve(ids.size());
+    for (const auto id : ids) {
+        const auto* clip = findClip(id);
+        if (clip == nullptr) {
+            result.status = ClipEditStatus::clipNotFound;
+            result.before.clear();
+            return result;
+        }
+        result.before.push_back({trackContainingClip(id), *clip});
+    }
+    std::size_t totalClips{};
+    for (const auto& track : tracks_) totalClips += track.clips.size();
+    if (ids.size() > maximumClips - totalClips ||
+        ids.size() > std::numeric_limits<std::uint64_t>::max() -
+                         nextClipId_.value) {
+        result.status = ClipEditStatus::capacityExceeded;
+        result.before.clear();
+        return result;
+    }
+    std::vector<std::pair<tracks::TrackId, std::size_t>> additions;
+    additions.reserve(ids.size());
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        const auto& original = result.before[index];
+        const auto* clip = &original.clip;
+        const auto trackId = original.track;
+        const auto* track = findTrack(trackId);
+        const auto* source = findSource(clip->source);
+        const auto target = shiftedPosition(clip->projectStart, deltaFrames);
+        if (!target || track == nullptr || source == nullptr ||
+            !validateClip(*track, *source, *target, clip->duration,
+                          clip->sourceOffset)) {
+            result.status = ClipEditStatus::invalidPosition;
+            result.before.clear();
+            result.after.clear();
+            result.createdClips.clear();
+            return result;
+        }
+        auto addition = std::find_if(
+            additions.begin(), additions.end(),
+            [trackId](const auto& value) { return value.first == trackId; });
+        std::size_t trackAdditionCount{};
+        if (addition == additions.end()) {
+            additions.push_back({trackId, 1});
+            trackAdditionCount = 1;
+        } else {
+            trackAdditionCount = ++addition->second;
+        }
+        if (trackAdditionCount > maximumClipsPerTrack - track->clips.size()) {
+            result.status = ClipEditStatus::capacityExceeded;
+            result.before.clear();
+            result.after.clear();
+            result.createdClips.clear();
+            return result;
+        }
+        const clips::ClipId created{nextClipId_.value + index};
+        auto duplicate = *clip;
+        duplicate.id = created;
+        duplicate.projectStart = *target;
+        result.after.push_back({trackId, duplicate});
+        result.createdClips.push_back(created);
+    }
+    for (const auto& addition : additions) {
+        auto* track = findTrackMutable(addition.first);
+        track->clips.reserve(track->clips.size() + addition.second);
+    }
+    for (const auto& state : result.after) {
+        findTrackMutable(state.track)->clips.push_back(state.clip);
+    }
+    for (const auto& addition : additions) {
+        sortTrackClips(*findTrackMutable(addition.first));
+    }
+    nextClipId_.value += static_cast<std::uint64_t>(ids.size());
+    result.changed = true;
+    return result;
+}
+
 ProjectState::ClipEditResult ProjectState::moveClip(
     clips::ClipId clip,
     timeline::ProjectFramePosition projectStart) noexcept {
@@ -996,6 +1215,134 @@ bool ProjectState::replaceHistoryClip(tracks::TrackId id,
     if (found == track->clips.end()) return false;
     *found = clip;
     sortTrackClips(*track);
+    return true;
+}
+
+bool ProjectState::reorderHistoryTrack(
+    tracks::TrackId track, std::size_t expectedIndex,
+    std::size_t targetIndex) noexcept {
+    if (expectedIndex >= tracks_.size() || targetIndex >= tracks_.size() ||
+        tracks_[expectedIndex].id != track) {
+        return false;
+    }
+    if (expectedIndex < targetIndex) {
+        std::rotate(tracks_.begin() + static_cast<std::ptrdiff_t>(expectedIndex),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(expectedIndex + 1),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(targetIndex + 1));
+    } else if (targetIndex < expectedIndex) {
+        std::rotate(tracks_.begin() + static_cast<std::ptrdiff_t>(targetIndex),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(expectedIndex),
+                    tracks_.begin() + static_cast<std::ptrdiff_t>(expectedIndex + 1));
+    }
+    return true;
+}
+
+bool ProjectState::restoreHistoryClips(
+    std::span<const ClipHistoryState> states) {
+    std::size_t total{};
+    for (const auto& track : tracks_) total += track.clips.size();
+    if (states.size() > maximumClips - total) return false;
+    std::vector<std::pair<tracks::TrackId, std::size_t>> additions;
+    additions.reserve(states.size());
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        const auto& state = states[index];
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (states[previous].clip.id == state.clip.id) return false;
+        }
+        auto* track = findTrackMutable(state.track);
+        const auto* source = findSource(state.clip.source);
+        if (!state.clip.id.isValid() || state.clip.id.value >= nextClipId_.value ||
+            findClip(state.clip.id) != nullptr || track == nullptr || source == nullptr ||
+            !validateClip(*track, *source, state.clip.projectStart,
+                          state.clip.duration, state.clip.sourceOffset)) {
+            return false;
+        }
+        auto found = std::find_if(
+            additions.begin(), additions.end(),
+            [&](const auto& addition) { return addition.first == state.track; });
+        if (found == additions.end()) {
+            additions.push_back({state.track, 1});
+        } else {
+            ++found->second;
+        }
+    }
+    for (const auto& addition : additions) {
+        auto* track = findTrackMutable(addition.first);
+        if (addition.second > maximumClipsPerTrack - track->clips.size()) {
+            return false;
+        }
+    }
+    for (const auto& addition : additions) {
+        auto* track = findTrackMutable(addition.first);
+        track->clips.reserve(track->clips.size() + addition.second);
+    }
+    for (const auto& state : states) {
+        findTrackMutable(state.track)->clips.push_back(state.clip);
+    }
+    for (const auto& addition : additions) {
+        sortTrackClips(*findTrackMutable(addition.first));
+    }
+    return true;
+}
+
+bool ProjectState::deleteHistoryClips(
+    std::span<const ClipHistoryState> states) noexcept {
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        const auto& state = states[index];
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (states[previous].clip.id == state.clip.id) return false;
+        }
+        const auto* track = findTrack(state.track);
+        if (track == nullptr || std::none_of(
+                track->clips.begin(), track->clips.end(),
+                [&](const auto& clip) { return clip == state.clip; })) {
+            return false;
+        }
+    }
+    for (const auto& state : states) {
+        auto* track = findTrackMutable(state.track);
+        const auto found = std::find_if(
+            track->clips.begin(), track->clips.end(),
+            [&](const auto& clip) { return clip == state.clip; });
+        track->clips.erase(found);
+    }
+    return true;
+}
+
+bool ProjectState::replaceHistoryClips(
+    std::span<const ClipHistoryState> expected,
+    std::span<const ClipHistoryState> replacement) noexcept {
+    if (expected.size() != replacement.size()) return false;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto& before = expected[index];
+        const auto& after = replacement[index];
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (expected[previous].clip.id == before.clip.id ||
+                replacement[previous].clip.id == after.clip.id) return false;
+        }
+        const auto* track = findTrack(before.track);
+        const auto* target = findTrack(after.track);
+        const auto* source = findSource(after.clip.source);
+        if (before.track != after.track || before.clip.id != after.clip.id ||
+            before.clip.source != after.clip.source ||
+            before.clip.duration != after.clip.duration ||
+            before.clip.sourceOffset != after.clip.sourceOffset ||
+            track == nullptr || target == nullptr || source == nullptr ||
+            std::none_of(track->clips.begin(), track->clips.end(),
+                         [&](const auto& clip) { return clip == before.clip; }) ||
+            !validateClip(*target, *source, after.clip.projectStart,
+                          after.clip.duration, after.clip.sourceOffset)) {
+            return false;
+        }
+    }
+    for (const auto& state : replacement) {
+        auto* track = findTrackMutable(state.track);
+        const auto found = std::find_if(
+            track->clips.begin(), track->clips.end(),
+            [&](const auto& clip) { return clip.id == state.clip.id; });
+        *found = state.clip;
+    }
+    for (auto& track : tracks_) sortTrackClips(track);
     return true;
 }
 

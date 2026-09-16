@@ -94,34 +94,49 @@ const ClipSnapshot* TimelineInteraction::find(const TimelineSnapshot& snapshot,
     return nullptr;
 }
 void TimelineInteraction::select(std::optional<clips::ClipId> clip) noexcept {
-    selection_ = clip;
+    selection_.clear();
+    if (clip) selection_.push_back(*clip);
     if (!clip) selectedTrack_.reset();
+    cancelGesture();
+}
+void TimelineInteraction::selectClips(std::span<const clips::ClipId> clips) {
+    selection_.assign(clips.begin(), clips.end());
+    std::sort(selection_.begin(), selection_.end());
+    selection_.erase(std::unique(selection_.begin(), selection_.end()),
+                     selection_.end());
+    if (selection_.empty()) selectedTrack_.reset();
+    cancelGesture();
+}
+bool TimelineInteraction::isSelected(clips::ClipId clip) const noexcept {
+    return std::binary_search(selection_.begin(), selection_.end(), clip);
+}
+void TimelineInteraction::toggleClip(tracks::TrackId track,
+                                     clips::ClipId clip) {
+    const auto found = std::lower_bound(selection_.begin(), selection_.end(), clip);
+    if (found != selection_.end() && *found == clip) selection_.erase(found);
+    else selection_.insert(found, clip);
+    selectedTrack_ = track;
     cancelGesture();
 }
 void TimelineInteraction::selectTrack(
     std::optional<tracks::TrackId> track) noexcept {
     selectedTrack_ = track;
-    selection_.reset();
+    selection_.clear();
     cancelGesture();
 }
 void TimelineInteraction::selectClip(tracks::TrackId track,
                                      clips::ClipId clip) noexcept {
     selectedTrack_ = track;
-    selection_ = clip;
+    if (!isSelected(clip)) {
+        selection_.assign(1, clip);
+    }
     cancelGesture();
 }
 void TimelineInteraction::reconcile(const TimelineSnapshot& snapshot) noexcept {
-    const TrackSnapshot* owner{};
-    if (selection_) {
-        for (const auto& track : snapshot.tracks)
-            if (std::any_of(track.clips.begin(), track.clips.end(),
-                            [&](const auto& clip) { return clip.id == *selection_; })) {
-                owner = &track;
-                break;
-            }
-        if (owner == nullptr) selection_.reset();
-        else selectedTrack_ = owner->id;
-    }
+    selection_.erase(
+        std::remove_if(selection_.begin(), selection_.end(),
+                       [&](const auto id) { return find(snapshot, id) == nullptr; }),
+        selection_.end());
     if (selectedTrack_ && std::none_of(
             snapshot.tracks.begin(), snapshot.tracks.end(),
             [&](const auto& track) { return track.id == *selectedTrack_; })) {
@@ -133,12 +148,13 @@ bool TimelineInteraction::beginGesture(GestureKind kind, const ClipSnapshot& cli
                                        double pointerX) noexcept {
     if (kind == GestureKind::none || !std::isfinite(pointerX) ||
         clip.projectStart.value < 0 || clip.duration.value <= 0.0) return false;
-    selection_ = clip.id;
+    selection_.assign(1, clip.id);
     gesture_ = kind;
     original_ = {clip.id, {}, clip.projectStart, clip.duration,
                  clip.sourceOffset, true};
     originalSourceFramesPerProjectFrame_ = clip.sourceFramesPerProjectFrame;
-    preview_ = original_;
+    originals_.assign(1, original_);
+    previews_.assign(1, original_);
     pointerOriginX_ = pointerX;
     return true;
 }
@@ -150,37 +166,92 @@ bool TimelineInteraction::beginGesture(GestureKind kind,
     selectedTrack_ = track.id;
     original_.track = track.id;
     originalLayout_ = track.layout;
-    preview_ = original_;
+    originals_.assign(1, original_);
+    previews_.assign(1, original_);
+    return true;
+}
+bool TimelineInteraction::beginMoveGesture(
+    const TimelineSnapshot& snapshot, const TrackSnapshot& track,
+    const ClipSnapshot& clip, double pointerX) {
+    if (!isSelected(clip.id) || selection_.size() <= 1) {
+        return beginGesture(GestureKind::move, track, clip, pointerX);
+    }
+    if (!std::isfinite(pointerX)) return false;
+    gesture_ = GestureKind::move;
+    originals_.clear();
+    previews_.clear();
+    originals_.reserve(selection_.size());
+    previews_.reserve(selection_.size());
+    for (const auto id : selection_) {
+        for (const auto& lane : snapshot.tracks) {
+            const auto found = std::find_if(
+                lane.clips.begin(), lane.clips.end(),
+                [id](const auto& candidate) { return candidate.id == id; });
+            if (found == lane.clips.end()) continue;
+            ClipPreview value{id, lane.id, found->projectStart, found->duration,
+                              found->sourceOffset, true};
+            originals_.push_back(value);
+            previews_.push_back(value);
+            break;
+        }
+    }
+    if (originals_.size() != selection_.size()) {
+        cancelGesture();
+        return false;
+    }
+    const auto leader = std::find_if(
+        originals_.begin(), originals_.end(),
+        [&](const auto& candidate) { return candidate.id == clip.id; });
+    original_ = *leader;
+    selectedTrack_ = track.id;
+    pointerOriginX_ = pointerX;
     return true;
 }
 void TimelineInteraction::updateGesture(double pointerX,
                                         const CoordinateTransform& transform) noexcept {
-    if (!preview_ || gesture_ == GestureKind::none || !std::isfinite(pointerX)) return;
+    if (previews_.empty() || gesture_ == GestureKind::none || !std::isfinite(pointerX)) return;
     const auto origin = transform.xToProjectFrame(pointerOriginX_);
     const auto current = transform.xToProjectFrame(pointerX);
     const auto delta = static_cast<long double>(current.value) -
                        static_cast<long double>(origin.value);
     constexpr double minimumDurationFrames = 1.0;
     if (gesture_ == GestureKind::move) {
-        const auto position = std::clamp<long double>(
-            static_cast<long double>(original_.projectStart.value) + delta, 0.0L,
-            static_cast<long double>(std::numeric_limits<std::int64_t>::max()));
-        preview_->projectStart.value = static_cast<std::int64_t>(std::llround(position));
+        auto minimumDelta = static_cast<long double>(
+            std::numeric_limits<std::int64_t>::min());
+        auto maximumDelta = static_cast<long double>(
+            std::numeric_limits<std::int64_t>::max());
+        for (const auto& original : originals_) {
+            minimumDelta = std::max(
+                minimumDelta,
+                -static_cast<long double>(original.projectStart.value));
+            maximumDelta = std::min(
+                maximumDelta,
+                static_cast<long double>(std::numeric_limits<std::int64_t>::max()) -
+                    static_cast<long double>(original.projectStart.value));
+        }
+        const auto appliedDelta = std::clamp(delta, minimumDelta, maximumDelta);
+        for (std::size_t index = 0; index < previews_.size(); ++index) {
+            const auto position =
+                static_cast<long double>(originals_[index].projectStart.value) +
+                appliedDelta;
+            previews_[index].projectStart.value =
+                static_cast<std::int64_t>(std::llround(position));
+        }
     } else if (gesture_ == GestureKind::trimLeft) {
         const auto originalEnd = static_cast<double>(original_.projectStart.value) + original_.duration.value;
         const auto start = std::clamp<double>(
             static_cast<double>(static_cast<long double>(original_.projectStart.value) + delta),
             0.0, originalEnd - minimumDurationFrames);
-        preview_->projectStart.value = static_cast<std::int64_t>(std::llround(start));
-        preview_->duration.value = originalEnd - static_cast<double>(preview_->projectStart.value);
-        const auto projectDelta = static_cast<double>(preview_->projectStart.value -
+        previews_.front().projectStart.value = static_cast<std::int64_t>(std::llround(start));
+        previews_.front().duration.value = originalEnd - static_cast<double>(previews_.front().projectStart.value);
+        const auto projectDelta = static_cast<double>(previews_.front().projectStart.value -
                                                       original_.projectStart.value);
-        preview_->sourceOffset.value = original_.sourceOffset.value +
+        previews_.front().sourceOffset.value = original_.sourceOffset.value +
             projectDelta * originalSourceFramesPerProjectFrame_;
     } else {
         const auto maximumDuration = static_cast<double>(
             std::numeric_limits<std::int64_t>::max() - original_.projectStart.value);
-        preview_->duration.value = std::clamp(
+        previews_.front().duration.value = std::clamp(
             original_.duration.value + static_cast<double>(delta),
             minimumDurationFrames, maximumDuration);
     }
@@ -190,17 +261,19 @@ void TimelineInteraction::updateGesture(
     const TimelineSnapshot& snapshot,
     std::optional<tracks::TrackId> targetTrack) noexcept {
     updateGesture(pointerX, transform);
-    if (!preview_ || gesture_ != GestureKind::move ||
+    if (previews_.empty() || gesture_ != GestureKind::move ||
         !original_.track.isValid()) return;
-    preview_->validTarget = false;
-    preview_->track = {};
+    if (previews_.size() > 1) return;
+    auto& preview = previews_.front();
+    preview.validTarget = false;
+    preview.track = {};
     if (!targetTrack) return;
     const auto found = std::find_if(
         snapshot.tracks.begin(), snapshot.tracks.end(),
         [&](const auto& track) { return track.id == *targetTrack; });
     if (found == snapshot.tracks.end()) return;
-    preview_->track = found->id;
-    preview_->validTarget = found->layout == originalLayout_;
+    preview.track = found->id;
+    preview.validTarget = found->layout == originalLayout_;
 }
 
 std::optional<tracks::TrackId> TimelineInteraction::trackAtVerticalPosition(
@@ -217,21 +290,25 @@ std::optional<tracks::TrackId> TimelineInteraction::trackAtVerticalPosition(
         : std::nullopt;
 }
 std::optional<commands::Command> TimelineInteraction::endGesture() noexcept {
-    if (!preview_) return {};
+    if (previews_.empty()) return {};
     std::optional<commands::Command> result;
-    if (gesture_ == GestureKind::move && preview_->validTarget &&
-        (preview_->projectStart != original_.projectStart ||
-         preview_->track != original_.track)) {
+    const auto& preview = previews_.front();
+    if (gesture_ == GestureKind::move && previews_.size() > 1) {
+        const auto delta = preview.projectStart.value - originals_.front().projectStart.value;
+        if (delta != 0) result = commands::MoveClips{selection_, delta};
+    } else if (gesture_ == GestureKind::move && preview.validTarget &&
+        (preview.projectStart != original_.projectStart ||
+         preview.track != original_.track)) {
         result = original_.track.isValid()
             ? std::optional<commands::Command>{commands::MoveClip{
-                  original_.id, preview_->track, preview_->projectStart}}
+                  original_.id, preview.track, preview.projectStart}}
             : std::optional<commands::Command>{commands::MoveClip{
-                  original_.id, preview_->projectStart}};
+                  original_.id, preview.projectStart}};
     }
-    else if (gesture_ == GestureKind::trimLeft && preview_->projectStart != original_.projectStart)
-        result = commands::TrimClipLeft{original_.id, preview_->projectStart};
-    else if (gesture_ == GestureKind::trimRight && preview_->duration != original_.duration) {
-        const auto end = static_cast<double>(original_.projectStart.value) + preview_->duration.value;
+    else if (gesture_ == GestureKind::trimLeft && preview.projectStart != original_.projectStart)
+        result = commands::TrimClipLeft{original_.id, preview.projectStart};
+    else if (gesture_ == GestureKind::trimRight && preview.duration != original_.duration) {
+        const auto end = static_cast<double>(original_.projectStart.value) + preview.duration.value;
         result = commands::TrimClipRight{original_.id,
             {static_cast<std::int64_t>(std::llround(end))}};
     }
@@ -240,30 +317,44 @@ std::optional<commands::Command> TimelineInteraction::endGesture() noexcept {
 }
 void TimelineInteraction::cancelGesture() noexcept {
     gesture_ = GestureKind::none;
-    preview_.reset();
+    originals_.clear();
+    previews_.clear();
+}
+const ClipPreview* TimelineInteraction::previewFor(clips::ClipId clip) const noexcept {
+    const auto found = std::find_if(
+        previews_.begin(), previews_.end(),
+        [clip](const auto& candidate) { return candidate.id == clip; });
+    return found == previews_.end() ? nullptr : &*found;
 }
 std::optional<commands::Command> TimelineInteraction::duplicateCommand(
     const TimelineSnapshot& snapshot) const noexcept {
-    if (!selection_) return {};
-    const auto* clip = find(snapshot, *selection_);
-    if (!clip) return {};
-    const auto end = static_cast<double>(clip->projectStart.value) + clip->duration.value;
-    if (!std::isfinite(end) || end >= std::ldexp(1.0, 63)) return {};
-    return commands::DuplicateClip{clip->id,
-        {static_cast<std::int64_t>(std::llround(end))}};
+    if (selection_.empty()) return {};
+    auto minimum = std::numeric_limits<std::int64_t>::max();
+    std::int64_t maximum{};
+    for (const auto id : selection_) {
+        const auto* clip = find(snapshot, id);
+        if (!clip) return {};
+        const auto end = ::vitadaw::timeline::checkedExclusiveProjectEnd(
+            clip->projectStart, clip->duration);
+        if (!end) return {};
+        minimum = std::min(minimum, clip->projectStart.value);
+        maximum = std::max(maximum, end->value);
+    }
+    return commands::DuplicateClips{selection_, maximum - minimum};
 }
 std::optional<commands::Command> TimelineInteraction::splitCommand(
     const TimelineSnapshot& snapshot,
     ::vitadaw::timeline::ProjectFramePosition playhead) const noexcept {
-    if (!selection_) return {};
-    const auto* clip = find(snapshot, *selection_);
+    if (selection_.size() != 1) return {};
+    const auto* clip = find(snapshot, selection_.front());
     if (!clip) return {};
     const auto end = static_cast<double>(clip->projectStart.value) + clip->duration.value;
     if (playhead.value <= clip->projectStart.value || static_cast<double>(playhead.value) >= end) return {};
     return commands::SplitClip{clip->id, playhead};
 }
 std::optional<commands::Command> TimelineInteraction::deleteCommand() const noexcept {
-    return selection_ ? std::optional<commands::Command>{commands::DeleteClip{*selection_}}
-                      : std::nullopt;
+    return selection_.empty()
+        ? std::nullopt
+        : std::optional<commands::Command>{commands::DeleteClips{selection_}};
 }
 } // namespace vitadaw::ui::timeline

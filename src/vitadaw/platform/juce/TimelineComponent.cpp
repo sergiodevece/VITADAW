@@ -77,13 +77,13 @@ juce::Rectangle<float> TimelineComponent::clipBounds(
     auto start = clip.projectStart;
     auto duration = clip.duration;
     auto displayTrackIndex = trackIndex;
-    if (interaction_.preview() && interaction_.preview()->id == clip.id) {
-        start = interaction_.preview()->projectStart;
-        duration = interaction_.preview()->duration;
+    if (const auto* preview = interaction_.previewFor(clip.id)) {
+        start = preview->projectStart;
+        duration = preview->duration;
         const auto target = std::find_if(
             snapshot_.tracks.begin(), snapshot_.tracks.end(),
             [&](const auto& lane) {
-                return lane.id == interaction_.preview()->track;
+                return lane.id == preview->track;
             });
         if (target != snapshot_.tracks.end()) {
             displayTrackIndex = static_cast<std::size_t>(
@@ -122,10 +122,10 @@ TimelineComponent::Hit TimelineComponent::timelineHitTest(juce::Point<float> poi
 }
 
 const ui::timeline::ClipSnapshot* TimelineComponent::selectedClip() const noexcept {
-    if (!interaction_.selection()) return nullptr;
+    if (interaction_.selections().size() != 1) return nullptr;
     for (const auto& lane : snapshot_.tracks)
         for (const auto& clip : lane.clips)
-            if (clip.id == *interaction_.selection()) return &clip;
+            if (clip.id == interaction_.selections().front()) return &clip;
     return nullptr;
 }
 
@@ -251,10 +251,10 @@ void TimelineComponent::paint(juce::Graphics& g) {
         for (const auto& clip : snapshot_.tracks[track].clips) {
             const auto bounds = clipBounds(track, clip);
             if (!bounds.intersects(viewport.toFloat())) continue; // linear ordered culling, no component tree
-            const auto selected = interaction_.selection() && *interaction_.selection() == clip.id;
-            const auto invalidPreview = interaction_.preview() &&
-                interaction_.preview()->id == clip.id &&
-                !interaction_.preview()->validTarget;
+            const auto selected = interaction_.isSelected(clip.id);
+            const auto* preview = interaction_.previewFor(clip.id);
+            const auto invalidPreview = preview != nullptr &&
+                !preview->validTarget;
             g.setColour(invalidPreview ? juce::Colour{0xffb94b4b} :
                         selected ? juce::Colour{0xffe5a84b} : juce::Colour{0xff4c87b9});
             g.fillRoundedRectangle(bounds, 4.0F);
@@ -263,9 +263,9 @@ void TimelineComponent::paint(juce::Graphics& g) {
             if (const auto waveform = application_.waveformCache().find(clip.source)) {
                 auto sourceOffset = clip.sourceOffset;
                 auto waveformDuration = clip.duration;
-                if (interaction_.preview() && interaction_.preview()->id == clip.id) {
-                    sourceOffset = interaction_.preview()->sourceOffset;
-                    waveformDuration = interaction_.preview()->duration;
+                if (preview != nullptr) {
+                    sourceOffset = preview->sourceOffset;
+                    waveformDuration = preview->duration;
                 }
                 const auto visibleLeft = std::max(bounds.getX(),
                                                   static_cast<float>(viewport.getX()));
@@ -386,6 +386,10 @@ void TimelineComponent::dispatch(std::optional<commands::Command> command) {
     }
     const auto result = dispatcher_.dispatch(*command);
     interaction_.cancelGesture();
+    if (result.status == commands::CommandStatus::accepted &&
+        !result.createdClips.empty()) {
+        interaction_.selectClips(result.createdClips);
+    }
     refreshModel(false); // model is authoritative for success and failure
     repaint();
     if (commandCompleted) commandCompleted(result);
@@ -414,9 +418,21 @@ void TimelineComponent::mouseDown(const juce::MouseEvent& event) {
         repaint();
         return;
     }
+    if (event.mods.isCommandDown() || event.mods.isCtrlDown()) {
+        interaction_.toggleClip(hit.track->id, hit.clip->id);
+        repaint();
+        return;
+    }
     interaction_.selectClip(hit.track->id, hit.clip->id);
-    static_cast<void>(interaction_.beginGesture(hit.kind, *hit.track, *hit.clip,
-                                                event.position.x - headerWidth));
+    if (hit.kind == GestureKind::move) {
+        static_cast<void>(interaction_.beginMoveGesture(
+            snapshot_, *hit.track, *hit.clip,
+            event.position.x - headerWidth));
+    } else if (interaction_.selections().size() == 1) {
+        static_cast<void>(interaction_.beginGesture(
+            hit.kind, *hit.track, *hit.clip,
+            event.position.x - headerWidth));
+    }
     repaint();
 }
 void TimelineComponent::mouseDrag(const juce::MouseEvent& event) {

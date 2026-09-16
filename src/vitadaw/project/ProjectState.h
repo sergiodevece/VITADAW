@@ -91,6 +91,36 @@ public:
         constexpr explicit operator bool() const noexcept { return succeeded(); }
     };
 
+    struct ClipHistoryState {
+        tracks::TrackId track;
+        clips::AudioClip clip;
+        bool operator==(const ClipHistoryState&) const = default;
+    };
+
+    struct BatchClipEditResult {
+        ClipEditStatus status{ClipEditStatus::success};
+        std::vector<ClipHistoryState> before;
+        std::vector<ClipHistoryState> after;
+        std::vector<clips::ClipId> createdClips;
+        bool changed{};
+
+        [[nodiscard]] bool succeeded() const noexcept {
+            return status == ClipEditStatus::success;
+        }
+        explicit operator bool() const noexcept { return succeeded(); }
+    };
+
+    struct TrackReorderResult {
+        ClipEditStatus status{ClipEditStatus::success};
+        std::size_t beforeIndex{};
+        std::size_t afterIndex{};
+        bool changed{};
+        [[nodiscard]] bool succeeded() const noexcept {
+            return status == ClipEditStatus::success;
+        }
+        explicit operator bool() const noexcept { return succeeded(); }
+    };
+
     explicit ProjectState(timeline::SampleRate projectSampleRate,
                           std::string name = "Untitled");
 
@@ -106,6 +136,8 @@ public:
         tracks::TrackId track) const;
     [[nodiscard]] std::optional<TrackHistoryState> removeAudioTrack(
         tracks::TrackId track);
+    [[nodiscard]] TrackReorderResult reorderAudioTrack(
+        tracks::TrackId track, tracks::TrackId anchor, bool placeAfter) noexcept;
     [[nodiscard]] routing::BusId addBus(std::string name);
     [[nodiscard]] bool setTrackOutputDestination(
         tracks::TrackId track,
@@ -174,6 +206,12 @@ public:
         timeline::SourceFramePosition sourceOffset = {0.0});
     [[nodiscard]] ClipEditResult removeClip(clips::ClipId clip) noexcept;
     [[nodiscard]] ClipEditResult deleteClip(clips::ClipId clip) noexcept;
+    [[nodiscard]] BatchClipEditResult moveClips(
+        std::span<const clips::ClipId> clips, std::int64_t deltaFrames);
+    [[nodiscard]] BatchClipEditResult deleteClips(
+        std::span<const clips::ClipId> clips);
+    [[nodiscard]] BatchClipEditResult duplicateClips(
+        std::span<const clips::ClipId> clips, std::int64_t deltaFrames);
     [[nodiscard]] ClipEditResult moveClip(
         clips::ClipId clip,
         timeline::ProjectFramePosition projectStart) noexcept;
@@ -210,6 +248,16 @@ private:
         tracks::TrackId toTrack, const clips::AudioClip& after);
     [[nodiscard]] bool replaceHistoryClip(tracks::TrackId track,
                                           const clips::AudioClip& clip) noexcept;
+    [[nodiscard]] bool reorderHistoryTrack(
+        tracks::TrackId track, std::size_t expectedIndex,
+        std::size_t targetIndex) noexcept;
+    [[nodiscard]] bool restoreHistoryClips(
+        std::span<const ClipHistoryState> clips);
+    [[nodiscard]] bool deleteHistoryClips(
+        std::span<const ClipHistoryState> clips) noexcept;
+    [[nodiscard]] bool replaceHistoryClips(
+        std::span<const ClipHistoryState> expected,
+        std::span<const ClipHistoryState> replacement) noexcept;
     [[nodiscard]] processors::InsertChain* findProcessorChain(
         processors::ProcessorInstanceId processor) noexcept;
     [[nodiscard]] const processors::InsertChain* findProcessorChain(

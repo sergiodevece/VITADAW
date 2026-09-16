@@ -43,7 +43,9 @@ public:
         auto result = std::make_unique<audio::PreparedAudioFile>(
             audio::AudioFileMetadata{timeline::SampleRate{48000.0}, channels,
                                      {48000}, {1.0}});
-        result->media = {path, {}, {}};
+        result->media = {
+            std::filesystem::path{"/tmp"} / path.filename(), {},
+            media::MediaFingerprint{std::string(64, 'a'), 96000}};
         return {std::move(result), {}};
     }
     audio::StructuralPlanPreparationResult prepareProcessingPlan(
@@ -71,6 +73,7 @@ public:
             static_cast<Plan*>(prepared.release()));
         active.swap(next);
         commit.execute();
+        ++commits;
         return true;
     }
     bool tryUpdateTrackMix(tracks::TrackId, mixer::PreparedTrackMixState,
@@ -141,6 +144,7 @@ public:
     bool failPreparation{};
     bool failCommit{};
     unsigned preparations{};
+    unsigned commits{};
     unsigned destroyedPlans{};
     std::unique_ptr<Plan> active;
     audio::RealtimeTransportSnapshot snapshot;
@@ -452,6 +456,182 @@ void certifiedTemporalBoundaryOperations() {
         "negative clip start is rejected before preparation");
 }
 
+void arrangeEditingIIBatchOperations() {
+    TestEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}};
+    commands::CommandDispatcher dispatch{app};
+    const auto accepted = [&](commands::Command command) {
+        const auto result = dispatch.dispatch(command);
+        check(result.status == commands::CommandStatus::accepted,
+              "Arrange Editing II fixture command accepted");
+        return result;
+    };
+
+    accepted(commands::AddAudioTrack{"One"});
+    accepted(commands::AddAudioTrack{"Two"});
+    accepted(commands::AddAudioTrack{"Three"});
+    accepted(commands::ImportAudioToTrack{"one.wav", {1}, {100}});
+    accepted(commands::ImportAudioToTrack{"two.wav", {2}, {500}});
+    const auto one = app.project().tracks()[0].clips[0];
+    const auto two = app.project().tracks()[1].clips[0];
+
+    const auto preparationsBeforeReorder = engine.preparations;
+    const auto commitsBeforeReorder = engine.commits;
+    accepted(commands::ReorderAudioTrack{
+        {1}, {3}, commands::TrackPlacement::after});
+    check(app.project().tracks()[0].id == tracks::TrackId{2} &&
+              app.project().tracks()[1].id == tracks::TrackId{3} &&
+              app.project().tracks()[2].id == tracks::TrackId{1} &&
+              app.project().findClip(one.id) != nullptr &&
+              app.project().routing().findTrackRoute({1}) != nullptr &&
+              engine.preparations == preparationsBeforeReorder + 1 &&
+              engine.commits == commitsBeforeReorder + 1,
+          "reorder changes only documentary order with one preparation");
+    accepted(commands::Undo{});
+    check(app.project().tracks()[0].id == tracks::TrackId{1},
+          "reorder Undo restores exact order");
+    accepted(commands::Redo{});
+    check(app.project().tracks()[2].id == tracks::TrackId{1},
+          "reorder Redo restores exact order");
+    const auto reorderNoopPreparations = engine.preparations;
+    const auto reorderNoopHistory = app.history().size();
+    accepted(commands::ReorderAudioTrack{
+        {1}, {1}, commands::TrackPlacement::before});
+    check(engine.preparations == reorderNoopPreparations &&
+              app.history().size() == reorderNoopHistory &&
+              dispatch.dispatch(commands::ReorderAudioTrack{
+                  {999}, {1}, commands::TrackPlacement::before}).error ==
+                  commands::CommandError::trackNotFound,
+          "reorder self is a no-op and missing TrackId is rejected");
+
+    const auto preparationsBeforeMove = engine.preparations;
+    const auto commitsBeforeMove = engine.commits;
+    const auto historyBeforeMove = app.history().size();
+    accepted(commands::MoveClips{{two.id, one.id, two.id}, 1000});
+    check(app.project().findClip(one.id)->projectStart.value == 1100 &&
+              app.project().findClip(two.id)->projectStart.value == 1500 &&
+              app.project().trackContainingClip(one.id) == tracks::TrackId{1} &&
+              app.project().trackContainingClip(two.id) == tracks::TrackId{2} &&
+              engine.preparations == preparationsBeforeMove + 1 &&
+              engine.commits == commitsBeforeMove + 1 &&
+              app.history().size() == historyBeforeMove + 1,
+          "MoveClips preserves owners and relative offsets in one transaction");
+    const auto noopPreparations = engine.preparations;
+    const auto noopHistory = app.history().size();
+    accepted(commands::MoveClips{{one.id, two.id}, 0});
+    check(engine.preparations == noopPreparations &&
+              app.history().size() == noopHistory,
+          "zero-delta MoveClips is a no-op without preparation or history");
+    accepted(commands::Undo{});
+    check(*app.project().findClip(one.id) == one &&
+              *app.project().findClip(two.id) == two,
+          "MoveClips Undo restores all clips exactly");
+    accepted(commands::Redo{});
+
+    const auto duplicatePreparations = engine.preparations;
+    const auto duplicateCommits = engine.commits;
+    const auto duplicateResult = accepted(
+        commands::DuplicateClips{{two.id, one.id, one.id}, 2000});
+    check(duplicateResult.createdClips ==
+              std::vector<clips::ClipId>{{3}, {4}} &&
+              app.project().findClip({3})->source == one.source &&
+              app.project().findClip({3})->projectStart.value == 3100 &&
+              app.project().findClip({4})->source == two.source &&
+              app.project().findClip({4})->projectStart.value == 3500 &&
+              engine.preparations == duplicatePreparations + 1 &&
+              engine.commits == duplicateCommits + 1,
+          "DuplicateClips assigns deterministic IDs and returns created selection");
+    accepted(commands::Undo{});
+    check(app.project().findClip({3}) == nullptr &&
+              app.project().findClip({4}) == nullptr,
+          "DuplicateClips Undo removes the whole batch");
+    accepted(commands::Redo{});
+    check(app.project().findClip({3}) != nullptr &&
+              app.project().findClip({4}) != nullptr,
+          "DuplicateClips Redo restores the same IDs");
+
+    const auto deletePreparations = engine.preparations;
+    const auto deleteCommits = engine.commits;
+    accepted(commands::DeleteClips{{{4}, {3}, {4}}});
+    check(app.project().findClip({3}) == nullptr &&
+              app.project().findClip({4}) == nullptr &&
+              app.project().sources().size() == 2 &&
+              engine.preparations == deletePreparations + 1 &&
+              engine.commits == deleteCommits + 1,
+          "DeleteClips deduplicates IDs and preserves Sources");
+    accepted(commands::Undo{});
+    check(app.project().findClip({3}) != nullptr &&
+              app.project().findClip({4}) != nullptr,
+          "DeleteClips Undo restores the entire batch");
+    const auto encoded = persistence::serializeProject(
+        app.project(), "/tmp/vitadaw-arrange-editing-ii.vitadaw");
+    const auto loaded = persistence::deserializeProject(encoded.bytes);
+    check(encoded.result.success(), "Arrange Editing II project serializes");
+    check(loaded.result.success(), "Arrange Editing II project deserializes");
+    check(loaded.project->documentData().tracks ==
+              app.project().documentData().tracks,
+          "schema v3 round-trip preserves reorder and batch ownership");
+    check(loaded.project->documentData().nextClipId ==
+              app.project().documentData().nextClipId,
+          "schema v3 round-trip preserves batch nextClipId");
+
+    const auto rejectedPreparations = engine.preparations;
+    const auto rejectedToken = app.history().currentStateToken();
+    const auto rejectedOne = *app.project().findClip(one.id);
+    check(dispatch.dispatch(commands::MoveClips{{one.id, {9999}}, -5000}).error ==
+              commands::CommandError::clipNotFound &&
+              dispatch.dispatch(commands::DeleteClips{{one.id, {9999}}}).error ==
+              commands::CommandError::clipNotFound &&
+              dispatch.dispatch(commands::DuplicateClips{{one.id, {9999}}, 1}).error ==
+              commands::CommandError::clipNotFound &&
+              engine.preparations == rejectedPreparations &&
+              app.history().currentStateToken() == rejectedToken &&
+              *app.project().findClip(one.id) == rejectedOne,
+          "a missing batch member rejects every operation before preparation");
+    check(dispatch.dispatch(commands::MoveClips{{}, 1}).error ==
+              commands::CommandError::validationFailed &&
+              dispatch.dispatch(commands::DeleteClips{{}}).error ==
+              commands::CommandError::validationFailed &&
+              dispatch.dispatch(commands::DuplicateClips{{}, 1}).error ==
+              commands::CommandError::validationFailed &&
+              engine.preparations == rejectedPreparations,
+          "empty batches are explicit validation failures without preparation");
+
+    const auto boundaryDelta =
+        timeline::maximumSupportedProjectFrame().value -
+        timeline::checkedExclusiveProjectEnd(
+            rejectedOne.projectStart, rejectedOne.duration)->value + 1;
+    check(dispatch.dispatch(commands::MoveClips{{one.id, two.id}, boundaryDelta}).error ==
+              commands::CommandError::invalidPosition &&
+              engine.preparations == rejectedPreparations &&
+              app.history().currentStateToken() == rejectedToken,
+          "one out-of-domain member rejects the complete MoveClips batch");
+
+    engine.failPreparation = true;
+    const auto rollbackToken = app.history().currentStateToken();
+    const auto rollbackOne = *app.project().findClip(one.id);
+    check(dispatch.dispatch(commands::MoveClips{{one.id, two.id}, 1}).error ==
+              commands::CommandError::preparationFailed &&
+              app.history().currentStateToken() == rollbackToken &&
+              *app.project().findClip(one.id) == rollbackOne,
+          "batch preparation failure rolls back model and history");
+
+    accepted(commands::Play{});
+    app.synchroniseTransport();
+    check(dispatch.dispatch(commands::MoveClips{{one.id}, 1}).error ==
+              commands::CommandError::transportMustBeStopped &&
+              dispatch.dispatch(commands::ReorderAudioTrack{
+                  {1}, {2}, commands::TrackPlacement::before}).error ==
+              commands::CommandError::transportMustBeStopped,
+          "batch edits reject Playing and reorder requires Stopped");
+    accepted(commands::Pause{});
+    app.synchroniseTransport();
+    accepted(commands::MoveClips{{one.id, two.id}, 1});
+    check(app.transport().playback == transport::PlaybackState::paused &&
+              !app.canRedo(),
+          "horizontal MoveClips preserves Paused transport and branches history");
+}
+
 void dspAndPersistenceOperations() {
     project::ProjectState project{timeline::SampleRate{48000.0}, "Tracks"};
     const auto a = project.addAudioTrack("A", media::AudioChannelLayout::mono);
@@ -484,6 +664,12 @@ void dspAndPersistenceOperations() {
     const auto overlap = renderFirstSample(project, source);
     check(std::abs(overlap - throughB * 2.0F) < 1.0e-4F,
           "overlapping clips sum before the destination track insert");
+    const auto beforeReorder = renderFirstSample(project, source);
+    check(project.reorderAudioTrack(a, empty, true).succeeded() &&
+              project.tracks()[0].id == b && project.tracks()[1].id == empty &&
+              project.tracks()[2].id == a &&
+              renderFirstSample(project, source) == beforeReorder,
+          "documentary reorder preserves prepared DSP behaviour");
 
     project::ProjectState stereoProject{timeline::SampleRate{48000.0}};
     const auto stereoA = stereoProject.addAudioTrack(
@@ -504,8 +690,8 @@ void dspAndPersistenceOperations() {
           loaded.project->documentData().tracks == project.documentData().tracks &&
           loaded.project->documentData().routing.trackRoutes ==
               project.documentData().routing.trackRoutes &&
-          loaded.project->tracks()[2].id == empty &&
-          loaded.project->tracks()[2].clips.empty(),
+          loaded.project->tracks()[1].id == empty &&
+          loaded.project->tracks()[1].clips.empty(),
           "schema v3 round-trip preserves order, IDs, ownership and empty tracks");
 
     project::ProjectState large{timeline::SampleRate{48000.0}};
@@ -543,6 +729,86 @@ void dspAndPersistenceOperations() {
               project::ProjectState::maximumTracks,
           "track capacity rejects 257 without partial mutation");
 }
+
+void reorderRoutingPersistenceContract() {
+    project::ProjectState project{timeline::SampleRate{48000.0},
+                                  "Reorder routing contract"};
+    const auto t1 = project.addAudioTrack("T1");
+    const auto t2 = project.addAudioTrack("T2");
+    const auto t3 = project.addAudioTrack("T3");
+    const auto music = project.addBus("Music");
+    const auto aux = project.addBus("Aux");
+    check(project.setTrackOutputDestination(
+              t1, routing::OutputDestination::toBus(music)),
+          "reorder contract routes T1 to Music by TrackId");
+    const auto trackSend = project.addSend(
+        t1, aux, routing::SendTapPoint::preFaderPrePan, {{-12.0F}, false});
+    const auto busSend = project.addSend(
+        music, aux, routing::SendTapPoint::postFaderPostPan,
+        {{-6.0F}, false});
+    check(trackSend.isValid() && busSend.isValid(),
+          "reorder contract creates track and bus sends");
+    const auto imported = project.importAudioToTrack(
+        t1, {"/tmp/reorder-routing.wav", {},
+             media::MediaFingerprint{std::string(64, 'b'), 512}},
+        {256}, timeline::SampleRate{48000.0},
+        media::AudioChannelLayout::mono, {0});
+    check(project.addClip(t2, imported.source, {0}, {256.0}, {0.0}).isValid(),
+          "reorder contract contains clips on multiple tracks");
+
+    std::array<float, 256> pcm;
+    pcm.fill(0.125F);
+    const audio::PreparedSourceView source{
+        imported.source, {{pcm.data(), nullptr}}, 1, {pcm.size()},
+        timeline::SampleRate{48000.0}, media::AudioChannelLayout::mono};
+    const auto before = renderFirstSample(project, source);
+    const auto routesBefore = project.routing().trackRoutes();
+    const auto sendsBefore = project.routing().sends();
+    check(project.reorderAudioTrack(t3, t1, false).succeeded() &&
+              project.tracks()[0].id == t3 &&
+              project.tracks()[1].id == t1 &&
+              project.tracks()[2].id == t2,
+          "reorder contract establishes non-trivial documentary order");
+    check(project.routing().trackRoutes() == routesBefore &&
+              project.routing().trackRoutes()[0].track == t1 &&
+              project.routing().trackRoutes()[1].track == t2 &&
+              project.routing().trackRoutes()[2].track == t3 &&
+              project.tracks()[0].id !=
+                  project.routing().trackRoutes()[0].track,
+          "track routes are an independent TrackId collection, not a positional parallel vector");
+    check(project.routing().findTrackRoute(t1)->destination ==
+              routing::OutputDestination::toBus(music) &&
+              project.findSend(trackSend)->source == routing::SendSource{t1} &&
+              project.findSend(trackSend)->destination == aux &&
+              project.findSend(busSend)->source == routing::SendSource{music} &&
+              project.findSend(busSend)->destination == aux &&
+              project.routing().sends() == sendsBefore,
+          "reorder preserves routing and send identities");
+    check(renderFirstSample(project, source) == before,
+          "reorder preserves playback with routed tracks and sends");
+
+    const auto firstSave = persistence::serializeProject(
+        project, "/tmp/vitadaw-reorder-routing.vitadaw");
+    const auto loaded = persistence::deserializeProject(firstSave.bytes);
+    check(firstSave.result.success() && loaded.result.success() &&
+              loaded.project->tracks()[0].id == t3 &&
+              loaded.project->tracks()[1].id == t1 &&
+              loaded.project->tracks()[2].id == t2,
+          "Save and Load preserve documentary track order");
+    check(loaded.project->routing().trackRoutes()[0].track == t1 &&
+              loaded.project->routing().trackRoutes()[1].track == t2 &&
+              loaded.project->routing().trackRoutes()[2].track == t3 &&
+              loaded.project->routing().findTrackRoute(t1)->destination ==
+                  routing::OutputDestination::toBus(music) &&
+              loaded.project->routing().sends() == sendsBefore,
+          "Load preserves TrackId routing and canonical TrackId route order");
+    check(renderFirstSample(*loaded.project, source) == before,
+          "playback after reordered Save and Load is bit-identical");
+    const auto secondSave = persistence::serializeProject(
+        *loaded.project, "/tmp/vitadaw-reorder-routing.vitadaw");
+    check(secondSave.result.success() && secondSave.bytes == firstSave.bytes,
+          "second Save preserves the canonical TrackId route representation");
+}
 } // namespace
 
 void* operator new(std::size_t size) {
@@ -560,6 +826,8 @@ int main() {
     applicationOperations();
     moveAndFailureOperations();
     certifiedTemporalBoundaryOperations();
+    arrangeEditingIIBatchOperations();
     dspAndPersistenceOperations();
+    reorderRoutingPersistenceContract();
     std::cout << "Track operations and cross-track editing tests passed\n";
 }

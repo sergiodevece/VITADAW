@@ -1,4 +1,4 @@
-# VitaDAW 0.6.4 — Arrange Editing I
+# VitaDAW 0.6.5 — Arrange Editing II
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -292,6 +292,15 @@ modelo, plan ni historial. Continúan permitidos los huecos, los movimientos má
 allá del contenido actual, los clips adyacentes y los solapes parciales o
 completos; los solapes se suman antes de los inserts de la pista. El schema
 documental permanece en v3.
+
+VitaDAW 0.6.5 añade reorder documental de pistas por IDs estables y edición
+atómica de varios clips. La selección múltiple es efímera y se reconcilia por
+`ClipId`; Move horizontal, Delete y Duplicate canonicalizan el conjunto,
+validan completamente el candidato y publican una sola preparación, commit y
+acción de historial. Duplicate desplaza el bloque por su ancho temporal total,
+incluidos huecos, y devuelve sus nuevos IDs monotónicos para seleccionar el
+resultado. El orden del array de pistas conserva el reorder en Save/Load sin
+cambiar schema v3 ni el orden DSP independiente por `TrackId`.
 
 ## Tecnología propuesta
 
@@ -697,6 +706,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.6.4 — Arrange Editing I:** consolidación de Add/Delete Track y Move Clip
   sobre el dominio temporal 0.6.x, validación anticipada de inicio/final
   certificados y preservación transaccional de modelo, plan e historial.
+- **0.6.5 — Arrange Editing II:** reorder de pistas por identidad estable,
+  multiselección efímera y Move/Delete/Duplicate múltiples, atómicos y
+  undoables con una sola preparación y commit por gesto.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -729,4 +741,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.1.md`](docs/validation-0.6.1.md) y
 [`docs/validation-0.6.2.md`](docs/validation-0.6.2.md) y
 [`docs/validation-0.6.3.md`](docs/validation-0.6.3.md) y
-[`docs/validation-0.6.4.md`](docs/validation-0.6.4.md).
+[`docs/validation-0.6.4.md`](docs/validation-0.6.4.md) y
+[`docs/validation-0.6.5.md`](docs/validation-0.6.5.md).

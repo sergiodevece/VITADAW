@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace vitadaw::commands {
 
@@ -19,6 +20,12 @@ struct AddAudioTrack {
     media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
 };
 struct DeleteAudioTrack { tracks::TrackId track; };
+enum class TrackPlacement { before, after };
+struct ReorderAudioTrack {
+    tracks::TrackId track;
+    tracks::TrackId anchor;
+    TrackPlacement placement{TrackPlacement::before};
+};
 
 struct AddBus {
     std::string name;
@@ -81,6 +88,15 @@ struct TrimClipRight {
     timeline::ProjectFramePosition projectEnd;
 };
 struct DeleteClip { clips::ClipId clip; };
+struct MoveClips {
+    std::vector<clips::ClipId> clips;
+    std::int64_t deltaFrames{};
+};
+struct DeleteClips { std::vector<clips::ClipId> clips; };
+struct DuplicateClips {
+    std::vector<clips::ClipId> clips;
+    std::int64_t deltaFrames{};
+};
 
 struct Play {};
 struct AddTempoChange { musical::MusicalTickPosition tick; musical::TempoBpm bpm; };
@@ -167,11 +183,13 @@ struct SetProcessorParameter {
     float value{};
 };
 
-using Command = std::variant<AddAudioTrack, DeleteAudioTrack, AddBus, LoadAudioFile,
+using Command = std::variant<AddAudioTrack, DeleteAudioTrack, ReorderAudioTrack,
+                             AddBus, LoadAudioFile,
                              ImportAudioToTrack, ImportAudioFile,
                              AddClip, RemoveClip,
                              RemoveSource, MoveClip, DuplicateClip, SplitClip,
                              TrimClipLeft, TrimClipRight, DeleteClip,
+                             MoveClips, DeleteClips, DuplicateClips,
                              AddTempoChange, MoveTempoChange, SetTempo, RemoveTempoChange,
                              AddTimeSignatureChange, MoveTimeSignatureChange, SetTimeSignature, RemoveTimeSignatureChange,
                              SetLoopRangeMusical, SetLoopEnabled,
@@ -224,12 +242,16 @@ enum class CommandError {
 
 struct CommandResult {
     CommandResult(CommandStatus s = CommandStatus::accepted, std::string text = {},
-        CommandError e = CommandError::none, persistence::PersistenceResult p = {}) noexcept
-        : status(s), message(std::move(text)), error(e), persistence(std::move(p)) {}
+        CommandError e = CommandError::none, persistence::PersistenceResult p = {},
+        std::vector<clips::ClipId> created = {}) noexcept
+        : status(s), message(std::move(text)), error(e), persistence(std::move(p)),
+          createdClips(std::move(created)) {}
     CommandStatus status{CommandStatus::accepted};
     std::string message;
     CommandError error{CommandError::none};
     persistence::PersistenceResult persistence;
+    // Specific structural result used to transfer DuplicateClips selection.
+    std::vector<clips::ClipId> createdClips;
 };
 
 class ICommandHandler {

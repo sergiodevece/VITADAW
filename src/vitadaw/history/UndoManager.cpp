@@ -11,7 +11,9 @@ std::string_view UndoableOperation::label() const noexcept {
     constexpr std::string_view labels[]{"history.moveClip", "history.duplicateClip",
         "history.splitClip", "history.trimClipLeft", "history.trimClipRight",
         "history.deleteClip", "history.tempo", "history.timeSignature",
-        "history.loopRange", "history.addAudioTrack", "history.deleteAudioTrack"};
+        "history.loopRange", "history.addAudioTrack", "history.deleteAudioTrack",
+        "history.reorderAudioTrack", "history.moveClips",
+        "history.duplicateClips", "history.deleteClips"};
     return labels[payload.index()];
 }
 
@@ -34,6 +36,15 @@ std::size_t UndoableOperation::approximateMemoryBytes() const noexcept {
             return edit.created ? trackBytes(*edit.created) : 0;
         else if constexpr (std::is_same_v<T, DeleteAudioTrack>)
             return edit.removed ? trackBytes(*edit.removed) : 0;
+        else if constexpr (std::is_same_v<T, MoveClips>)
+            return (edit.before.capacity() + edit.after.capacity()) *
+                   sizeof(project::ProjectState::ClipHistoryState);
+        else if constexpr (std::is_same_v<T, DuplicateClips>)
+            return edit.created.capacity() *
+                   sizeof(project::ProjectState::ClipHistoryState);
+        else if constexpr (std::is_same_v<T, DeleteClips>)
+            return edit.removed.capacity() *
+                   sizeof(project::ProjectState::ClipHistoryState);
         return 0;
     }, payload);
 }
@@ -61,6 +72,24 @@ bool UndoableOperation::apply(project::ProjectState& candidate, bool forward) co
             if (!forward) return candidate.restoreHistoryTrack(*edit.removed);
             const auto removed = candidate.removeAudioTrack(edit.removed->track.id);
             return removed && *removed == *edit.removed;
+        } else if constexpr (std::is_same_v<T, ReorderAudioTrack>) {
+            return candidate.reorderHistoryTrack(
+                edit.track, forward ? edit.beforeIndex : edit.afterIndex,
+                forward ? edit.afterIndex : edit.beforeIndex);
+        } else if constexpr (std::is_same_v<T, MoveClips>) {
+            return candidate.replaceHistoryClips(
+                forward ? std::span<const project::ProjectState::ClipHistoryState>{edit.before}
+                        : std::span<const project::ProjectState::ClipHistoryState>{edit.after},
+                forward ? std::span<const project::ProjectState::ClipHistoryState>{edit.after}
+                        : std::span<const project::ProjectState::ClipHistoryState>{edit.before});
+        } else if constexpr (std::is_same_v<T, DuplicateClips>) {
+            return forward
+                ? candidate.restoreHistoryClips(edit.created)
+                : candidate.deleteHistoryClips(edit.created);
+        } else if constexpr (std::is_same_v<T, DeleteClips>) {
+            return forward
+                ? candidate.deleteHistoryClips(edit.removed)
+                : candidate.restoreHistoryClips(edit.removed);
         } else if constexpr (std::is_same_v<T, MoveClip>) {
             return candidate.transferHistoryClip(
                 forward ? edit.beforeTrack : edit.afterTrack,

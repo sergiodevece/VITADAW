@@ -80,8 +80,11 @@ public:
             }
             dispatch(commands::DeleteAudioTrack{*selected});
         };
+        moveTrackUp_.onClick = [this] { reorderSelectedTrack(false); };
+        moveTrackDown_.onClick = [this] { reorderSelectedTrack(true); };
         for (auto* button : {&importButton_, &addMonoTrack_,
-                             &addStereoTrack_, &deleteTrack_})
+                             &addStereoTrack_, &deleteTrack_,
+                             &moveTrackUp_, &moveTrackDown_})
             addAndMakeVisible(*button);
 
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
@@ -265,8 +268,10 @@ public:
         bounds.removeFromTop(5);
         auto importRow = bounds.removeFromTop(32);
         for (auto* button : {&importButton_, &addMonoTrack_,
-                             &addStereoTrack_, &deleteTrack_}) {
-            button->setBounds(importRow.removeFromLeft(150));
+                             &addStereoTrack_, &deleteTrack_,
+                             &moveTrackUp_, &moveTrackDown_}) {
+            button->setBounds(importRow.removeFromLeft(
+                button == &moveTrackUp_ || button == &moveTrackDown_ ? 125 : 140));
             importRow.removeFromLeft(5);
         }
         bounds.removeFromTop(8);
@@ -276,6 +281,32 @@ public:
     }
 
 private:
+    void reorderSelectedTrack(bool down) {
+        const auto selected = timeline_.selectedTrackId();
+        if (!selected) {
+            showResult({commands::CommandStatus::rejected,
+                        "Select a track before reordering it",
+                        commands::CommandError::selectTargetTrack});
+            return;
+        }
+        const auto& tracks = application_.project().tracks();
+        const auto found = std::find_if(
+            tracks.begin(), tracks.end(),
+            [&](const auto& track) { return track.id == *selected; });
+        if (found == tracks.end()) return;
+        const auto index = static_cast<std::size_t>(found - tracks.begin());
+        if ((!down && index == 0) || (down && index + 1 == tracks.size())) {
+            showResult({commands::CommandStatus::accepted,
+                        "Track order unchanged"});
+            return;
+        }
+        const auto anchor = down ? tracks[index + 1].id : tracks[index - 1].id;
+        dispatch(commands::ReorderAudioTrack{
+            *selected, anchor,
+            down ? commands::TrackPlacement::after
+                 : commands::TrackPlacement::before});
+    }
+
     void updateHistoryControls() {
         const auto undo = application_.undoLabel();
         const auto redo = application_.redoLabel();
@@ -390,6 +421,8 @@ private:
     juce::TextButton addMonoTrack_{"+ Mono Track"};
     juce::TextButton addStereoTrack_{"+ Stereo Track"};
     juce::TextButton deleteTrack_{"Delete Track"};
+    juce::TextButton moveTrackUp_{"Move Track Up"};
+    juce::TextButton moveTrackDown_{"Move Track Down"};
     juce::TextButton playButton_{"Play"}, pauseButton_{"Pause"}, stopButton_{"Stop"};
     juce::TextButton undoButton_{"Undo"}, redoButton_{"Redo"};
     juce::TextButton saveButton_{"Save"}, saveAsButton_{"Save As..."};

@@ -144,6 +144,30 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 return persistenceCommand(command);
             } else if constexpr (std::is_same_v<T, Undo> || std::is_same_v<T, Redo>) {
                 return traverseHistory(std::is_same_v<T, Redo>);
+            } else if constexpr (std::is_same_v<T, ReorderAudioTrack>) {
+                if (transport_.playback != transport::PlaybackState::stopped)
+                    return {CommandStatus::rejected, "Stop before reordering tracks",
+                            CommandError::transportMustBeStopped};
+                auto candidate = session_.project;
+                const auto edit = candidate.reorderAudioTrack(
+                    value.track, value.anchor,
+                    value.placement == TrackPlacement::after);
+                if (!edit) {
+                    return {CommandStatus::rejected, "Audio track not found",
+                            CommandError::trackNotFound};
+                }
+                if (!edit.changed) {
+                    return {CommandStatus::accepted, "Track order unchanged"};
+                }
+                history::UndoableOperation operation;
+                operation.payload = history::ReorderAudioTrack{
+                    value.track, edit.beforeIndex, edit.afterIndex};
+                auto pending = session_.history.stage(std::move(operation));
+                if (!pending)
+                    return {CommandStatus::rejected, "History capacity exceeded",
+                            CommandError::historyCapacityExceeded};
+                return commitStructuralProject(
+                    std::move(candidate), "Audio track reordered", &*pending);
             } else if constexpr (std::is_same_v<T, AddAudioTrack> ||
                                  std::is_same_v<T, DeleteAudioTrack>) {
                 if (transport_.playback != transport::PlaybackState::stopped)
@@ -189,6 +213,45 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     std::is_same_v<T, AddAudioTrack> ? "Audio track added"
                                                      : "Audio track deleted",
                     &*pending);
+            } else if constexpr (std::is_same_v<T, MoveClips> ||
+                                 std::is_same_v<T, DeleteClips> ||
+                                 std::is_same_v<T, DuplicateClips>) {
+                if (transport_.playback == transport::PlaybackState::playing)
+                    return {CommandStatus::rejected, "Stop before editing history",
+                            CommandError::transportMustBeStopped};
+                if (value.clips.empty())
+                    return {CommandStatus::rejected, "Select at least one clip",
+                            CommandError::validationFailed};
+                auto candidate = session_.project;
+                project::ProjectState::BatchClipEditResult edit;
+                if constexpr (std::is_same_v<T, MoveClips>)
+                    edit = candidate.moveClips(value.clips, value.deltaFrames);
+                else if constexpr (std::is_same_v<T, DeleteClips>)
+                    edit = candidate.deleteClips(value.clips);
+                else
+                    edit = candidate.duplicateClips(value.clips, value.deltaFrames);
+                if (!edit)
+                    return {CommandStatus::rejected, clipEditError(edit.status),
+                            clipCommandError(edit.status)};
+                if (!edit.changed)
+                    return {CommandStatus::accepted, "Clip batch unchanged"};
+                history::UndoableOperation operation;
+                if constexpr (std::is_same_v<T, MoveClips>)
+                    operation.payload = history::MoveClips{
+                        std::move(edit.before), std::move(edit.after)};
+                else if constexpr (std::is_same_v<T, DeleteClips>)
+                    operation.payload = history::DeleteClips{
+                        std::move(edit.before)};
+                else
+                    operation.payload = history::DuplicateClips{
+                        std::move(edit.after)};
+                auto pending = session_.history.stage(std::move(operation));
+                if (!pending)
+                    return {CommandStatus::rejected, "History capacity exceeded",
+                            CommandError::historyCapacityExceeded};
+                return commitStructuralProject(
+                    std::move(candidate), "Clip batch committed", &*pending, 0,
+                    std::move(edit.createdClips));
             } else if constexpr (std::is_same_v<T, MoveClip> ||
                                  std::is_same_v<T, DuplicateClip> ||
                                  std::is_same_v<T, SplitClip> ||
@@ -1032,7 +1095,8 @@ audio::ProcessingPlanSpecification DawApplication::makePlanSpecification(
 
 commands::CommandResult DawApplication::commitStructuralProject(
     project::ProjectState candidate, std::string successMessage,
-    history::UndoManager::PendingAppend* pending, int historyDirection) {
+    history::UndoManager::PendingAppend* pending, int historyDirection,
+    std::vector<clips::ClipId> createdClips) {
     if (transport_.playback == transport::PlaybackState::playing) {
         return {commands::CommandStatus::rejected,
                 "Routing cannot change during playback",
@@ -1080,7 +1144,8 @@ commands::CommandResult DawApplication::commitStructuralProject(
     }
     pendingAudioCommandSequence_ =
         audioEngine_.transportSnapshot().lastProcessedCommandSequence;
-    return {commands::CommandStatus::accepted, std::move(successMessage)};
+    return {commands::CommandStatus::accepted, std::move(successMessage),
+            commands::CommandError::none, {}, std::move(createdClips)};
 }
 
 audio::PreparedAudibilityState DawApplication::resolveAudibility(

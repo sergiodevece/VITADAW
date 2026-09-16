@@ -31,6 +31,19 @@ using TrackHistoryStatePtr =
     std::shared_ptr<const project::ProjectState::TrackHistoryState>;
 struct AddAudioTrack { TrackHistoryStatePtr created; };
 struct DeleteAudioTrack { TrackHistoryStatePtr removed; };
+struct ReorderAudioTrack {
+    tracks::TrackId track;
+    std::size_t beforeIndex{}, afterIndex{};
+};
+struct MoveClips {
+    std::vector<project::ProjectState::ClipHistoryState> before, after;
+};
+struct DuplicateClips {
+    std::vector<project::ProjectState::ClipHistoryState> created;
+};
+struct DeleteClips {
+    std::vector<project::ProjectState::ClipHistoryState> removed;
+};
 
 // Model values only. No borrowed views or prepared/runtime ownership.
 class UndoableOperation {
@@ -38,7 +51,9 @@ public:
     using Payload = std::variant<MoveClip, DuplicateClip, SplitClip,
                                  TrimClipLeft, TrimClipRight, DeleteClip,
                                  TempoEdit, SignatureEdit, LoopRangeEdit,
-                                 AddAudioTrack, DeleteAudioTrack>;
+                                 AddAudioTrack, DeleteAudioTrack,
+                                 ReorderAudioTrack, MoveClips,
+                                 DuplicateClips, DeleteClips>;
     Payload payload;
     [[nodiscard]] bool isMusical() const noexcept {
         return std::holds_alternative<TempoEdit>(payload) ||

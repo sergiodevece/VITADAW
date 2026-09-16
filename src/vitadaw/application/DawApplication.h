@@ -60,7 +60,8 @@ private:
     [[nodiscard]] commands::CommandResult commitStructuralProject(
         project::ProjectState candidate, std::string successMessage,
         history::UndoManager::PendingAppend* pending = nullptr,
-        int historyDirection = 0);
+        int historyDirection = 0,
+        std::vector<clips::ClipId> createdClips = {});
     [[nodiscard]] audio::PreparedAudibilityState resolveAudibility(
         const project::ProjectState& project,
         tracks::TrackId overriddenTrack = {},

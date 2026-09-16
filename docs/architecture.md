@@ -1817,6 +1817,49 @@ El schema continúa en v3: pistas, clips, ownership, coordenadas y contadores ya
 formaban parte del documento. El callback no lee `ProjectState` y no se modifica
 el plan preparado ni su renderer.
 
+### Arrange Editing II 0.6.5
+
+0.6.5 incorpora reorder documental de pistas y operaciones agregadas
+`MoveClips`, `DeleteClips` y `DuplicateClips`. La identidad pública del reorder
+es `TrackId + anchor TrackId + before/after`; los índices solo se almacenan como
+estado interno de Undo/Redo. La mutación rota únicamente el array documental de
+pistas: conserva IDs, clips, mixer, inserts, routing y sends, mientras el
+processing plan mantiene su orden DSP independiente por `TrackId`.
+
+`tracks_` es la autoridad del orden visual/documental. En cambio,
+`routing_.trackRoutes_` es una colección independiente asociada por `TrackId`:
+no existe el invariante posicional `tracks_[i].id == trackRoutes_[i].track`.
+Save conserva el orden de `tracks_` y canonicaliza las rutas por TrackId; Load,
+edición y preparación resuelven cada ruta por identidad. El orden DSP también
+es independiente y se canonicaliza por TrackId antes de preparar el plan.
+
+Cada batch canonicaliza y deduplica ClipIds, resuelve el conjunto completo,
+valida dominio/capacidad, reserva la memoria necesaria y solo entonces modifica
+el candidato. Un fallo rechaza todo el conjunto. Move aplica un único delta
+horizontal y conserva ownership y offsets relativos; Delete conserva Sources;
+Duplicate asigna IDs monotónicos en orden ascendente del ClipId original y usa
+como desplazamiento UI el ancho exclusivo completo del grupo, incluidos huecos.
+Una acción aceptada produce una sola preparación, commit y entrada de historial;
+delta cero es success no-op sin rebuild ni historial.
+
+La selección múltiple del timeline es un vector canónico y efímero de ClipIds.
+Cmd/Ctrl-click alterna membresía, un click normal reemplaza salvo cuando inicia
+drag sobre un miembro ya seleccionado, y Split/Trim exigen exactamente un clip.
+Selección y previews no se persisten ni forman parte de Undo. Tras mutaciones se
+reconcilian contra el snapshot, y Duplicate selecciona los IDs devueltos por su
+`CommandResult` específico sin convertir el resultado en metadata genérica.
+`selectedTrack_` representa por separado la pista activa/contextual del timeline:
+una selección de clips puede abarcar varias pistas mientras conserva una única
+pista activa para Import, Delete Track, reorder y highlight del header. Move,
+Delete y Duplicate de clips se derivan siempre del conjunto de ClipIds.
+
+Los payloads vectoriales de historial guardan valores del submodelo y su
+capacidad dinámica se contabiliza en el presupuesto acotado del UndoManager.
+El flujo sigue siendo `Command -> ProjectState` candidato -> preparación fuera
+de RT -> commit conjunto. El callback no accede al modelo mutable, no asigna y
+no participa en validación ni rebuild. El schema continúa en v3; el orden ya se
+representaba en el array de pistas y los clips/contadores ya eran documentales.
+
 ## Temporal State Model V1 y Musical Time 0.6.1
 
 Las autoridades quedan formalmente separadas:
@@ -1964,7 +2007,7 @@ de reset. Si un rebuild ocurre antes del DSP, su `hardDiscontinuity` subsume a
 Seek y se conservan los resets legítimos. Stop, lifecycle y loop conservan sus
 políticas anteriores; no se introduce una colección de causas ni otra API de inserts.
 
-## Evolución hasta 0.6.4
+## Evolución hasta 0.6.5
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -2056,6 +2099,10 @@ políticas anteriores; no se introduce una colección de causas ni otra API de i
 34. **Completado en 0.6.4:** consolidación de Arrange Editing I, con Add/Delete
     Track y Move horizontal/cross-track validados contra el inicio y final
     exclusivo del dominio temporal certificado antes de preparar DSP.
+
+35. **Completado en 0.6.5:** Arrange Editing II con reorder por TrackId,
+    multiselección efímera y Move/Delete/Duplicate múltiples, atómicos,
+    undoables y contabilizados dentro del presupuesto de historial.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

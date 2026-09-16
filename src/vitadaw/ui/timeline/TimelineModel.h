@@ -5,6 +5,7 @@
 #include "vitadaw/transport/TransportState.h"
 
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -105,12 +106,25 @@ struct ClipPreview {
 // Ephemeral presentation state only. It never owns or mutates ProjectState.
 class TimelineInteraction {
 public:
-    [[nodiscard]] std::optional<clips::ClipId> selection() const noexcept { return selection_; }
+    [[nodiscard]] std::optional<clips::ClipId> selection() const noexcept {
+        return selection_.empty()
+            ? std::nullopt
+            : std::optional<clips::ClipId>{selection_.front()};
+    }
+    [[nodiscard]] std::span<const clips::ClipId> selections() const noexcept {
+        return selection_;
+    }
+    [[nodiscard]] bool isSelected(clips::ClipId clip) const noexcept;
     [[nodiscard]] std::optional<tracks::TrackId> selectedTrack() const noexcept {
         return selectedTrack_;
     }
-    [[nodiscard]] const std::optional<ClipPreview>& preview() const noexcept { return preview_; }
+    [[nodiscard]] const ClipPreview* previewFor(clips::ClipId clip) const noexcept;
+    [[nodiscard]] const ClipPreview* preview() const noexcept {
+        return previews_.empty() ? nullptr : &previews_.front();
+    }
     void select(std::optional<clips::ClipId> clip) noexcept;
+    void selectClips(std::span<const clips::ClipId> clips);
+    void toggleClip(tracks::TrackId track, clips::ClipId clip);
     void selectTrack(std::optional<tracks::TrackId> track) noexcept;
     void selectClip(tracks::TrackId track, clips::ClipId clip) noexcept;
     void reconcile(const TimelineSnapshot& snapshot) noexcept;
@@ -120,6 +134,9 @@ public:
                                     const TrackSnapshot& track,
                                     const ClipSnapshot& clip,
                                     double pointerX) noexcept;
+    [[nodiscard]] bool beginMoveGesture(
+        const TimelineSnapshot& snapshot, const TrackSnapshot& track,
+        const ClipSnapshot& clip, double pointerX);
     void updateGesture(double pointerX, const CoordinateTransform& transform) noexcept;
     void updateGesture(double pointerX, const CoordinateTransform& transform,
                        const TimelineSnapshot& snapshot,
@@ -139,13 +156,14 @@ public:
 private:
     [[nodiscard]] static const ClipSnapshot* find(
         const TimelineSnapshot&, clips::ClipId) noexcept;
-    std::optional<clips::ClipId> selection_;
+    std::vector<clips::ClipId> selection_;
     std::optional<tracks::TrackId> selectedTrack_;
     GestureKind gesture_{GestureKind::none};
     ClipPreview original_{};
+    std::vector<ClipPreview> originals_;
     media::AudioChannelLayout originalLayout_{media::AudioChannelLayout::mono};
     double originalSourceFramesPerProjectFrame_{1.0};
-    std::optional<ClipPreview> preview_;
+    std::vector<ClipPreview> previews_;
     double pointerOriginX_{};
 };
 

@@ -197,13 +197,19 @@ void actionsAndRefreshTests() {
     TimelineInteraction interaction;
     interaction.select(onlyClip(snapshot).id);
     const auto duplicate = interaction.duplicateCommand(snapshot);
-    check(duplicate && std::get<commands::DuplicateClip>(*duplicate).projectStart.value == 240000,
+    check(duplicate &&
+              std::get<commands::DuplicateClips>(*duplicate).clips ==
+                  std::vector<clips::ClipId>{onlyClip(snapshot).id} &&
+              std::get<commands::DuplicateClips>(*duplicate).deltaFrames == 192000,
           "duplicate must be contiguous to the selected clip");
     check(!interaction.splitCommand(snapshot, {48000}) &&
               !interaction.splitCommand(snapshot, {240000}) &&
               interaction.splitCommand(snapshot, {144000}),
           "split must require the playhead strictly inside the selected clip");
-    check(interaction.deleteCommand().has_value(), "delete action must target selection");
+    check(interaction.deleteCommand().has_value() &&
+              std::get<commands::DeleteClips>(*interaction.deleteCommand()).clips ==
+                  std::vector<clips::ClipId>{onlyClip(snapshot).id},
+          "delete action must target the complete selection");
 
     check(bool(project.splitClip(onlyClip(snapshot).id, {144000})), "split model commit");
     auto splitSnapshot = makeTimelineSnapshot(project, 2);
@@ -230,6 +236,86 @@ void actionsAndRefreshTests() {
     check(loadedSnapshot.tracks == restored.tracks &&
               loadedSnapshot.contentDuration == restored.contentDuration,
           "Load must reconstruct exact timeline positions and durations");
+}
+
+void multipleSelectionTests() {
+    auto project = oneClipProject();
+    const auto source = project.sources().front().id;
+    const auto secondTrack = project.addAudioTrack("Second");
+    const auto second = project.addClip(secondTrack, source, {288000}, {48000}, {0});
+    auto snapshot = makeTimelineSnapshot(project, 1);
+    const auto first = snapshot.tracks[0].clips[0].id;
+    TimelineInteraction interaction;
+    interaction.selectClip(snapshot.tracks[0].id, first);
+    interaction.toggleClip(secondTrack, second);
+    check(interaction.selections().size() == 2 &&
+              interaction.selections()[0] == first &&
+              interaction.selections()[1] == second &&
+              !interaction.splitCommand(snapshot, {100000}),
+          "Cmd/Ctrl-style toggle forms a canonical multi-selection and disables Split");
+    interaction.selectClip(snapshot.tracks[0].id, first);
+    check(interaction.selections().size() == 2 &&
+              interaction.selectedTrack() == snapshot.tracks[0].id,
+          "normal click preserves the group and makes its lane the active track");
+
+    CoordinateTransform transform{snapshot.projectSampleRate, 100.0, 0.0};
+    check(interaction.beginMoveGesture(
+              snapshot, snapshot.tracks[0], snapshot.tracks[0].clips[0], 100.0),
+          "group move gesture begins from a selected member");
+    interaction.updateGesture(200.0, transform, snapshot, secondTrack);
+    const auto command = interaction.endGesture();
+    const auto& move = std::get<commands::MoveClips>(*command);
+    check(move.clips == std::vector<clips::ClipId>{first, second} &&
+              move.deltaFrames == 48000,
+          "group drag emits one horizontal MoveClips with a shared delta");
+
+    const auto duplicate = interaction.duplicateCommand(snapshot);
+    const auto& duplicateBatch = std::get<commands::DuplicateClips>(*duplicate);
+    check(duplicateBatch.clips == std::vector<clips::ClipId>{first, second} &&
+              duplicateBatch.deltaFrames == 288000,
+          "group duplicate uses the complete temporal span including gaps");
+
+    const auto activeTrack = interaction.selectedTrack();
+    const auto duplicated = project.duplicateClips(
+        duplicateBatch.clips, duplicateBatch.deltaFrames);
+    check(duplicated.succeeded() && duplicated.createdClips.size() == 2,
+          "duplicate fixture returns exactly two new ClipIds");
+    interaction.selectClips(duplicated.createdClips);
+    snapshot = makeTimelineSnapshot(project, 2);
+    interaction.reconcile(snapshot);
+    check(std::vector<clips::ClipId>{interaction.selections().begin(),
+                                     interaction.selections().end()} ==
+              duplicated.createdClips &&
+              interaction.selectedTrack() == activeTrack,
+          "Duplicate selects exactly the new ClipIds and preserves the active track");
+    const auto duplicateCreated = interaction.duplicateCommand(snapshot);
+    const auto deleteCreated = interaction.deleteCommand();
+    check(duplicateCreated && deleteCreated &&
+              std::get<commands::DuplicateClips>(*duplicateCreated).clips ==
+                  duplicated.createdClips &&
+              std::get<commands::DeleteClips>(*deleteCreated).clips ==
+                  duplicated.createdClips,
+          "clip actions derive from the multi-selection, not the active track");
+    const commands::ImportAudioToTrack importForActive{
+        {}, *interaction.selectedTrack(), {0}};
+    const commands::DeleteAudioTrack deleteActive{*interaction.selectedTrack()};
+    const commands::ReorderAudioTrack reorderActive{
+        *interaction.selectedTrack(), secondTrack,
+        commands::TrackPlacement::before};
+    check(importForActive.track == *activeTrack &&
+              deleteActive.track == *activeTrack &&
+              reorderActive.track == *activeTrack,
+          "track actions deliberately use the independent active-track context");
+
+    check(bool(project.deleteClip(first)), "partial selection deletion fixture");
+    snapshot = makeTimelineSnapshot(project, 3);
+    interaction.reconcile(snapshot);
+    check(interaction.selections().size() == 2,
+          "reconcile retains selected duplicate IDs when unrelated clips disappear");
+    interaction.toggleClip(snapshot.tracks[0].id, duplicated.createdClips[0]);
+    interaction.toggleClip(secondTrack, duplicated.createdClips[1]);
+    check(interaction.selections().empty(),
+          "toggle removes every selected ClipId without conflating track context");
 }
 
 void largeSessionTest() {
@@ -264,6 +350,7 @@ int main() {
     gestureTests();
     crossTrackInteractionTests();
     actionsAndRefreshTests();
+    multipleSelectionTests();
     largeSessionTest();
     std::cout << "Timeline UI foundation tests passed\n";
 }

@@ -362,6 +362,31 @@ void managerTests() {
     check(!payloadTooSmall.stage(std::move(addTrack)) &&
               !payloadTooSmall.canUndo(),
           "variable track payload is rejected before model/plan commit");
+
+    std::vector<project::ProjectState::ClipHistoryState> batchStates;
+    batchStates.reserve(64);
+    for (std::uint64_t index = 0; index < 64; ++index) {
+        auto clip = before;
+        clip.id = {index + 1};
+        batchStates.push_back({track, clip});
+    }
+    history::UndoableOperation batchDelete{
+        history::DeleteClips{batchStates}};
+    const auto batchBytes = batchDelete.approximateMemoryBytes();
+    check(batchBytes >= batchStates.capacity() * sizeof(batchStates.front()),
+          "batch history accounts for vector-owned clip snapshots");
+    history::UndoManager batchTooSmall{
+        {512, sizeof(history::HistoryEntry) + batchBytes - 1}};
+    check(!batchTooSmall.stage(batchDelete),
+          "batch history is rejected when its dynamic payload exceeds budget");
+    history::UndoManager batchFits{
+        {512, sizeof(history::HistoryEntry) + batchBytes}};
+    auto batchPending = batchFits.stage(std::move(batchDelete));
+    check(batchPending.has_value(), "batch history stages at its exact budget");
+    batchFits.commit(std::move(*batchPending));
+    check(batchFits.size() == 1 &&
+              batchFits.memoryBytes() <= history::UndoManager::memoryBudget,
+          "batch history commit remains inside the global memory budget");
 }
 } // namespace
 
