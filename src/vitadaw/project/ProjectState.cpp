@@ -481,14 +481,19 @@ bool ProjectState::validateClip(
     timeline::ProjectFramePosition projectStart,
     timeline::ProjectFrameDuration duration,
     timeline::SourceFramePosition sourceOffset) const noexcept {
-    if (track.layout != source.layout || projectStart.value < 0 ||
+    if (track.layout != source.layout ||
+        !timeline::isSupportedProjectFramePosition(projectStart) ||
         !std::isfinite(duration.value) || duration.value <= 0.0 ||
         !std::isfinite(sourceOffset.value) || sourceOffset.value < 0.0 ||
         !settings_.sampleRate.isValid() || !source.sampleRate.isValid()) {
         return false;
     }
-    const auto projectEnd = static_cast<long double>(projectStart.value) +
-                            static_cast<long double>(duration.value);
+    const auto projectEnd = timeline::checkedExclusiveProjectEnd(
+        projectStart, duration);
+    if (!projectEnd ||
+        !timeline::isSupportedProjectFramePosition(*projectEnd)) {
+        return false;
+    }
     const auto sourceEnd = static_cast<long double>(sourceOffset.value) +
         static_cast<long double>(duration.value) *
             static_cast<long double>(source.sampleRate.hertz()) /
@@ -497,9 +502,7 @@ bool ProjectState::validateClip(
     const auto roundTripTolerance =
         std::numeric_limits<double>::epsilon() * 64.0L *
         std::max(1.0L, std::max(std::abs(sourceEnd), sourceLimit));
-    return std::isfinite(projectEnd) && std::isfinite(sourceEnd) &&
-           projectEnd <= static_cast<long double>(
-                             std::numeric_limits<std::int64_t>::max()) &&
+    return std::isfinite(sourceEnd) &&
            sourceEnd <= sourceLimit + roundTripTolerance;
 }
 

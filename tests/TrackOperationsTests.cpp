@@ -395,6 +395,63 @@ void moveAndFailureOperations() {
           "cross-track Move requires fully Stopped transport");
 }
 
+void certifiedTemporalBoundaryOperations() {
+    TestEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}};
+    commands::CommandDispatcher dispatch{app};
+    auto ok = [&](commands::Command command) {
+        const auto result = dispatch.dispatch(command);
+        check(result.status == commands::CommandStatus::accepted,
+              "certified-boundary fixture command accepted");
+    };
+
+    ok(commands::AddAudioTrack{"Boundary", media::AudioChannelLayout::mono});
+    ok(commands::ImportAudioToTrack{"mono.wav", {1}, {0}});
+    const auto clip = app.project().tracks()[0].clips[0];
+    const auto maximum = timeline::maximumSupportedProjectFrame().value;
+    const auto lastValidStart = maximum - 48000;
+
+    ok(commands::MoveClip{clip.id, {lastValidStart}});
+    check(app.project().findClip(clip.id)->projectStart.value == lastValidStart &&
+              app.project().duration().value == maximum,
+          "clip whose exclusive end equals the certified maximum is valid");
+
+    const auto preparationsBeforeNoop = engine.preparations;
+    const auto tokenBeforeNoop = app.history().currentStateToken();
+    const auto* planBeforeNoop = engine.active.get();
+    ok(commands::MoveClip{clip.id, {lastValidStart}});
+    check(engine.preparations == preparationsBeforeNoop &&
+              app.history().currentStateToken() == tokenBeforeNoop &&
+              engine.active.get() == planBeforeNoop,
+          "same-track same-position Move is a no-op without history or rebuild");
+
+    const auto checkRejectedBeforePreparation = [&](std::int64_t start,
+                                                     const char* message) {
+        const auto preparations = engine.preparations;
+        const auto token = app.history().currentStateToken();
+        const auto* plan = engine.active.get();
+        const auto before = *app.project().findClip(clip.id);
+        const auto result = dispatch.dispatch(commands::MoveClip{clip.id, {start}});
+        check(result.status == commands::CommandStatus::rejected &&
+                  result.error == commands::CommandError::invalidPosition &&
+                  engine.preparations == preparations &&
+                  app.history().currentStateToken() == token &&
+                  engine.active.get() == plan &&
+                  *app.project().findClip(clip.id) == before,
+              message);
+    };
+
+    checkRejectedBeforePreparation(
+        lastValidStart + 1,
+        "exclusive clip end beyond certified time is rejected before preparation");
+    checkRejectedBeforePreparation(
+        maximum + 1,
+        "clip start beyond certified time is rejected before preparation");
+    checkRejectedBeforePreparation(
+        -1,
+        "negative clip start is rejected before preparation");
+}
+
 void dspAndPersistenceOperations() {
     project::ProjectState project{timeline::SampleRate{48000.0}, "Tracks"};
     const auto a = project.addAudioTrack("A", media::AudioChannelLayout::mono);
@@ -502,6 +559,7 @@ void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); 
 int main() {
     applicationOperations();
     moveAndFailureOperations();
+    certifiedTemporalBoundaryOperations();
     dspAndPersistenceOperations();
     std::cout << "Track operations and cross-track editing tests passed\n";
 }

@@ -1787,6 +1787,36 @@ una nueva garantía pública. El callback conserva zero allocations, locks e I/O
 cuantización causal exacta, almacenamiento fijo y cuatro voces. El recorrido de
 hasta 8191 segmentos por subbloque sigue pendiente de benchmark RT profesional.
 
+### Arrange Editing I 0.6.4
+
+0.6.4 consolida Add/Delete Audio Track y Move Clip, ya existentes, sobre el
+dominio temporal certificado de 0.6.x. No introduce comandos ni otra ruta de
+mutación. Toda operación conserva la secuencia `Command -> ProjectState`
+candidato -> preparación completa fuera de RT -> commit conjunto de modelo,
+plan e historial.
+
+`ProjectState::validateClip` es la frontera común para importación, creación,
+movimiento, trim, restauración de historial y carga documental. Además de
+layout, duración y límites de fuente, exige que `projectStart` sea una posición
+soportada y que `checkedExclusiveProjectEnd(projectStart,duration)` exista y
+sea también una posición soportada. El cálculo del final usa la utilidad
+temporal comprobada y no suma en entero con posibilidad de overflow. Un Move
+fuera del dominio devuelve `invalidPosition` antes de llamar a la preparación
+del processing plan.
+
+No cambia la semántica de arrange. Una posición válida posterior al contenido
+actual amplía `contentDuration`; los intervalos adyacentes son válidos; los
+solapes parciales y completos se suman antes de los inserts de pista. Move
+conserva ClipId, SourceId, duration y sourceOffset. Un Move horizontal no-op no
+crea historial ni plan. Move cross-track sigue siendo Stopped-only y exige
+layout idéntico; Add/Delete Track siguen siendo Stopped-only. Delete conserva
+el catálogo de Sources. Undo/Redo restaura valores e IDs sin retroceder los
+contadores monotónicos.
+
+El schema continúa en v3: pistas, clips, ownership, coordenadas y contadores ya
+formaban parte del documento. El callback no lee `ProjectState` y no se modifica
+el plan preparado ni su renderer.
+
 ## Temporal State Model V1 y Musical Time 0.6.1
 
 Las autoridades quedan formalmente separadas:
@@ -1934,7 +1964,7 @@ de reset. Si un rebuild ocurre antes del DSP, su `hardDiscontinuity` subsume a
 Seek y se conservan los resets legítimos. Stop, lifecycle y loop conservan sus
 políticas anteriores; no se introduce una colección de causas ni otra API de inserts.
 
-## Evolución hasta 0.6.0
+## Evolución hasta 0.6.4
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -2016,6 +2046,16 @@ políticas anteriores; no se introduce una colección de causas ni otra API de i
 31. **Completado en 0.6.1:** Musical Time bidireccional exacto, inverse y rounding
     racionales, consultas de tempo/métrica por frontera certificada y grid con
     double exclusivamente al final de la presentación.
+
+32. **Completado en 0.6.2:** contrato de loop half-open exacto, admisión
+    reconciliada y obligación musical preservada durante rebuild y lifecycle.
+
+33. **Completado en 0.6.3:** metrónomo con beat N/D, accent de inicio de compás,
+    Pause sin PCM antiguo y read model coherente de sesión.
+
+34. **Completado en 0.6.4:** consolidación de Arrange Editing I, con Add/Delete
+    Track y Move horizontal/cross-track validados contra el inicio y final
+    exclusivo del dominio temporal certificado antes de preparar DSP.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

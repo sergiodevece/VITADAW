@@ -1,4 +1,4 @@
-# VitaDAW 0.6.3 — Metronome
+# VitaDAW 0.6.4 — Arrange Editing I
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -277,6 +277,21 @@ activo puede reproducirse hasta Stop. Desactivarlo durante esa reproducción
 silencia nuevos clicks sin ejecutar Stop ni retirar `runUntilStop` de la sesión
 en curso. `MetronomeReadModel` publica enabled, nivel y revisión temporal como
 un único valor coherente de presentación.
+
+VitaDAW 0.6.4 consolida la edición estructural del arrange existente sobre los
+contratos temporales certificados de 0.6.x. Add/Delete Audio Track y Move Clip
+horizontal o entre pistas conservan su flujo transaccional: comando, modelo
+candidato, preparación fuera de RT y commit conjunto de modelo, plan e
+historial. No se añaden comandos, subsistemas ni políticas de edición nuevas.
+
+Toda creación, restauración o edición de un clip valida ahora tanto
+`projectStart` como su final exclusivo mediante el dominio definido por
+`maximumSupportedProjectFrame()`. Un inicio o final fuera de ese dominio se
+rechaza como `invalidPosition` antes de preparar el processing plan, sin cambiar
+modelo, plan ni historial. Continúan permitidos los huecos, los movimientos más
+allá del contenido actual, los clips adyacentes y los solapes parciales o
+completos; los solapes se suman antes de los inserts de la pista. El schema
+documental permanece en v3.
 
 ## Tecnología propuesta
 
@@ -679,6 +694,9 @@ La arquitectura y las reglas de tiempo real se describen en
   obligación musical pendiente preservada en lifecycle y read model cohesionado.
 - **0.6.3 — Metronome:** contrato N/D y accent, Pause sin colas PCM,
   read model coherente, rollback integral y matriz exacta de scheduling.
+- **0.6.4 — Arrange Editing I:** consolidación de Add/Delete Track y Move Clip
+  sobre el dominio temporal 0.6.x, validación anticipada de inicio/final
+  certificados y preservación transaccional de modelo, plan e historial.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -710,4 +728,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.0.md`](docs/validation-0.6.0.md) y
 [`docs/validation-0.6.1.md`](docs/validation-0.6.1.md) y
 [`docs/validation-0.6.2.md`](docs/validation-0.6.2.md) y
-[`docs/validation-0.6.3.md`](docs/validation-0.6.3.md).
+[`docs/validation-0.6.3.md`](docs/validation-0.6.3.md) y
+[`docs/validation-0.6.4.md`](docs/validation-0.6.4.md).
