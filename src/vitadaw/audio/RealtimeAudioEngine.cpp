@@ -1179,6 +1179,10 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
                 clearMetronomeRuntime();
             } else if (queued.type == CommandType::pause) {
                 clock_.pause();
+                // Pause cancels already-started click tails, but deliberately
+                // preserves an unrendered musical boundary obligation. Stop,
+                // Seek and metronome-off clear both voices and pending state.
+                clearMetronomeVoices();
             } else if (queued.type == CommandType::seek) {
                 if (clock_.seek(queued.target)) {
                     processorDiscontinuity_ =

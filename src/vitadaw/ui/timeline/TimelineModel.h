@@ -39,6 +39,13 @@ struct LoopReadModel {
     bool operator==(const LoopReadModel&) const = default;
 };
 
+struct MetronomeReadModel {
+    bool enabled{};
+    audio::MetronomeLevelDb level;
+    std::uint64_t temporalRevision{};
+    bool operator==(const MetronomeReadModel&) const = default;
+};
+
 struct TimelineSnapshot {
     ::vitadaw::timeline::SampleRate projectSampleRate;
     ::vitadaw::timeline::ProjectFrameCount contentDuration;
@@ -49,9 +56,7 @@ struct TimelineSnapshot {
     std::uint64_t musicalRevision{};
     std::optional<musical::MusicalPosition> musicalPosition;
     LoopReadModel loop;
-    bool metronomeEnabled{};
-    audio::MetronomeLevelDb metronomeLevel;
-    std::uint64_t temporalRevision{};
+    MetronomeReadModel metronome;
     bool operator==(const TimelineSnapshot&) const = default;
 };
 

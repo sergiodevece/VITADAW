@@ -1239,6 +1239,12 @@ mixer::MeterSnapshot DawApplication::meterSnapshot() const noexcept {
     return audioEngine_.meterSnapshot();
 }
 
+ui::timeline::MetronomeReadModel
+DawApplication::metronomeReadModel() const noexcept {
+    return {session_.metronomeEnabled, session_.metronomeLevel,
+            session_.appliedTemporalRevision};
+}
+
 ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
     auto result = ui::timeline::makeTimelineSnapshot(session_.project,
                                                session_.history.revision(),
@@ -1251,9 +1257,7 @@ ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
     result.loop.temporalRevision = preparedLoopView_
         ? preparedLoopView_->temporalRevision() : musicalRevision_;
     result.loop.prepared = preparedLoopView_;
-    result.metronomeEnabled = session_.metronomeEnabled;
-    result.metronomeLevel = session_.metronomeLevel;
-    result.temporalRevision = session_.appliedTemporalRevision;
+    result.metronome = metronomeReadModel();
     if (result.loop.prepared) {
         const auto startLabel = musicalTime_->musicalPositionAt(
             result.loop.prepared->exactStart().exactPosition());

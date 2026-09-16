@@ -188,9 +188,10 @@ public:
         loopEnabled_.setEnabled(stopped);
         loopEnabled_.setToggleState(application_.loopEnabled(),
                                     juce::dontSendNotification);
-        metronomeEnabled_.setToggleState(application_.metronomeEnabled(),
+        const auto metronome = application_.metronomeReadModel();
+        metronomeEnabled_.setToggleState(metronome.enabled,
                                          juce::dontSendNotification);
-        metronomeLevel_.setValue(application_.metronomeLevel().value,
+        metronomeLevel_.setValue(metronome.level.value,
                                  juce::dontSendNotification);
         timeline_.setTransportState(state);
         updateHistoryControls();

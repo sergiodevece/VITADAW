@@ -1,4 +1,5 @@
 #include "vitadaw/application/DawApplication.h"
+#include "vitadaw/application/ProjectSession.h"
 #include "vitadaw/audio/RealtimeAudioEngine.h"
 #include "vitadaw/persistence/ProjectPersistence.h"
 #include "vitadaw/processors/GainProcessor.h"
@@ -162,6 +163,8 @@ std::string encode(const project::ProjectState& p, const std::filesystem::path& 
 }
 void codecTests() {
     const auto p = complex(); const auto original = encode(p);
+    check(original.find("metronome") == std::string::npos,
+          "metronome enabled and level are not project persistence fields");
     check(original == encode(p), "deterministic bytes");
     auto loaded = deserializeProject(original); check(loaded.result.success(), "complex deserialize");
     check(encode(*loaded.project) == original, "full canonical model equality including every field/counter");
@@ -286,6 +289,20 @@ void codecTests() {
         std::ifstream file(std::filesystem::path{VITADAW_FIXTURES}/name);
         reject({std::istreambuf_iterator<char>(file), {}}, code);
     }
+}
+
+void metronomeSessionResetTests() {
+    application::ProjectSession session{timeline::SampleRate{48000}};
+    session.metronomeEnabled = true;
+    session.metronomeLevel = {-3.0F};
+    project::ProjectState candidate{timeline::SampleRate{48000}};
+    std::filesystem::path path{"/session/replacement.vitadaw"};
+    waveform::WaveformCache waveforms;
+    session.adopt(candidate, path, waveforms);
+    check(!session.metronomeEnabled &&
+              session.metronomeLevel == audio::MetronomeLevelDb{} &&
+              session.metronomeLevel.value == -12.0F,
+          "New/Load session adoption resets metronome to disabled at -12 dB");
 }
 
 void sessionTests() {
@@ -477,4 +494,4 @@ void* operator new(std::size_t bytes) {
 void operator delete(void* p) noexcept {if(realtime&&p)++rtDestructions;std::free(p);}
 void* operator new[](std::size_t n){return ::operator new(n);}
 void operator delete[](void*p)noexcept{::operator delete(p);}
-int main(){codecTests();sessionTests();musicalTransactions();nativeFiles();allocationRollback();std::cout<<"Project persistence passed\n";}
+int main(){codecTests();metronomeSessionResetTests();sessionTests();musicalTransactions();nativeFiles();allocationRollback();std::cout<<"Project persistence passed\n";}

@@ -279,7 +279,8 @@ struct Harness {
     Harness(audio::ProcessingPlanSpecification specification,
             std::span<const audio::PreparedTrackView> sources,
             std::size_t capacity = 64,
-            const processors::IAudioProcessorFactory* factory = nullptr)
+            const processors::IAudioProcessorFactory* factory = nullptr,
+            bool startPlaying = true)
         : rate(specification.processingSampleRate.isValid()
                    ? specification.processingSampleRate
                    : specification.projectSampleRate) {
@@ -292,8 +293,10 @@ struct Harness {
         engine.deviceInitialising();
         std::array<float*, 0> noChannels{};
         engine.processBlock({noChannels.data(), 0, 0}, rate);
-        check(engine.tryRequestPlay().accepted,
-              "prepared processor project should play");
+        if (startPlaying) {
+            check(engine.tryRequestPlay().accepted,
+                  "prepared processor project should play");
+        }
     }
 
     std::pair<std::vector<float>, std::vector<float>> render(
@@ -338,6 +341,48 @@ int main() {
     const std::array stereoSource{source({1}, ones, &ones)};
     const std::array monoSource{source({1}, ones)};
     const auto minusSix = processors::GainProcessor::gainDbToLinear(-6.0F);
+
+    const auto renderMasterClick = [&](bool withInsert) {
+        auto specification = basic(48000.0);
+        specification.masterMix =
+            mixer::prepare(mixer::MasterMixState{{-6.0F}});
+        if (withInsert) {
+            specification.masterInserts.processors.push_back(processor(
+                900, processors::internalGainProcessorType, -100.0F));
+        }
+        Harness harness{specification,
+                        std::span<const audio::PreparedTrackView>{}, 64,
+                        nullptr, false};
+        auto temporal = audio::prepareTemporalContext(
+            {}, std::nullopt, timeline::SampleRate{48000},
+            timeline::SampleRate{48000}, 91);
+        check(temporal.success(), "master-chain metronome context prepares");
+        temporal.prepared->clicks.normal.fill(0.0F);
+        temporal.prepared->clicks.accent.fill(0.0F);
+        temporal.prepared->clicks.normal[0] = 1.0F;
+        temporal.prepared->clicks.accent[0] = 2.0F;
+        temporal.prepared->clicks.frameCount = 1;
+        check(harness.engine.configureTemporalContext(temporal.prepared.get()) &&
+                  harness.engine.trySetMetronomeEnabled(true).accepted &&
+                  harness.engine.trySetMetronomeLevel({0.0F}).accepted,
+              "master-chain metronome controls configure");
+        static_cast<void>(harness.render(0));
+        static_cast<void>(harness.render(512));
+        check(harness.engine.tryRequestPlay().accepted,
+              "master-chain metronome-only Play");
+        const auto output = harness.render(1);
+        return std::pair{output.first[0], harness.engine.meterSnapshot().master};
+    };
+    const auto clickWithoutInsert = renderMasterClick(false);
+    const auto clickWithSilentInsert = renderMasterClick(true);
+    check(close(clickWithoutInsert.first, 2.0F * minusSix) &&
+              close(clickWithSilentInsert.first, clickWithoutInsert.first),
+          "Master Inserts do not process the metronome, while Master Gain scales it");
+    check(close(clickWithSilentInsert.second.left,
+                std::abs(clickWithSilentInsert.first)) &&
+              close(clickWithSilentInsert.second.right,
+                std::abs(clickWithSilentInsert.first)),
+          "Master Meter measures the post-Master-Gain metronome click");
 
     auto trackGain = basic();
     trackGain.tracks = {{{1}, {}, {},

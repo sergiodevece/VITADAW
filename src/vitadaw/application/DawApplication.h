@@ -42,6 +42,8 @@ public:
     [[nodiscard]] bool loopEnabled() const noexcept { return session_.loopEnabled; }
     [[nodiscard]] bool metronomeEnabled() const noexcept { return session_.metronomeEnabled; }
     [[nodiscard]] audio::MetronomeLevelDb metronomeLevel() const noexcept { return session_.metronomeLevel; }
+    [[nodiscard]] ui::timeline::MetronomeReadModel
+        metronomeReadModel() const noexcept;
 
 private:
     commands::CommandResult musicalCommand(const commands::Command&);

@@ -44,8 +44,7 @@ void TimelineComponent::refreshModel(bool resetViewport) {
     if (!resetViewport && snapshot_.revision == application_.timelineRevision() &&
         snapshot_.musicalRevision == application_.musicalRevision() &&
         snapshot_.loop.enabled == application_.loopEnabled() &&
-        snapshot_.metronomeEnabled == application_.metronomeEnabled() &&
-        snapshot_.metronomeLevel == application_.metronomeLevel() &&
+        snapshot_.metronome == application_.metronomeReadModel() &&
         waveformRevision_ == application_.waveformCache().revision()) return;
     snapshot_ = application_.timelineSnapshot();
     waveformRevision_ = application_.waveformCache().revision();

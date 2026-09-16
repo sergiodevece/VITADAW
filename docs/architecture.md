@@ -1743,6 +1743,50 @@ puede aumentar el número de subbloques hasta la cota derivada de su mínimo de
 10 ms, pero no añade búsqueda por pista ni trabajo no acotado. El benchmark de
 deadline profesional sigue pendiente.
 
+### Metronome 0.6.3
+
+0.6.3 consolida el metrónomo existente sin introducir otro clock, beat map ni
+scheduler. El documento conserva tempo y métrica; `PreparedTemporalContext`
+conserva el grid analítico y las tablas; `RealtimeAudioEngine` conserva las
+voces y obligaciones pendientes; `MetronomeReadModel` es únicamente un valor
+de presentación `{enabled,level,temporalRevision}` construido desde una
+publicación de sesión coherente.
+
+Enabled y level son session-only, no dirty, no Undo y no persistentes. New y
+Load restablecen disabled y -12 dB. El rango del nivel sigue siendo [-100,0] dB
+y el cambio conserva el smoother de 5 ms. Enabled permite Play sin contenido,
+pero no inicia ni detiene directamente el transporte. Sin loop, esa reproducción
+usa run-until-Stop; desactivar el metrónomo silencia eventos nuevos sin detener
+ni cambiar locator o política abierta de la reproducción en curso. Un Play
+posterior vacío y disabled se rechaza.
+
+Para N/D, una figura D es un beat y el compás tiene N beats. El único accent es
+el primer beat del compás, calculado respecto al anchor exacto de la firma. Por
+tanto 4/4 es accent+3 normales, 3/4 accent+2 y 7/8 accent+6; no existe grouping
+2+2+3 ni métrica compuesta implícita. Un cambio de firma anclado a BarIndex
+inicia un nuevo compás y su frontera recibe accent.
+
+Pause conserva la posición exacta y cancela todas las voces activas mediante
+`clearMetronomeVoices()`. No conserva PCM, cursor de tabla ni cola sonora. Los
+tres bits de `PendingMetronomeBoundaryState` permanecen sin ampliación: una
+obligación legítima todavía no emitida o un loopStart atravesado puede sobrevivir
+Pause y un rebuild. Stop, Seek, metronome-off y reset limpian voces y pending.
+Resume deja que el scheduler normal consuma una obligación válida una vez; sin
+pending no inventa click.
+
+La cadena master queda fijada como Master Inserts → Metronome → Master Gain →
+Master Meter/Output. Los inserts Master no procesan el click; Master Gain sí lo
+escala y Master Meter observa el resultado escalado. Mute/Solo de pistas y buses
+no condicionan el metrónomo.
+
+La preparación y el commit temporales siguen siendo transaccionales. Un rechazo
+conserva semánticamente documento, contexto preparado publicado, revisión,
+read model, enabled, level, playback y runUntilStop. La identidad del owner
+puede comprobarse como detalle de la implementación actual, pero no constituye
+una nueva garantía pública. El callback conserva zero allocations, locks e I/O,
+cuantización causal exacta, almacenamiento fijo y cuatro voces. El recorrido de
+hasta 8191 segmentos por subbloque sigue pendiente de benchmark RT profesional.
+
 ## Temporal State Model V1 y Musical Time 0.6.1
 
 Las autoridades quedan formalmente separadas:

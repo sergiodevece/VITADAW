@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <string_view>
 #include <vector>
@@ -36,6 +37,82 @@ void processRange(audio::RealtimeAudioEngine& engine, std::vector<float>& left,
                   std::size_t count, double rate) {
     std::array<float*,2> channels{left.data()+offset,right.data()+offset};
     engine.processBlock({channels.data(),2,count},timeline::SampleRate{rate});
+}
+
+struct MetronomeRender {
+    std::vector<float> left;
+    std::vector<float> right;
+};
+
+void makeDiagnosticClicks(audio::PreparedTemporalContext& context) {
+    context.clicks.normal.fill(0.0F);
+    context.clicks.accent.fill(0.0F);
+    context.clicks.normal[0] = 1.0F;
+    context.clicks.accent[0] = 2.0F;
+    context.clicks.frameCount = 1;
+}
+
+MetronomeRender renderMetronomeGrid(
+    const musical::MusicalTimeMap& map, double rate, std::size_t frames,
+    std::span<const std::size_t> partitions, bool diagnostic,
+    float levelDb = 0.0F) {
+    auto temporal = audio::prepareTemporalContext(
+        map, std::nullopt, timeline::SampleRate{rate},
+        timeline::SampleRate{rate}, 71);
+    check(temporal.success(), "metronome matrix context prepares");
+    if (diagnostic) makeDiagnosticClicks(*temporal.prepared);
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{rate}, {0},
+                      std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "metronome matrix context configures");
+    enterOperational(engine, rate);
+    check(engine.trySetMetronomeEnabled(true).accepted &&
+              engine.trySetMetronomeLevel({levelDb}).accepted,
+          "metronome matrix controls enqueue");
+    std::vector<float> empty;
+    process(engine, empty, empty, rate);
+    std::vector<float> settle(512), settleRight(512);
+    process(engine, settle, settleRight, rate);
+    check(engine.tryRequestPlay().accepted, "metronome matrix Play");
+    MetronomeRender result{std::vector<float>(frames),
+                           std::vector<float>(frames)};
+    if (partitions.empty()) {
+        process(engine, result.left, result.right, rate);
+    } else {
+        std::size_t offset{}, partition{};
+        while (offset < frames) {
+            const auto count = std::min(partitions[partition % partitions.size()],
+                                        frames - offset);
+            check(count != 0, "metronome partition must be non-zero");
+            processRange(engine, result.left, result.right, offset, count, rate);
+            offset += count;
+            ++partition;
+        }
+    }
+    return result;
+}
+
+std::size_t exactTriggerFrame(const audio::PreparedTemporalContext& context,
+                              std::int64_t tick) {
+    const auto position = context.musicalTime->exactProjectFrameAtTick({tick});
+    check(bool(position), "expected musical trigger is representable");
+    const auto floor = audio::exact::floorPosition(position.value);
+    return static_cast<std::size_t>(floor.frame) +
+        (audio::exact::zero(audio::exact::wide(floor.remainder)) ? 0U : 1U);
+}
+
+void checkDiagnosticEvents(const std::vector<float>& rendered,
+                           std::span<const std::pair<std::size_t, float>> expected,
+                           std::string_view message) {
+    std::size_t event{};
+    for (std::size_t frame = 0; frame < rendered.size(); ++frame) {
+        if (rendered[frame] == 0.0F) continue;
+        check(event < expected.size() && expected[event].first == frame &&
+                  expected[event].second == rendered[frame], message);
+        ++event;
+    }
+    check(event == expected.size(), message);
 }
 
 void preparationAndPersistence() {
@@ -521,6 +598,58 @@ void pendingLoopStartSurvivesHardRebuild() {
           "restored musical obligation is consumed once");
 }
 
+void pendingBeatSurvivesHardRebuild(bool accent) {
+    musical::MusicalTimeMap map;
+    map.tempo.events[0].bpm = {123.0};
+    auto temporal = audio::prepareTemporalContext(
+        map, std::nullopt, timeline::SampleRate{48000},
+        timeline::SampleRate{48000}, accent ? 43 : 42);
+    check(temporal.success(), "pending beat rebuild context prepares");
+    makeDiagnosticClicks(*temporal.prepared);
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000}, {0},
+                      std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "pending beat rebuild context configures");
+    enterOperational(engine, 48000);
+    check(engine.trySetMetronomeEnabled(true).accepted &&
+              engine.trySetMetronomeLevel({0.0F}).accepted,
+          "pending beat rebuild controls enqueue");
+    std::vector<float> empty;
+    process(engine, empty, empty, 48000);
+    std::vector<float> settle(512), settleRight(512);
+    process(engine, settle, settleRight, 48000);
+    if (accent) {
+        const auto bar = temporal.prepared->musicalTime->exactProjectFrameAtTick(
+            {4 * musical::ppq});
+        check(bool(bar), "pending accent bar is representable");
+        const auto floor = audio::exact::floorPosition(bar.value);
+        check(!audio::exact::zero(audio::exact::wide(floor.remainder)) &&
+                  engine.tryRequestSeek({floor.frame}).accepted,
+              "pending accent seeks immediately before fractional downbeat");
+        process(engine, empty, empty, 48000);
+    }
+    check(engine.tryRequestPlay().accepted, "pending beat rebuild Play");
+    std::vector<float> before(accent ? 1 : 23415);
+    std::vector<float> beforeRight(before.size());
+    process(engine, before, beforeRight, 48000);
+    const auto pending = engine.temporalCheckpoint();
+    check(pending.pendingMetronomeBoundary.eventPending &&
+              pending.pendingMetronomeBoundary.accent == accent,
+          "real scheduler leaves the expected normal/accent obligation");
+
+    engine.deviceInitialisingPreservingTransport();
+    check(engine.configureTemporalContext(temporal.prepared.get()) &&
+              engine.restoreTemporalCheckpoint(pending),
+          "hard rebuild restores pending normal/accent obligation");
+    std::vector<float> after(2), afterRight(2);
+    process(engine, after, afterRight, 48000);
+    check(after[0] == (accent ? 2.0F : 1.0F) && after[1] == 0.0F &&
+              !engine.temporalCheckpoint()
+                   .pendingMetronomeBoundary.eventPending,
+          "hard rebuild emits pending normal/accent exactly once");
+}
+
 void exactMusicalLoopAndMetronome() {
     const std::array<std::size_t,1> single{23416};
     const std::array<std::size_t,5> split{511,1024,8192,10000,3689};
@@ -680,6 +809,477 @@ void metronomeAndEmptyPolicy() {
     check(next[0]==0.0F && std::abs(next[1])>0.0F,
           "beat on callback boundary is emitted once by the following block");
 }
+
+void meterAccentMatrix() {
+    const auto checkMeter = [](unsigned numerator, unsigned denominator,
+                               double bpm) {
+        musical::MusicalTimeMap map;
+        map.tempo.events[0].bpm = {bpm};
+        map.signatures.events[0].signature = {numerator, denominator};
+        auto oracle = audio::prepareTemporalContext(
+            map, std::nullopt, timeline::SampleRate{48000},
+            timeline::SampleRate{48000}, 72);
+        check(oracle.success(), "meter oracle prepares");
+        const auto ticksPerBeat = musical::ppq * 4 / denominator;
+        std::vector<std::pair<std::size_t, float>> expected;
+        for (unsigned beat = 0; beat < numerator; ++beat) {
+            expected.push_back({exactTriggerFrame(*oracle.prepared,
+                    static_cast<std::int64_t>(beat) * ticksPerBeat),
+                beat == 0 ? 2.0F : 1.0F});
+        }
+        const auto frames = expected.back().first + 2;
+        const auto rendered = renderMetronomeGrid(map, 48000, frames, {}, true);
+        checkDiagnosticEvents(rendered.left, expected,
+                              "meter emits one accent then denominator-unit beats");
+        if (numerator == 7 && denominator == 8) {
+            check(std::count_if(rendered.left.begin(), rendered.left.end(),
+                                [](float value) { return value == 2.0F; }) == 1,
+                  "7/8 produces one accent and no implicit 2+2+3 grouping");
+        }
+    };
+    checkMeter(4, 4, 120.0);
+    checkMeter(3, 4, 120.0);
+    checkMeter(3, 4, 123.0);
+    checkMeter(7, 8, 120.0);
+    checkMeter(7, 8, 123.0);
+
+    musical::MusicalTimeMap changes;
+    changes.signatures.events = {{{1}, {0}, {4, 4}},
+                                  {{2}, {1}, {3, 4}},
+                                  {{3}, {2}, {7, 8}}};
+    changes.signatures.nextId = {4};
+    auto oracle = audio::prepareTemporalContext(
+        changes, std::nullopt, timeline::SampleRate{48000},
+        timeline::SampleRate{48000}, 73);
+    check(oracle.success(), "meter-change oracle prepares");
+    const std::array accentTicks{std::int64_t{0},
+                                 std::int64_t{4 * musical::ppq},
+                                 std::int64_t{7 * musical::ppq}};
+    std::vector<std::pair<std::size_t, float>> expected;
+    for (const auto tick : accentTicks)
+        expected.push_back({exactTriggerFrame(*oracle.prepared, tick), 2.0F});
+    const auto rendered = renderMetronomeGrid(
+        changes, 48000, expected.back().first + 2, {}, true);
+    for (const auto [frame, value] : expected)
+        check(rendered.left[frame] == value,
+              "new time-signature bar boundary is accented");
+}
+
+void tempoRateAndPartitionMatrix() {
+    const std::array<double, 4> tempos{
+        120.0, 123.0, std::nextafter(123.0, INFINITY),
+        std::nextafter(123.0, -INFINITY)};
+    for (const auto rate : {44100.0, 48000.0, 96000.0}) {
+        for (const auto bpm : tempos) {
+            musical::MusicalTimeMap map;
+            map.tempo.events[0].bpm = {bpm};
+            auto oracle = audio::prepareTemporalContext(
+                map, std::nullopt, timeline::SampleRate{rate},
+                timeline::SampleRate{rate}, 74);
+            check(oracle.success(), "tempo/rate oracle prepares");
+            std::vector<std::pair<std::size_t, float>> expected;
+            for (std::int64_t beat = 0; beat < 3; ++beat)
+                expected.push_back({exactTriggerFrame(
+                    *oracle.prepared, beat * musical::ppq),
+                    beat == 0 ? 2.0F : 1.0F});
+            const auto rendered = renderMetronomeGrid(
+                map, rate, expected.back().first + 2, {}, true);
+            checkDiagnosticEvents(rendered.left, expected,
+                                  "tempo/rate trigger equals rational ceil");
+        }
+    }
+
+    musical::MusicalTimeMap changes;
+    changes.tempo.events = {{{1}, {0}, {120.0}},
+                             {{2}, {musical::ppq}, {123.0}},
+                             {{3}, {musical::ppq + musical::ppq / 2},
+                                   {std::nextafter(123.0, INFINITY)}}};
+    changes.tempo.nextId = {4};
+    auto oracle = audio::prepareTemporalContext(
+        changes, std::nullopt, timeline::SampleRate{48000},
+        timeline::SampleRate{48000}, 75);
+    check(oracle.success(), "on/off-beat tempo changes prepare");
+    std::vector<std::pair<std::size_t, float>> expected;
+    for (std::int64_t beat = 0; beat < 4; ++beat)
+        expected.push_back({exactTriggerFrame(*oracle.prepared,
+                            beat * musical::ppq),
+                            beat == 0 ? 2.0F : 1.0F});
+    const auto changed = renderMetronomeGrid(
+        changes, 48000, expected.back().first + 2, {}, true);
+    checkDiagnosticEvents(changed.left, expected,
+                          "tempo changes retain exact beat triggers");
+
+    musical::MusicalTimeMap partitionMap;
+    partitionMap.tempo.events[0].bpm = {123.0};
+    const auto frames = std::size_t{72000};
+    const std::array<std::size_t, 1> one{1};
+    const std::array<std::size_t, 1> p127{127};
+    const std::array<std::size_t, 1> p256{256};
+    const std::array<std::size_t, 1> p1024{1024};
+    const std::array<std::size_t, 7> irregular{3, 127, 19, 256, 1, 1024, 71};
+    const auto pcm = renderMetronomeGrid(partitionMap, 48000, frames, {}, false);
+    const auto triggers = renderMetronomeGrid(partitionMap, 48000, frames, {}, true);
+    for (const auto partitions : {
+             std::span<const std::size_t>{one},
+             std::span<const std::size_t>{p127},
+             std::span<const std::size_t>{p256},
+             std::span<const std::size_t>{p1024},
+             std::span<const std::size_t>{irregular}}) {
+        check(renderMetronomeGrid(partitionMap, 48000, frames,
+                                  partitions, false).left == pcm.left,
+              "real click PCM is callback-partition invariant");
+        check(renderMetronomeGrid(partitionMap, 48000, frames,
+                                  partitions, true).left == triggers.left,
+              "logical 0/1/2 triggers are callback-partition invariant");
+    }
+}
+
+void pauseResumeMetronomeContract() {
+    const auto prepare = [](double bpm, bool diagnostic) {
+        musical::MusicalTimeMap map;
+        map.tempo.events[0].bpm = {bpm};
+        auto result = audio::prepareTemporalContext(
+            map, std::nullopt, timeline::SampleRate{48000},
+            timeline::SampleRate{48000}, 76);
+        check(result.success(), "pause context prepares");
+        if (diagnostic) makeDiagnosticClicks(*result.prepared);
+        return std::move(result.prepared);
+    };
+    const auto configure = [](audio::RealtimeAudioEngine& engine,
+                              const audio::PreparedTemporalContext* temporal) {
+        engine.configure({timeline::SampleRate{48000}, {0},
+                          std::span<const audio::PreparedTrackView>{}});
+        check(engine.configureTemporalContext(temporal),
+              "pause context configures");
+        enterOperational(engine, 48000);
+        check(engine.trySetMetronomeEnabled(true).accepted &&
+                  engine.trySetMetronomeLevel({0.0F}).accepted,
+              "pause controls enqueue");
+        std::vector<float> empty;
+        process(engine, empty, empty, 48000);
+        std::vector<float> settle(512), settleRight(512);
+        process(engine, settle, settleRight, 48000);
+        check(engine.tryRequestPlay().accepted, "pause fixture Play");
+    };
+
+    auto real = prepare(120.0, false);
+    audio::RealtimeAudioEngine voiceEngine;
+    configure(voiceEngine, real.get());
+    std::vector<float> firstHalf(96), firstHalfRight(96);
+    process(voiceEngine, firstHalf, firstHalfRight, 48000);
+    check(std::any_of(firstHalf.begin(), firstHalf.end(),
+                      [](float value) { return value != 0.0F; }),
+          "pause fixture starts a real four-millisecond click");
+    check(voiceEngine.tryRequestPause().accepted, "pause mid-voice");
+    std::vector<float> empty;
+    process(voiceEngine, empty, empty, 48000);
+    check(voiceEngine.tryRequestPlay().accepted, "resume after mid-voice pause");
+    std::vector<float> afterResume(192), afterResumeRight(192);
+    process(voiceEngine, afterResume, afterResumeRight, 48000);
+    check(std::all_of(afterResume.begin(), afterResume.end(),
+                      [](float value) { return value == 0.0F; }),
+          "Resume does not continue the cancelled click tail");
+
+    auto diagnostic = prepare(123.0, true);
+    audio::RealtimeAudioEngine pendingEngine;
+    configure(pendingEngine, diagnostic.get());
+    std::vector<float> toFractionalBeat(23415), beatRight(23415);
+    process(pendingEngine, toFractionalBeat, beatRight, 48000);
+    const auto beforePause = pendingEngine.temporalCheckpoint();
+    check(beforePause.pendingMetronomeBoundary.eventPending &&
+              !beforePause.pendingMetronomeBoundary.accent,
+          "real scheduler creates a legitimate fractional pending beat");
+    check(pendingEngine.tryRequestPause().accepted,
+          "Pause with legitimate pending event");
+    process(pendingEngine, empty, empty, 48000);
+    check(pendingEngine.temporalCheckpoint().pendingMetronomeBoundary ==
+              beforePause.pendingMetronomeBoundary,
+          "Pause preserves only the legitimate pending obligation");
+    check(pendingEngine.tryRequestPlay().accepted,
+          "Resume with legitimate pending event");
+    std::vector<float> consumed(2), consumedRight(2);
+    process(pendingEngine, consumed, consumedRight, 48000);
+    check(consumed[0] == 1.0F && consumed[1] == 0.0F &&
+              !pendingEngine.temporalCheckpoint()
+                   .pendingMetronomeBoundary.eventPending,
+          "Resume consumes a legitimate pending event exactly once");
+
+    audio::RealtimeAudioEngine noPendingEngine;
+    configure(noPendingEngine, diagnostic.get());
+    std::vector<float> awayFromBeat(128), awayRight(128);
+    process(noPendingEngine, awayFromBeat, awayRight, 48000);
+    check(!noPendingEngine.temporalCheckpoint()
+               .pendingMetronomeBoundary.eventPending,
+          "no-pending fixture is between beats");
+    check(noPendingEngine.tryRequestPause().accepted, "Pause without pending");
+    process(noPendingEngine, empty, empty, 48000);
+    check(noPendingEngine.tryRequestPlay().accepted, "Resume without pending");
+    std::vector<float> noInvented(128), noInventedRight(128);
+    process(noPendingEngine, noInvented, noInventedRight, 48000);
+    check(std::all_of(noInvented.begin(), noInvented.end(),
+                      [](float value) { return value == 0.0F; }),
+          "Resume without pending does not invent a click");
+
+    audio::RealtimeAudioEngine stopEngine;
+    configure(stopEngine, diagnostic.get());
+    std::vector<float> stopPending(23415), stopPendingRight(23415);
+    process(stopEngine, stopPending, stopPendingRight, 48000);
+    check(stopEngine.temporalCheckpoint()
+              .pendingMetronomeBoundary.eventPending,
+          "Stop fixture obtains pending from the real scheduler");
+    check(stopEngine.tryRequestStop().accepted,
+          "Stop with pending obligation is accepted");
+    process(stopEngine, empty, empty, 48000);
+    check(stopEngine.temporalCheckpoint().pendingMetronomeBoundary ==
+              audio::RealtimeAudioEngine::PendingMetronomeBoundaryState{},
+          "Stop clears voices and every pending obligation");
+
+    audio::RealtimeAudioEngine seekPendingEngine;
+    configure(seekPendingEngine, diagnostic.get());
+    std::vector<float> seekPending(23415), seekPendingRight(23415);
+    process(seekPendingEngine, seekPending, seekPendingRight, 48000);
+    check(seekPendingEngine.tryRequestPause().accepted,
+          "Seek-pending fixture pauses");
+    process(seekPendingEngine, empty, empty, 48000);
+    check(seekPendingEngine.tryRequestSeek({100}).accepted,
+          "Seek after Pause with pending is accepted");
+    process(seekPendingEngine, empty, empty, 48000);
+    check(seekPendingEngine.temporalCheckpoint().pendingMetronomeBoundary ==
+              audio::RealtimeAudioEngine::PendingMetronomeBoundaryState{},
+          "Seek clears voices and every pending obligation");
+}
+
+void loopBoundaryMetronomeMatrix() {
+    const auto render = [](musical::MusicalLoopRange loop,
+                           std::size_t frames) {
+        auto temporal = audio::prepareTemporalContext(
+            {}, loop, timeline::SampleRate{48000},
+            timeline::SampleRate{48000}, 81);
+        check(temporal.success(), "loop-boundary metronome prepares");
+        makeDiagnosticClicks(*temporal.prepared);
+        audio::RealtimeAudioEngine engine;
+        engine.configure({timeline::SampleRate{48000}, {0},
+                          std::span<const audio::PreparedTrackView>{}});
+        check(engine.configureTemporalContext(temporal.prepared.get()),
+              "loop-boundary metronome configures");
+        enterOperational(engine, 48000);
+        check(engine.trySetLoopEnabled(true).accepted &&
+                  engine.trySetMetronomeEnabled(true).accepted &&
+                  engine.trySetMetronomeLevel({0.0F}).accepted,
+              "loop-boundary controls enqueue");
+        std::vector<float> empty;
+        process(engine, empty, empty, 48000);
+        std::vector<float> settle(512), settleRight(512);
+        process(engine, settle, settleRight, 48000);
+        check(engine.tryRequestPlay().accepted, "loop-boundary Play");
+        std::vector<float> left(frames), right(frames);
+        process(engine, left, right, 48000);
+        return left;
+    };
+
+    const auto normalStart = render(
+        {{musical::ppq}, {2 * musical::ppq}}, 48002);
+    check(normalStart[0] == 2.0F && normalStart[24000] == 1.0F &&
+              normalStart[48000] == 1.0F,
+          "loopStart on a normal beat emits that normal beat once per lap");
+
+    const auto nonBeatStart = render(
+        {{musical::ppq / 2}, {musical::ppq + musical::ppq / 2}},
+        36002);
+    check(nonBeatStart[0] == 2.0F && nonBeatStart[24000] == 1.0F &&
+              nonBeatStart[36000] == 0.0F,
+          "loopStart off-grid invents no click at wrap");
+
+    const auto beatEnd = render({{0}, {musical::ppq}}, 24002);
+    check(beatEnd[0] == 2.0F && beatEnd[24000] == 2.0F,
+          "loopEnd beat is excluded and shared loopStart downbeat emits once");
+}
+
+void metronomeTransportAndLevelMatrix() {
+    musical::MusicalTimeMap map;
+    map.tempo.events[0].bpm = {123.0};
+    auto temporal = audio::prepareTemporalContext(
+        map, std::nullopt, timeline::SampleRate{48000},
+        timeline::SampleRate{48000}, 77);
+    check(temporal.success(), "transport matrix context prepares");
+    makeDiagnosticClicks(*temporal.prepared);
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000}, {0},
+                      std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "transport matrix context configures");
+    enterOperational(engine, 48000);
+    check(engine.trySetMetronomeEnabled(true).accepted &&
+              engine.trySetMetronomeEnabled(false).accepted &&
+              engine.trySetMetronomeEnabled(true).accepted,
+          "metronome enable/disable is accepted while Stopped");
+    std::vector<float> empty;
+    process(engine, empty, empty, 48000);
+    check(engine.tryRequestPlay().accepted, "transport matrix Play");
+    std::vector<float> opening(23415), openingRight(23415);
+    process(engine, opening, openingRight, 48000);
+    check(engine.temporalCheckpoint().pendingMetronomeBoundary.eventPending,
+          "transport matrix reaches a real pending beat");
+    check(engine.tryRequestPause().accepted, "transport matrix Pause");
+    process(engine, empty, empty, 48000);
+    check(engine.trySetMetronomeEnabled(false).accepted &&
+              engine.trySetMetronomeEnabled(true).accepted,
+          "metronome enable/disable is accepted while Paused");
+    process(engine, empty, empty, 48000);
+    check(!engine.temporalCheckpoint().pendingMetronomeBoundary.eventPending,
+          "metronome-off clears pending scheduling while Paused");
+    check(engine.tryRequestPlay().accepted, "transport matrix Resume");
+    process(engine, empty, empty, 48000);
+    check(engine.trySetMetronomeEnabled(false).accepted,
+          "metronome disable is accepted while Playing");
+    process(engine, empty, empty, 48000);
+    const auto open = engine.temporalCheckpoint();
+    check(open.clock.playback == transport::PlaybackState::playing &&
+              open.runUntilStop && !open.metronomeEnabled,
+          "disable during open playback neither Stops nor clears runUntilStop");
+    check(engine.tryRequestStop().accepted, "Stop ends open playback");
+    process(engine, empty, empty, 48000);
+    check(engine.transportSnapshot().playback ==
+              transport::PlaybackState::stopped &&
+              !engine.tryRequestPlay().accepted,
+          "later empty Play is rejected while metronome is disabled");
+    check(engine.tryRequestStop().accepted, "second Stop is accepted");
+    process(engine, empty, empty, 48000);
+    check(engine.transportSnapshot().position.value == 0,
+          "second Stop rewinds to zero");
+
+    auto seekTemporal = audio::prepareTemporalContext(
+        {}, std::nullopt, timeline::SampleRate{48000},
+        timeline::SampleRate{48000}, 78);
+    check(seekTemporal.success(), "seek metronome context prepares");
+    makeDiagnosticClicks(*seekTemporal.prepared);
+    audio::RealtimeAudioEngine seekEngine;
+    seekEngine.configure({timeline::SampleRate{48000}, {0},
+                          std::span<const audio::PreparedTrackView>{}});
+    check(seekEngine.configureTemporalContext(seekTemporal.prepared.get()),
+          "seek metronome context configures");
+    enterOperational(seekEngine, 48000);
+    check(seekEngine.trySetMetronomeEnabled(true).accepted &&
+              seekEngine.trySetMetronomeLevel({0.0F}).accepted,
+          "seek metronome enable");
+    process(seekEngine, empty, empty, 48000);
+    std::vector<float> seekSettle(512), seekSettleRight(512);
+    process(seekEngine, seekSettle, seekSettleRight, 48000);
+    const auto renderFrom = [&](std::int64_t position, std::size_t frames) {
+        check(seekEngine.tryRequestSeek({position}).accepted,
+              "Stopped metronome Seek accepted");
+        process(seekEngine, empty, empty, 48000);
+        check(seekEngine.tryRequestPlay().accepted, "Play after metronome Seek");
+        std::vector<float> left(frames), right(frames);
+        process(seekEngine, left, right, 48000);
+        check(seekEngine.tryRequestStop().accepted, "Stop after metronome Seek");
+        process(seekEngine, empty, empty, 48000);
+        return left;
+    };
+    check(renderFrom(24000, 2)[0] == 1.0F,
+          "Seek exactly to beat emits that beat once");
+    const auto before = renderFrom(23999, 3);
+    check(before[0] == 0.0F && before[1] == 1.0F,
+          "Seek just before beat reaches the beat causally");
+    const auto after = renderFrom(24001, 3);
+    check(std::all_of(after.begin(), after.end(),
+                      [](float value) { return value == 0.0F; }),
+          "Seek just after beat does not replay it");
+
+    check(seekEngine.tryRequestSeek({100}).accepted,
+          "Paused-seek fixture positions while Stopped");
+    process(seekEngine, empty, empty, 48000);
+    check(seekEngine.tryRequestPlay().accepted, "Paused-seek fixture Play");
+    process(seekEngine, empty, empty, 48000);
+    check(seekEngine.tryRequestPause().accepted, "Paused-seek fixture Pause");
+    process(seekEngine, empty, empty, 48000);
+    check(seekEngine.tryRequestSeek({24000}).accepted,
+          "Seek is accepted while Paused");
+    check(seekEngine.tryRequestPlay().accepted,
+          "Play can follow pending Paused Seek");
+    check(!seekEngine.tryRequestSeek({0}).accepted,
+          "Seek is rejected against projected Playing");
+    process(seekEngine, empty, empty, 48000);
+
+    check(!seekEngine.trySetMetronomeLevel(
+              {std::numeric_limits<float>::quiet_NaN()}).accepted &&
+              !seekEngine.trySetMetronomeLevel(
+                  {std::numeric_limits<float>::infinity()}).accepted &&
+              !seekEngine.trySetMetronomeLevel({-100.1F}).accepted &&
+              !seekEngine.trySetMetronomeLevel({0.1F}).accepted,
+          "invalid metronome levels are rejected");
+
+    const auto zero = renderMetronomeGrid({}, 48000, 2, {}, true, -100.0F);
+    const auto nominal = renderMetronomeGrid({}, 48000, 2, {}, true, -12.0F);
+    const auto unity = renderMetronomeGrid({}, 48000, 2, {}, true, 0.0F);
+    check(zero.left[0] == 0.0F &&
+              std::abs(nominal.left[0] -
+                       2.0F * audio::prepareMetronomeLevel({-12.0F})) < 1.0e-6F &&
+              unity.left[0] == 2.0F,
+          "metronome levels -100/-12/0 use the prepared gain contract");
+}
+
+void metronomeLargeAndDensePreparation() {
+    musical::MusicalTimeMap dense;
+    dense.tempo.events.clear();
+    dense.signatures.events.clear();
+    dense.tempo.events.reserve(musical::maximumEvents);
+    dense.signatures.events.reserve(musical::maximumEvents);
+    for (std::size_t index = 0; index < musical::maximumEvents; ++index) {
+        dense.tempo.events.push_back({{index + 1},
+            {static_cast<std::int64_t>(index) * 960},
+            {index % 2 ? 123.0 : 120.0}});
+        dense.signatures.events.push_back({{index + 1},
+            {static_cast<std::int64_t>(index)}, {1, 64}});
+    }
+    dense.tempo.nextId = {musical::maximumEvents + 1};
+    dense.signatures.nextId = {musical::maximumEvents + 1};
+    const auto prepared = audio::prepareTemporalContext(
+        dense, std::nullopt, timeline::SampleRate{96000},
+        timeline::SampleRate{44100}, 79);
+    check(prepared.success() && !prepared.prepared->beats.empty() &&
+              prepared.prepared->beats.size() <=
+                  2 * musical::maximumEvents - 1,
+          "maximum dense tempo/meter maps remain prepared and bounded");
+
+    musical::MusicalTimeMap large;
+    large.tempo.events[0].bpm = {400.0};
+    auto largeContext = audio::prepareTemporalContext(
+        large, std::nullopt, timeline::SampleRate{48000},
+        timeline::SampleRate{48000}, 80);
+    check(largeContext.success(), "large-position metronome prepares");
+    makeDiagnosticClicks(*largeContext.prepared);
+    const auto tick = musical::maximumCoordinate -
+        musical::maximumCoordinate % musical::ppq;
+    const auto exact = largeContext.prepared->musicalTime
+                           ->exactProjectFrameAtTick({tick});
+    check(bool(exact), "large musical beat has an exact project position");
+    const auto floor = audio::exact::floorPosition(exact.value);
+    const auto triggerOffset = audio::exact::zero(
+        audio::exact::wide(floor.remainder)) ? 0U : 1U;
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000}, {0},
+                      std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(largeContext.prepared.get()),
+          "large-position metronome configures");
+    enterOperational(engine, 48000);
+    check(engine.trySetMetronomeEnabled(true).accepted &&
+              engine.trySetMetronomeLevel({0.0F}).accepted,
+          "large-position metronome enable");
+    std::vector<float> empty;
+    process(engine, empty, empty, 48000);
+    std::vector<float> settle(512), settleRight(512);
+    process(engine, settle, settleRight, 48000);
+    check(engine.tryRequestSeek({floor.frame}).accepted,
+          "large supported metronome position seeks exactly");
+    process(engine, empty, empty, 48000);
+    check(engine.tryRequestPlay().accepted, "large-position Play");
+    std::vector<float> left(2), right(2);
+    process(engine, left, right, 48000);
+    check((left[triggerOffset] == 1.0F || left[triggerOffset] == 2.0F) &&
+              left[1U - triggerOffset] == 0.0F,
+          "large-position scheduler emits the exact prepared beat");
+}
 }
 
 void* operator new(std::size_t size) {
@@ -706,7 +1306,15 @@ int main() {
     exactMusicalLoopAndMetronome();
     crossedLoopStartMetronome();
     pendingLoopStartSurvivesHardRebuild();
+    pendingBeatSurvivesHardRebuild(false);
+    pendingBeatSurvivesHardRebuild(true);
     temporalReregistrationPreservesClock();
     metronomeAndEmptyPolicy();
+    meterAccentMatrix();
+    tempoRateAndPartitionMatrix();
+    pauseResumeMetronomeContract();
+    loopBoundaryMetronomeMatrix();
+    metronomeTransportAndLevelMatrix();
+    metronomeLargeAndDensePreparation();
     std::cout << "Loop and metronome tests passed\n";
 }

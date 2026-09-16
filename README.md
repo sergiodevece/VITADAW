@@ -1,4 +1,4 @@
-# VitaDAW 0.6.2 — Loop Foundation
+# VitaDAW 0.6.3 — Metronome
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -262,6 +262,21 @@ fronteras exactas/de presentación y revisión coherentes. Los rebuilds pueden
 cancelar voces del metrónomo, pero preservan la obligación musical de un click de
 loopStart atravesado para emitirlo exactamente una vez al reanudar. El scheduler
 de hasta 8191 segmentos continúa acotado y pendiente de benchmark profesional.
+
+VitaDAW 0.6.3 consolida el metrónomo como función de producto sin sustituir
+esa infraestructura. `metronomeEnabled` y el nivel permanecen como estado de
+sesión no persistente, con defaults disabled y -12 dB. El beat es la figura del
+denominador y solo el primer beat de cada compás recibe accent: 7/8 produce un
+accent y seis clicks normales, sin agrupación 2+2+3. Pause cancela cualquier
+cola de click ya iniciada pero conserva una obligación musical todavía no
+emitida; Resume no reanuda PCM antiguo ni inventa un evento.
+
+El click conserva su posición explícita en la cadena: Master Inserts →
+Metronome → Master Gain → Master Meter/Output. Un proyecto vacío con metrónomo
+activo puede reproducirse hasta Stop. Desactivarlo durante esa reproducción
+silencia nuevos clicks sin ejecutar Stop ni retirar `runUntilStop` de la sesión
+en curso. `MetronomeReadModel` publica enabled, nivel y revisión temporal como
+un único valor coherente de presentación.
 
 ## Tecnología propuesta
 
@@ -662,6 +677,8 @@ La arquitectura y las reglas de tiempo real se describen en
   y persistencia bit-exact de BPM sin crear otra autoridad temporal.
 - **0.6.2 — Loop Foundation:** contrato half-open exacto, admisión reconciliada,
   obligación musical pendiente preservada en lifecycle y read model cohesionado.
+- **0.6.3 — Metronome:** contrato N/D y accent, Pause sin colas PCM,
+  read model coherente, rollback integral y matriz exacta de scheduling.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -692,4 +709,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.6.md`](docs/validation-0.5.6.md) y
 [`docs/validation-0.6.0.md`](docs/validation-0.6.0.md) y
 [`docs/validation-0.6.1.md`](docs/validation-0.6.1.md) y
-[`docs/validation-0.6.2.md`](docs/validation-0.6.2.md).
+[`docs/validation-0.6.2.md`](docs/validation-0.6.2.md) y
+[`docs/validation-0.6.3.md`](docs/validation-0.6.3.md).

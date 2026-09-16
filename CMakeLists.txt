@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.6.2 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.6.3 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -185,7 +185,7 @@ if(VITADAW_BUILD_TESTS)
             juce::juce_audio_devices juce::juce_audio_formats)
         target_compile_definitions(vitadaw_temporal_juce_integration_tests PRIVATE
             JUCE_USE_FLAC=0 JUCE_USE_MP3AUDIOFORMAT=0 JUCE_USE_OGGVORBIS=0 JUCE_USE_CURL=0)
-        foreach(case bootstrap lifetime checkpoint rollback run_until_stop pending_wrap)
+        foreach(case bootstrap lifetime checkpoint rollback metronome_rates metronome_rollback run_until_stop pending_wrap)
             add_test(NAME vitadaw_temporal_juce_${case}
                 COMMAND vitadaw_temporal_juce_integration_tests ${case})
         endforeach()

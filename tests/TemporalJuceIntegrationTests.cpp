@@ -1,5 +1,6 @@
 #include "vitadaw/platform/juce/JuceAudioDeviceAdapter.h"
 #include "vitadaw/application/DawApplication.h"
+#include "vitadaw/commands/CommandDispatcher.h"
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -103,6 +104,92 @@ int main(int argc, char** argv) {
             Access::engine(adapter).deviceUnavailable();
             check(Access::open(adapter, 48000), "empty project reprepare back");
             plan(adapter);
+        } else if (test == "metronome_rates") {
+            check(Access::open(adapter, 44100),
+                  "metronome lifecycle opens 44.1 kHz");
+            Access::engine(adapter).deviceConsumerStarted();
+            check(adapter.trySetMetronomeEnabled(true).accepted &&
+                      adapter.trySetMetronomeLevel({-12.0F}).accepted,
+                  "metronome lifecycle establishes session controls");
+            process(adapter, 0);
+            check(adapter.tryRequestPlay().accepted,
+                  "metronome lifecycle starts open playback");
+            process(adapter, 64);
+            auto previous = Access::engine(adapter).temporalCheckpoint();
+            for (const auto rate : {48000.0, 96000.0, 44100.0}) {
+                check(Access::open(adapter, rate),
+                      "metronome lifecycle reprepares requested sample rate");
+                check(Access::context(adapter)->deviceSampleRate ==
+                          timeline::SampleRate{rate} &&
+                          same(previous,
+                               Access::engine(adapter).temporalCheckpoint()),
+                      "44.1/48/96 reprepare preserves metronome checkpoint");
+                Access::engine(adapter).deviceConsumerStarted();
+                process(adapter, 64);
+                previous = Access::engine(adapter).temporalCheckpoint();
+                check(previous.clock.playback ==
+                          transport::PlaybackState::playing &&
+                          previous.metronomeEnabled && previous.runUntilStop,
+                      "metronome remains active after device-rate rebuild");
+            }
+            check(adapter.tryRequestStop().accepted,
+                  "metronome lifecycle stops after rate matrix");
+            process(adapter, 0);
+        } else if (test == "metronome_rollback") {
+            check(Access::open(adapter, 48000),
+                  "metronome rollback opens certified device");
+            Access::engine(adapter).deviceConsumerStarted();
+            commands::CommandDispatcher dispatcher{app};
+            check(dispatcher.dispatch(commands::SetTempo{
+                      {1}, {std::nextafter(123.0, INFINITY)}}).status ==
+                      commands::CommandStatus::accepted,
+                  "metronome rollback commits document A");
+            check(dispatcher.dispatch(commands::SetLoopRangeMusical{
+                      {0}, {musical::ppq}}).status ==
+                      commands::CommandStatus::accepted,
+                  "metronome rollback certifies fractional temporal context A");
+            check(dispatcher.dispatch(commands::SetMetronomeEnabled{true}).status ==
+                      commands::CommandStatus::accepted &&
+                      dispatcher.dispatch(commands::SetMetronomeLevel{{-18.0F}}).status ==
+                      commands::CommandStatus::accepted,
+                  "metronome rollback establishes session A");
+            process(adapter, 0);
+            app.synchroniseTransport();
+            check(dispatcher.dispatch(commands::Play{}).status ==
+                      commands::CommandStatus::accepted,
+                  "metronome rollback starts open playback A");
+            process(adapter, 32);
+            app.synchroniseTransport();
+            const auto documentA = app.project().musicalTime();
+            const auto preparedMapA = Access::context(adapter)->documentMap;
+            const auto revisionA = Access::context(adapter)->revision;
+            const auto readModelA = app.metronomeReadModel();
+            const auto checkpointA = Access::engine(adapter).temporalCheckpoint();
+            check(readModelA.enabled && readModelA.level.value == -18.0F &&
+                      readModelA.temporalRevision == revisionA &&
+                      checkpointA.clock.playback ==
+                          transport::PlaybackState::playing &&
+                      checkpointA.runUntilStop,
+                  "metronome rollback fixture is coherent before candidate B");
+            check(!Access::open(adapter, 44100),
+                  "metronome rollback rejects incompatible reprepare B");
+            app.synchroniseTransport();
+            const auto checkpointAfter =
+                Access::engine(adapter).temporalCheckpoint();
+            check(app.project().musicalTime() == documentA &&
+                      Access::context(adapter)->documentMap == preparedMapA &&
+                      Access::context(adapter)->revision == revisionA &&
+                      Access::context(adapter)->deviceSampleRate ==
+                          timeline::SampleRate{48000} &&
+                      adapter.transportSnapshot().temporalRevision == revisionA &&
+                      app.metronomeReadModel() == readModelA &&
+                      same(checkpointA, checkpointAfter) &&
+                      checkpointAfter.clock.playback ==
+                          transport::PlaybackState::playing &&
+                      checkpointAfter.runUntilStop,
+                  "failed reprepare preserves semantic context, revision, read model and open playback without a hybrid");
+            check(Access::open(adapter, 48000),
+                  "metronome rollback recovers compatible device");
         } else if (test == "run_until_stop") {
             temporal(adapter, std::nextafter(123.0, INFINITY));
             plan(adapter);

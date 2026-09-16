@@ -259,6 +259,7 @@ public:
         }
         snapshot.playing = true;
         snapshot.playback = vitadaw::transport::PlaybackState::playing;
+        runUntilStop = runUntilStop || snapshot.metronomeEnabled;
         snapshot.lastProcessedCommandSequence = sequence;
         return {true, sequence, vitadaw::audio::AudioControlRejection::none,
                 snapshot.playback, snapshot.position, true};
@@ -316,7 +317,9 @@ public:
     vitadaw::audio::AudioControlRequestResult trySetMetronomeEnabled(bool enabled) noexcept override {
         if (!acceptRequests) return {};
         const auto sequence = nextSequence++;
+        const auto preserveOpenPlayback = snapshot.playing && runUntilStop;
         snapshot.metronomeEnabled = enabled;
+        runUntilStop = enabled || preserveOpenPlayback;
         snapshot.lastProcessedCommandSequence = sequence;
         return {true,sequence};
     }
@@ -374,6 +377,7 @@ public:
     bool rejectNextStructuralPreparation{};
     bool rejectNextStructuralCommit{};
     bool rejectNextTemporalCommit{};
+    bool runUntilStop{};
     vitadaw::audio::ProcessingPlanSpecification liveSpecification;
     ResourceCounters resourceCounters;
     std::unique_ptr<vitadaw::audio::PreparedTemporalContext> temporal;
@@ -1124,6 +1128,29 @@ int main() {
           sessionApp.metronomeLevel().value == -18.0F &&
           sessionApp.history().currentStateToken() == loopToken,
           "metronome applied state is observable and non-documentary");
+    const auto metronomeA = sessionApp.metronomeReadModel();
+    const auto documentA = sessionApp.project().musicalTime();
+    const auto preparedA = sessionAudio.temporal->documentMap;
+    const auto revisionA = sessionAudio.temporal->revision;
+    const auto playbackA = sessionAudio.transportSnapshot().playback;
+    const auto runUntilStopA = sessionAudio.runUntilStop;
+    sessionAudio.rejectNextTemporalCommit = true;
+    const auto rejectedTempoB = sessionDispatcher.dispatch(
+        commands::SetTempo{{1}, {123.0}});
+    sessionApp.synchroniseTransport();
+    check(rejectedTempoB.status == commands::CommandStatus::rejected &&
+              sessionApp.project().musicalTime() == documentA &&
+              sessionAudio.temporal->documentMap == preparedA &&
+              sessionAudio.temporal->revision == revisionA &&
+              sessionAudio.transportSnapshot().temporalRevision == revisionA &&
+              sessionApp.metronomeReadModel() == metronomeA &&
+              sessionApp.timelineSnapshot().metronome == metronomeA &&
+              metronomeA.temporalRevision == revisionA &&
+              sessionApp.metronomeEnabled() == metronomeA.enabled &&
+              sessionApp.metronomeLevel() == metronomeA.level &&
+              sessionAudio.transportSnapshot().playback == playbackA &&
+              sessionAudio.runUntilStop == runUntilStopA,
+          "failed temporal commit preserves semantic context, revision, metronome read model and playback policy");
     check(sessionDispatcher.dispatch(commands::Undo{}).status ==
               commands::CommandStatus::accepted &&
           !sessionApp.project().loopRange().has_value(),
