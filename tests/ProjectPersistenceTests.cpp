@@ -4,10 +4,12 @@
 #include "vitadaw/processors/GainProcessor.h"
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <new>
 #include <unistd.h>
@@ -165,6 +167,33 @@ void codecTests() {
     check(encode(*loaded.project) == original, "full canonical model equality including every field/counter");
     check(loaded.project->tracks()[0].clips == p.tracks()[0].clips, "fractional clip values exact");
     check(loaded.project->sources()[0].sampleRate == p.sources()[0].sampleRate, "source clock exact");
+    {
+        auto musicalDto=p.documentData();
+        musicalDto.musicalTime.tempo.events={
+            {{1},{0},{123.0}},
+            {{2},{musical::ppq},{std::nextafter(123.0,
+                                                std::numeric_limits<double>::infinity())}},
+            {{3},{2*musical::ppq},{std::nextafter(123.0,0.0)}}};
+        musicalDto.musicalTime.tempo.nextId={4};
+        musicalDto.musicalTime.signatures.events={
+            {{1},{0},{4,4}},{{2},{3},{7,8}}};
+        musicalDto.musicalTime.signatures.nextId={3};
+        auto musicalProject=project::ProjectState::fromDocumentData(
+            std::move(musicalDto));
+        check(bool(musicalProject),"bit-exact musical persistence fixture");
+        const auto musicalBytes=encode(*musicalProject);
+        const auto musicalLoaded=deserializeProject(musicalBytes);
+        check(musicalLoaded.result.success(),"bit-exact musical deserialize");
+        const auto& before=musicalProject->musicalTime();
+        const auto& after=musicalLoaded.project->musicalTime();
+        check(before.resolution==after.resolution&&before.tempo.nextId==after.tempo.nextId&&
+              before.signatures==after.signatures,"PPQ IDs and bar anchors persist");
+        check(before.tempo.events.size()==after.tempo.events.size(),"tempo count persists");
+        for(std::size_t index=0;index<before.tempo.events.size();++index)
+            check(std::bit_cast<std::uint64_t>(before.tempo.events[index].bpm.value)==
+                  std::bit_cast<std::uint64_t>(after.tempo.events[index].bpm.value),
+                  "BPM binary64 bits persist exactly");
+    }
     auto dto = p.documentData();
     constexpr std::uint64_t big = 9007199254740993ULL;
     for (auto& t : dto.tracks) { t.id.value += big; for(auto& c:t.clips){c.id.value+=big; c.source.value+=big;}

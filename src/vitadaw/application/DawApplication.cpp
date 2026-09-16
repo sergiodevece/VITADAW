@@ -1250,13 +1250,17 @@ ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
     result.metronomeLevel = session_.metronomeLevel;
     result.temporalRevision = session_.appliedTemporalRevision;
     if (result.loopRange) {
+        const auto exactStart = musicalTime_->exactProjectFrameAtTick(
+            result.loopRange->start);
+        const auto exactEnd = musicalTime_->exactProjectFrameAtTick(
+            result.loopRange->end);
         const auto start = musicalTime_->preciseProjectFrameAtTick(result.loopRange->start);
         const auto end = musicalTime_->preciseProjectFrameAtTick(result.loopRange->end);
-        if (start && end) {
+        if (exactStart && exactEnd && start && end) {
             result.loopStart = start.value;
             result.loopEnd = end.value;
-            const auto startLabel = musicalTime_->musicalPositionAt(start.value);
-            const auto endLabel = musicalTime_->musicalPositionAt(end.value);
+            const auto startLabel = musicalTime_->musicalPositionAt(exactStart.value);
+            const auto endLabel = musicalTime_->musicalPositionAt(exactEnd.value);
             if (startLabel) result.loopStartPosition = startLabel.value;
             if (endLabel) result.loopEndPosition = endLabel.value;
         }

@@ -202,6 +202,58 @@ void partitionInvariance() {
           "loop render and fractional phase are callback-partition invariant");
 }
 
+std::vector<float> renderMusicalRatePair(double projectRate, double deviceRate,
+    std::span<const std::size_t> partitions) {
+    musical::MusicalTimeMap map;
+    map.tempo.events[0].bpm={400.0};
+    auto temporal=audio::prepareTemporalContext(map,
+        musical::MusicalLoopRange{{0},{musical::ppq}},
+        timeline::SampleRate{projectRate},timeline::SampleRate{deviceRate},21);
+    check(temporal.success(),"rate-matrix temporal context prepares");
+    const auto beat=temporal.prepared->musicalTime->exactProjectFrameAtTick(
+        {musical::ppq});
+    check(beat&&audio::exact::compareBoundary(
+              beat.value,temporal.prepared->loop->clockBounds.exactEnd)==0,
+          "loop and metronome share exact musical anchor");
+
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{projectRate},{0},
+        std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "rate-matrix temporal context installs");
+    enterOperational(engine,deviceRate);
+    check(engine.trySetLoopEnabled(true).accepted&&
+          engine.trySetMetronomeEnabled(true).accepted,
+          "rate-matrix loop and metronome enable");
+    check(engine.trySetMetronomeLevel({0.0F}).accepted,
+          "rate-matrix metronome unity");
+    std::vector<float> empty;
+    process(engine,empty,empty,deviceRate);
+    std::vector<float> settle(512),settleRight(512);
+    process(engine,settle,settleRight,deviceRate);
+    check(engine.tryRequestPlay().accepted,"rate-matrix Play");
+    std::size_t total{};for(auto count:partitions)total+=count;
+    std::vector<float> left(total),right(total);
+    std::size_t offset{};
+    for(auto count:partitions){
+        processRange(engine,left,right,offset,count,deviceRate);offset+=count;
+    }
+    check(std::any_of(left.begin(),left.end(),[](float sample){return sample!=0.0F;}),
+          "rate-matrix metronome produces clicks");
+    return left;
+}
+
+void musicalRateMatrixRegression() {
+    const std::array<std::size_t,1> single{30000};
+    const std::array<std::size_t,8> split{64,128,256,512,1024,4096,8192,15728};
+    for(const auto rates:{std::pair{44100.0,48000.0},
+                          std::pair{48000.0,96000.0},
+                          std::pair{96000.0,44100.0}})
+        check(renderMusicalRatePair(rates.first,rates.second,single)==
+              renderMusicalRatePair(rates.first,rates.second,split),
+              "musical anchors and click samples are rate/partition invariant");
+}
+
 std::vector<float> renderExactMusicalLoop(
     std::span<const std::size_t> partitions) {
     std::vector<float> samples(30000);
@@ -477,6 +529,7 @@ int main() {
     fractionalClock();
     loopRenderAndMultipleWraps();
     partitionInvariance();
+    musicalRateMatrixRegression();
     exactMusicalLoopAndMetronome();
     crossedLoopStartMetronome();
     temporalReregistrationPreservesClock();

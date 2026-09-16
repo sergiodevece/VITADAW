@@ -1,4 +1,4 @@
-# VitaDAW 0.6.0 — Transport & Timeline Foundation
+# VitaDAW 0.6.1 — Musical Time
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -236,6 +236,23 @@ un harness JUCE sin hardware para bootstrap, lifetime, checkpoint, reprepare y
 rollback de `runUntilStop`;
 no equivale a un smoke acústico ni a un benchmark RT profesional.
 Detalles: [`docs/validation-0.6.0.md`](docs/validation-0.6.0.md).
+
+VitaDAW 0.6.1 consolida Musical Time como una vista bidireccional exacta
+sobre la autoridad de project frames. `MusicalTickPosition` es la coordenada
+musical canónica y `MusicalPosition` su descomposición bar/beat/tick. El mapa
+preparado convierte tick→posición exacta y posición exacta→tick mediante
+aritmética fija 128/256; las decisiones de segmento, frontera y redondeo no
+dependen de floating point. Los segmentos de tempo son half-open y una posición
+igual al anchor siguiente pertenece siempre al segmento nuevo. Los doubles se
+conservan exclusivamente para segundos, negras y píxeles de presentación.
+
+Todo `PreparedMusicalTimeMap` publicado queda certificado para la ruta exacta.
+Un documento inválido, una coordenada fuera de rango, un resultado que exceda
+el timeline soportado y una configuración que no cabe en la capacidad exacta
+producen errores distintos. La inversa queda acotada a una búsqueda de segmento
+y un máximo de 41 comparaciones de ticks. Grid, loop y metrónomo comparten los
+mismos anchors exactos; no se añade un segundo reloj ni estado musical mutable.
+El schema permanece en v3 y los BPM conservan exactamente sus bits binary64.
 
 ## Tecnología propuesta
 
@@ -631,6 +648,9 @@ La arquitectura y las reglas de tiempo real se describen en
   autoritativa, dominio navegable separado del contenido, reducción sobre el
   orden aceptado, discontinuidad Seek explícita sin reset universal y preparación
   temporal/musical exacta con rollback íntegro del checkpoint.
+- **0.6.1 — Musical Time:** mapa musical preparado bidireccional, inverse y
+  rounding racionales, consultas exactas de tempo/métrica, grid anclado a ticks
+  y persistencia bit-exact de BPM sin crear otra autoridad temporal.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -659,4 +679,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.4.md`](docs/validation-0.5.4.md) y
 [`docs/validation-0.5.5.md`](docs/validation-0.5.5.md) y
 [`docs/validation-0.5.6.md`](docs/validation-0.5.6.md) y
-[`docs/validation-0.6.0.md`](docs/validation-0.6.0.md).
+[`docs/validation-0.6.0.md`](docs/validation-0.6.0.md) y
+[`docs/validation-0.6.1.md`](docs/validation-0.6.1.md).

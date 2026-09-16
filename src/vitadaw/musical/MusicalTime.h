@@ -88,6 +88,7 @@ struct PreparedTempoSegment {
 };
 struct PreparedExactTempoSegment {
     MusicalTickPosition startTick;
+    audio::exact::Position startPosition;
     audio::exact::LinearMapping framesFromStart;
 };
 struct PreparedTimeSignatureSegment {
@@ -113,21 +114,22 @@ public:
     }
     [[nodiscard]] Result<timeline::Seconds> secondsAt(QuarterNotePosition) const noexcept;
     [[nodiscard]] Result<timeline::PreciseProjectFramePosition> preciseProjectFrameAt(QuarterNotePosition) const noexcept;
-    [[nodiscard]] Result<timeline::PreciseProjectFramePosition> preciseProjectFrameAtTick(MusicalTickPosition t) const noexcept {
-        return preciseProjectFrameAt(QuarterNotePosition{static_cast<double>(t.value) / ppq});
-    }
-    // DSP preparation only: this path never evaluates the tick/frame boundary
-    // through seconds or floating point.
+    [[nodiscard]] Result<timeline::PreciseProjectFramePosition> preciseProjectFrameAtTick(MusicalTickPosition) const noexcept;
+    // Returns the complete exact position, including a possible subframe
+    // component. It is not necessarily an integer ProjectFramePosition.
     [[nodiscard]] Result<audio::exact::Position> exactProjectFrameAtTick(
         MusicalTickPosition) const noexcept;
     [[nodiscard]] Result<timeline::ProjectFramePosition> projectFrameAt(MusicalTickPosition, Rounding = Rounding::nearest) const noexcept;
     [[nodiscard]] Result<timeline::ProjectFramePosition> projectFrameAt(MusicalPosition, Rounding = Rounding::nearest) const noexcept;
     [[nodiscard]] Result<MusicalTickPosition> tickAt(MusicalPosition) const noexcept;
+    [[nodiscard]] Result<MusicalTickPosition> absoluteTickAt(audio::exact::Position) const noexcept;
+    [[nodiscard]] Result<MusicalTickPosition> absoluteTickAt(timeline::ProjectFramePosition) const noexcept;
+    [[nodiscard]] Result<MusicalPosition> musicalPositionAt(audio::exact::Position) const noexcept;
     [[nodiscard]] Result<MusicalPosition> musicalPositionAt(timeline::PreciseProjectFramePosition) const noexcept;
-    [[nodiscard]] Result<MusicalPosition> musicalPositionAt(timeline::ProjectFramePosition f) const noexcept {
-        return musicalPositionAt(timeline::PreciseProjectFramePosition{static_cast<double>(f.value)});
-    }
+    [[nodiscard]] Result<MusicalPosition> musicalPositionAt(timeline::ProjectFramePosition) const noexcept;
+    [[nodiscard]] Result<TempoBpm> tempoAt(audio::exact::Position) const noexcept;
     [[nodiscard]] Result<TempoBpm> tempoAt(timeline::ProjectFramePosition) const noexcept;
+    [[nodiscard]] Result<TimeSignature> timeSignatureAt(audio::exact::Position) const noexcept;
     [[nodiscard]] Result<TimeSignature> timeSignatureAt(timeline::ProjectFramePosition) const noexcept;
     [[nodiscard]] EnumerationResult enumerateGridLines(timeline::PreciseProjectFramePosition start,
         timeline::PreciseProjectFramePosition end, GridSubdivision, std::span<GridLine>) const noexcept;
@@ -137,20 +139,11 @@ public:
     }
 private:
     PreparedMusicalTimeMap() = default;
-    // Compressed radix index over the bounded 41-bit tick domain. Grid queries
-    // cannot scan thousands of tempo events hidden between two emitted lines.
-    struct TempoLookupNode {
-        double splitQuarter{};
-        std::uint32_t left{UINT32_MAX}, right{UINT32_MAX}, tempoIndex{};
-    };
-    const PreparedTempoSegment& gridTempoAt(double quarter) const noexcept;
     MusicalPosition positionAtTick(std::int64_t) const noexcept;
     timeline::SampleRate rate_;
     std::uint64_t revision_{};
     std::vector<PreparedTempoSegment> tempos_;
     std::vector<PreparedExactTempoSegment> exactTempos_;
-    bool exactDspCertified_{true};
     std::vector<PreparedTimeSignatureSegment> signatures_;
-    std::vector<TempoLookupNode> gridTempoIndex_;
 };
 } // namespace vitadaw::musical

@@ -1703,6 +1703,63 @@ denominador fuera del callback solo para los límites racionales que interactúa
 con RT. Una integral, anchor, LCM o conversión de checkpoint que exceda la
 capacidad fija se rechaza antes del commit y preserva el contexto anterior.
 
+## Temporal State Model V1 y Musical Time 0.6.1
+
+Las autoridades quedan formalmente separadas:
+
+- autoridad documental: `ProjectState::MusicalTimeMap`;
+- autoridad preparada de consultas para la revisión N:
+  `PreparedMusicalTimeMap`;
+- coordenada musical canónica: `MusicalTickPosition`;
+- vista musical estructurada: `MusicalPosition`;
+- autoridad temporal pública/DSP: `ProjectFramePosition + ExactProjectPhase`;
+- semántica de transporte: `TransportReducer`;
+- ejecución RT: `RealtimeProjectClock`;
+- publicación confirmada: `RealtimeTransportExchange`;
+- proyección de aplicación: estado RT confirmado más comandos aceptados
+  pendientes.
+
+Musical Time es derivado de project time; no es otro reloj. No se cachea una
+posición musical mutable en snapshots, checkpoints o sesión. Dos mapas
+preparados de la misma revisión pueden tener owners distintos —aplicación y
+contexto temporal—, pero compilan determinísticamente el mismo documento.
+
+Un mapa preparado publicado está siempre certificado para consultas exactas.
+La compilación distingue invalidez documental, `outOfRange`,
+`conversionOverflow` y `capacityExceeded`; no existe fallback silencioso a una
+ruta exclusivamente floating point. `exactProjectFrameAtTick()` conserva su
+nombre por compatibilidad, pero devuelve `audio::exact::Position`: puede incluir
+una componente subframe y no equivale necesariamente a un
+`ProjectFramePosition` entero.
+
+La conversión forward selecciona por tick un segmento exacto y evalúa su
+`LinearMapping`. La inversa selecciona primero el segmento por anchors exactos
+y busca después el mayor tick de su intervalo half-open
+`[startTick,nextStartTick)` cuya frontera no supera la posición. Una posición
+igual al anchor siguiente selecciona el segmento nuevo; la búsqueda anterior
+nunca puede devolver el tick exclusivo. La selección inicial es O(log N) y la
+búsqueda interna necesita como máximo 41 comparaciones por el dominio 2^40.
+
+`projectFrameAt` redondea la posición racional sin convertirla a double:
+floor conserva la parte entera, ceil incrementa solo con resto y nearest compara
+`2*resto` con el denominador en UInt256; el empate va hacia arriba. No se promete
+que tick→project frame entero→tick sea reversible cuando varios ticks comparten
+el mismo frame.
+
+Tempo y métrica consultan primero la inversa exacta. La descomposición
+bar/beat/tick usa exclusivamente enteros y los cambios de métrica permanecen
+anclados a `BarIndex`. El grid obtiene el primer tick mediante inversa exacta,
+avanza cursores monotónicos de métrica y tempo, calcula cada anchor con el mapa
+exacto y convierte a double únicamente al producir coordenadas de presentación.
+Segundos, `QuarterNotePosition` y píxeles no realimentan decisiones discretas.
+
+El dominio musical continúa limitado a ticks `[0,2^40]`; consultas temporales
+posteriores a su último anchor exacto devuelven `outOfRange`, sin clamp. El
+schema v3 no cambia: BPM sigue siendo el valor contractual de sus bits binary64
+y su serialización se verifica bit a bit, incluidos ambos vecinos de 123 BPM.
+No se añaden rampas, automation, snapping, quantize ni consultas inversas por
+muestra dentro del callback.
+
 El adaptador prepara conjuntamente el plan y contexto del nuevo dispositivo,
 certifica fuentes y checkpoint contra el ClockFormat **efectivo**, y solo entonces
 retira las vistas del motor bajo quiescencia. Los owners anteriores permanecen
@@ -1871,6 +1928,10 @@ políticas anteriores; no se introduce una colección de causas ni otra API de i
 30. **Completado en 0.6.0:** autoridad entera de project frame, dominio navegable
     independiente del contenido, proyección linealizada de transporte y
     discontinuidad Seek explícita sin reset universal.
+
+31. **Completado en 0.6.1:** Musical Time bidireccional exacto, inverse y rounding
+    racionales, consultas de tempo/métrica por frontera certificada y grid con
+    double exclusivamente al final de la presentación.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.
