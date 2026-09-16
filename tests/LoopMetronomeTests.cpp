@@ -108,6 +108,94 @@ void preparationAndPersistence() {
                   exactLoop.prepared->loop->clockBounds.exactEnd),
               {23414,{{26,0},{41,0},false}})==0,
           "loop end preserves exact 960000/41 boundary");
+    const auto& view = *exactLoop.prepared->loopView;
+    static_assert(noexcept(view.contains(view.exactStart())));
+    static_assert(noexcept(view.distanceToEnd(view.exactStart())));
+    static_assert(noexcept(view.positionAfterWrap(view.exactEnd())));
+    const audio::DspFramePosition justBefore{{23415}, {{16,0}, {41,0}, true}};
+    const audio::DspFramePosition exact{{23415}, {{15,0}, {41,0}, true}};
+    const audio::DspFramePosition justAfter{{23415}, {{14,0}, {41,0}, true}};
+    check(view.contains(view.exactStart()) && view.contains(justBefore) &&
+              !view.contains(exact) && !view.contains(justAfter),
+          "prepared loop view preserves exact half-open boundaries");
+    const auto distance = view.distanceToEnd(view.exactStart());
+    check(distance && audio::exact::comparePositions(
+              distance->value.exactPosition(), view.exactEnd().exactPosition()) == 0,
+          "prepared loop view returns exact distance to end");
+    const auto wrappedExact = view.positionAfterWrap(exact);
+    const auto wrappedAfter = view.positionAfterWrap(justAfter);
+    const auto repeatedDistance = view.distanceToEnd(view.exactStart());
+    const auto repeatedWrap = view.positionAfterWrap(justAfter);
+    check(wrappedExact && wrappedAfter &&
+              audio::exact::comparePositions(wrappedExact->exactPosition(),
+                                             view.exactStart().exactPosition()) == 0 &&
+              audio::exact::comparePositions(wrappedAfter->exactPosition(),
+                  audio::exact::Position{0, {{1,0}, {41,0}, false}}) == 0,
+          "prepared loop view wraps exact end and rational overshoot purely");
+    check(repeatedDistance && repeatedWrap &&
+              audio::exact::comparePositions(repeatedDistance->value.exactPosition(),
+                                             distance->value.exactPosition()) == 0 &&
+              audio::exact::comparePositions(repeatedWrap->exactPosition(),
+                                             wrappedAfter->exactPosition()) == 0,
+          "prepared loop view is deterministic for repeated identical inputs");
+}
+
+void oneWrapPerDeviceFrameInvariant() {
+    musical::MusicalTimeMap map;
+    map.tempo.events[0].bpm = {400.0};
+    auto temporal = audio::prepareTemporalContext(map,
+        musical::MusicalLoopRange{{0}, {1024}}, timeline::SampleRate{1000},
+        timeline::SampleRate{100}, 31);
+    check(temporal.success(), "one-device-frame minimum loop prepares");
+    const auto& loop = *temporal.prepared->loop;
+    check(loop.start.value == 0.0 && loop.end.value == 10.0,
+          "1024 ticks at 400 BPM exercises the exact 10 ms minimum");
+    audio::RealtimeProjectClock clock;
+    clock.prepare({0});
+    check(clock.prepareFormat(temporal.prepared->exactClock),
+          "minimum loop clock format installs");
+    clock.setPlaybackPolicy(loop.clockBounds, false);
+    check(clock.play(), "minimum loop makes empty clock playable");
+    clock.advanceDeviceFrame();
+    check(clock.consumeWrapped() &&
+              audio::exact::comparePositions(clock.renderPosition().exactPosition(),
+                  audio::exact::boundaryPosition(loop.clockBounds.exactStart)) == 0,
+          "a device-frame-sized loop wraps exactly once");
+    clock.advanceDeviceFrame();
+    check(clock.consumeWrapped(),
+          "the equality bound produces one boolean wrap per later device frame");
+}
+
+void loopAnchorsAtTempoAndMeterChanges() {
+    musical::MusicalTimeMap tempoMap;
+    tempoMap.tempo.events = {{{1}, {0}, {120.0}},
+                             {{2}, {musical::ppq}, {123.0}},
+                             {{3}, {2 * musical::ppq}, {60.0}}};
+    tempoMap.tempo.nextId = {4};
+    auto tempo = audio::prepareTemporalContext(tempoMap,
+        musical::MusicalLoopRange{{musical::ppq}, {2 * musical::ppq}},
+        timeline::SampleRate{48000}, timeline::SampleRate{96000}, 33);
+    check(tempo.success(), "loop exactly bounded by tempo changes prepares");
+    const auto start = tempo.prepared->musicalTime->exactProjectFrameAtTick(
+        {musical::ppq});
+    const auto end = tempo.prepared->musicalTime->exactProjectFrameAtTick(
+        {2 * musical::ppq});
+    check(start && end &&
+              audio::exact::comparePositions(
+                  tempo.prepared->loopView->exactStart().exactPosition(), start.value) == 0 &&
+              audio::exact::comparePositions(
+                  tempo.prepared->loopView->exactEnd().exactPosition(), end.value) == 0,
+          "loop start/end consume authoritative exact tempo-change anchors");
+
+    musical::MusicalTimeMap meterMap;
+    meterMap.signatures.events = {{{1}, {0}, {3, 4}},
+                                  {{2}, {1}, {7, 8}}};
+    meterMap.signatures.nextId = {3};
+    auto meter = audio::prepareTemporalContext(meterMap,
+        musical::MusicalLoopRange{{0}, {8 * musical::ppq}},
+        timeline::SampleRate{44100}, timeline::SampleRate{48000}, 34);
+    check(meter.success() && meter.prepared->beats.size() >= 2,
+          "3/4 to 7/8 meter change inside loop prepares one exact beat grid");
 }
 
 void fractionalClock() {
@@ -164,6 +252,45 @@ void loopRenderAndMultipleWraps() {
           "published position is inside loop after multiple wraps");
     check(std::any_of(left.begin(),left.end(),[](float x){return x!=0.0F;}),
           "segmented loop renders audio without a gap-only callback");
+}
+
+void projectedLoopAdmission() {
+    std::vector<float> samples(48000, 0.25F);
+    audio::PreparedTrackView track{{1}, {{samples.data(), nullptr}}, 1,
+        {samples.size()}, timeline::SampleRate{48000}, {0}, {48000}, {0}, {}};
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000}, {48000}, std::span{&track, 1}});
+    auto temporal = audio::prepareTemporalContext({},
+        musical::MusicalLoopRange{{0}, {musical::ppq}},
+        timeline::SampleRate{48000}, timeline::SampleRate{48000}, 32);
+    check(temporal.success() && engine.configureTemporalContext(temporal.prepared.get()),
+          "projected-admission context configures");
+    enterOperational(engine, 48000);
+
+    check(engine.tryRequestPlay().accepted,
+          "projected-admission Play is pending");
+    check(!engine.trySetLoopEnabled(true).accepted,
+          "pending Play rejects loop enable against projected Playing");
+    check(engine.tryRequestStop().accepted &&
+              engine.trySetLoopEnabled(true).accepted,
+          "pending Stop permits loop enable against projected Stopped");
+    std::vector<float> empty;
+    process(engine, empty, empty, 48000);
+    check(engine.transportSnapshot().playback == transport::PlaybackState::stopped &&
+              engine.transportSnapshot().loopEnabled,
+          "ordered Play Stop Enable is applied coherently");
+
+    check(engine.tryRequestPlay().accepted,
+          "enabled-loop Play is pending");
+    check(!engine.trySetLoopEnabled(false).accepted,
+          "pending Play rejects loop disable against projected Playing");
+    process(engine, empty, empty, 48000);
+    check(engine.tryRequestStop().accepted &&
+              engine.trySetLoopEnabled(false).accepted,
+          "pending Stop permits loop disable against projected Stopped");
+    process(engine, empty, empty, 48000);
+    check(!engine.transportSnapshot().loopEnabled,
+          "ordered Stop Disable is applied coherently");
 }
 
 std::vector<float> renderPartitionedLoop(std::span<const std::size_t> partitions) {
@@ -351,6 +478,49 @@ void crossedLoopStartMetronome() {
           "loop-start events are callback-partition independent");
 }
 
+void pendingLoopStartSurvivesHardRebuild() {
+    musical::MusicalTimeMap map;
+    map.tempo.events[0].bpm = {123.0};
+    auto temporal = audio::prepareTemporalContext(map,
+        musical::MusicalLoopRange{{0}, {musical::ppq}},
+        timeline::SampleRate{48000}, timeline::SampleRate{48000}, 41);
+    check(temporal.success(), "pending-boundary context prepares");
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000}, {0},
+                      std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "pending-boundary context configures");
+    enterOperational(engine, 48000);
+    check(engine.trySetLoopEnabled(true).accepted &&
+              engine.trySetMetronomeEnabled(true).accepted &&
+              engine.trySetMetronomeLevel({0.0F}).accepted,
+          "pending-boundary session controls enqueue");
+    std::vector<float> empty;
+    process(engine, empty, empty, 48000);
+    std::vector<float> settle(512), settleRight(512);
+    process(engine, settle, settleRight, 48000);
+    check(engine.tryRequestPlay().accepted, "pending-boundary Play");
+    std::vector<float> lap(23415), lapRight(23415);
+    process(engine, lap, lapRight, 48000);
+
+    engine.deviceInitialisingPreservingTransport();
+    const auto checkpoint = engine.temporalCheckpoint();
+    check(checkpoint.pendingMetronomeBoundary.crossedLoopStart,
+          "wrap at callback end leaves one logical boundary obligation");
+    check(engine.configureTemporalContext(temporal.prepared.get()) &&
+              engine.restoreTemporalCheckpoint(checkpoint),
+          "hard rebuild restores the logical boundary obligation");
+
+    std::vector<float> after(256), afterRight(256);
+    process(engine, after, afterRight, 48000);
+    for (std::size_t frame = 0; frame < after.size(); ++frame)
+        check(after[frame] == temporal.prepared->clicks.accent[frame],
+              "restored loop-start click is emitted exactly once");
+    check(!engine.temporalCheckpoint().pendingMetronomeBoundary.crossedLoopStart &&
+              !engine.temporalCheckpoint().pendingMetronomeBoundary.eventPending,
+          "restored musical obligation is consumed once");
+}
+
 void exactMusicalLoopAndMetronome() {
     const std::array<std::size_t,1> single{23416};
     const std::array<std::size_t,5> split{511,1024,8192,10000,3689};
@@ -526,12 +696,16 @@ void operator delete[](void* memory,std::size_t) noexcept { std::free(memory); }
 
 int main() {
     preparationAndPersistence();
+    oneWrapPerDeviceFrameInvariant();
+    loopAnchorsAtTempoAndMeterChanges();
     fractionalClock();
     loopRenderAndMultipleWraps();
+    projectedLoopAdmission();
     partitionInvariance();
     musicalRateMatrixRegression();
     exactMusicalLoopAndMetronome();
     crossedLoopStartMetronome();
+    pendingLoopStartSurvivesHardRebuild();
     temporalReregistrationPreservesClock();
     metronomeAndEmptyPolicy();
     std::cout << "Loop and metronome tests passed\n";

@@ -47,12 +47,20 @@ public:
     [[nodiscard]] bool canConfigureTemporalContext(
         const PreparedTemporalContext* context) const noexcept;
     bool configureTemporalContext(const PreparedTemporalContext* context) noexcept;
+    struct PendingMetronomeBoundaryState {
+        // Minimal musical obligation only. No voices, PCM or scheduler tables.
+        bool crossedLoopStart{};
+        bool eventPending{};
+        bool accent{};
+        bool operator==(const PendingMetronomeBoundaryState&) const = default;
+    };
     struct TemporalCheckpoint {
         RealtimeProjectClock::Checkpoint clock;
         bool loopEnabled{};
         bool metronomeEnabled{};
         bool runUntilStop{};
         MetronomeLevelDb metronomeLevel;
+        PendingMetronomeBoundaryState pendingMetronomeBoundary;
     };
     [[nodiscard]] TemporalCheckpoint temporalCheckpoint() const noexcept;
     bool restoreTemporalCheckpoint(TemporalCheckpoint) noexcept;
@@ -181,6 +189,8 @@ private:
                                std::size_t frameCount) noexcept;
     [[nodiscard]] float renderMetronomeSample(std::size_t frame) noexcept;
     void clearMetronomeRuntime() noexcept;
+    void clearMetronomeVoices() noexcept;
+    void clearMetronomePendingScheduling() noexcept;
     void processLegacySubBlock(
         AudioBlockView output, std::size_t outputOffset,
         std::size_t validFrames, const DspFramePosition* positions) noexcept;

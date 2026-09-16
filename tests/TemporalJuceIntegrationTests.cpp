@@ -80,7 +80,8 @@ bool same(const audio::RealtimeAudioEngine::TemporalCheckpoint& a,
                                      {b.clock.position.value, b.clock.phase}) == 0 &&
         a.loopEnabled == b.loopEnabled && a.metronomeEnabled == b.metronomeEnabled &&
         a.runUntilStop == b.runUntilStop &&
-        a.metronomeLevel == b.metronomeLevel;
+        a.metronomeLevel == b.metronomeLevel &&
+        a.pendingMetronomeBoundary == b.pendingMetronomeBoundary;
 }
 int main(int argc, char** argv) {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
@@ -144,6 +145,35 @@ int main(int argc, char** argv) {
             check(adapter.transportSnapshot().playback ==
                       transport::PlaybackState::stopped,
                   "open playback still terminates on explicit Stop");
+        } else if (test == "pending_wrap") {
+            temporal(adapter, 123.0);
+            plan(adapter);
+            Access::engine(adapter).deviceInitialising();
+            Access::engine(adapter).deviceConsumerStarted();
+            check(adapter.trySetLoopEnabled(true).accepted &&
+                      adapter.trySetMetronomeEnabled(true).accepted &&
+                      adapter.trySetMetronomeLevel({0.0F}).accepted,
+                  "pending-wrap session controls");
+            process(adapter, 0);
+            process(adapter, 512);
+            check(adapter.tryRequestPlay().accepted, "pending-wrap Play");
+            process(adapter, 23415);
+            Access::controlledStop(adapter);
+            const auto pending = Access::engine(adapter).temporalCheckpoint();
+            check(pending.pendingMetronomeBoundary.crossedLoopStart,
+                  "JUCE checkpoint retains crossed loop-start obligation");
+            plan(adapter, true);
+            Access::engine(adapter).deviceInitialisingPreservingTransport();
+            std::array<float, 256> left{}, right{};
+            std::array<float*, 2> output{left.data(), right.data()};
+            Access::engine(adapter).processBlock(
+                {output.data(), 2, left.size()}, timeline::SampleRate{48000});
+            for (std::size_t frame = 0; frame < left.size(); ++frame)
+                check(left[frame] == Access::context(adapter)->clicks.accent[frame],
+                      "JUCE rebuild emits the pending loop-start click once");
+            check(!Access::engine(adapter).temporalCheckpoint()
+                       .pendingMetronomeBoundary.crossedLoopStart,
+                  "JUCE rebuild consumes the pending obligation");
         } else {
             temporal(adapter, test == "rollback" ? std::nextafter(123.0, INFINITY) : 123.0);
             plan(adapter);

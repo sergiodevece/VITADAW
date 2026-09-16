@@ -65,6 +65,7 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
         musicalRevision_ + 1);
     if (!temporal.success())
         return {PersistenceCode::semanticValidationFailed, PersistencePhase::prepare};
+    auto loopView = temporal.prepared->loopView;
     std::vector<audio::PreparedSourceAudio> resources;
     waveform::WaveformCache candidateWaveforms;
     resources.reserve(data.sources.size());
@@ -136,14 +137,16 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
         project::ProjectState* project;
         std::filesystem::path* path;
         std::unique_ptr<const musical::PreparedMusicalTimeMap>* musicalMap;
+        std::optional<audio::PreparedLoopView>* loopView;
         audio::PreparedAudibilityState audibility;
         waveform::WaveformCache* waveforms;
-    } context{this, candidate.get(), &path, &musicalMap.value,
+    } context{this, candidate.get(), &path, &musicalMap.value, &loopView,
               resolveAudibility(*candidate), &candidateWaveforms};
     const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
         auto& c = *static_cast<Context*>(raw);
         c.app->session_.adopt(*c.project, *c.path, *c.waveforms);
         c.app->musicalTime_.swap(*c.musicalMap);
+        c.app->preparedLoopView_.swap(*c.loopView);
         ++c.app->musicalRevision_;
         c.app->audibility_ = c.audibility;
         c.app->transport_.stopAndRewind();

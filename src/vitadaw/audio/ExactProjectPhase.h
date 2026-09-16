@@ -51,6 +51,8 @@ public:
     bool before(RationalBoundary boundary) const noexcept { return compareBoundary(position_, boundary) < 0; }
     // All policy decisions stay in RealtimeProjectClock/TransportReducer.
     // Returns true iff a prepared loop boundary was crossed.
+    // Preparation certifies loopLength >= one device-frame step, so one call
+    // can cross at most one boundary and a boolean preserves the full event.
     bool advance(std::optional<Loop> loop) noexcept {
         const auto current = floorPosition(position_);
         auto remainder = wide(current.remainder);

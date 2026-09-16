@@ -29,6 +29,16 @@ struct TrackSnapshot {
     bool operator==(const TrackSnapshot&) const = default;
 };
 
+struct LoopReadModel {
+    std::optional<musical::MusicalLoopRange> documentRange;
+    bool enabled{};
+    std::uint64_t temporalRevision{};
+    std::optional<audio::PreparedLoopView> prepared;
+    std::optional<musical::MusicalPosition> startPosition;
+    std::optional<musical::MusicalPosition> endPosition;
+    bool operator==(const LoopReadModel&) const = default;
+};
+
 struct TimelineSnapshot {
     ::vitadaw::timeline::SampleRate projectSampleRate;
     ::vitadaw::timeline::ProjectFrameCount contentDuration;
@@ -38,12 +48,7 @@ struct TimelineSnapshot {
     std::vector<TrackSnapshot> tracks;
     std::uint64_t musicalRevision{};
     std::optional<musical::MusicalPosition> musicalPosition;
-    std::optional<musical::MusicalLoopRange> loopRange;
-    std::optional<::vitadaw::timeline::PreciseProjectFramePosition> loopStart;
-    std::optional<::vitadaw::timeline::PreciseProjectFramePosition> loopEnd;
-    std::optional<musical::MusicalPosition> loopStartPosition;
-    std::optional<musical::MusicalPosition> loopEndPosition;
-    bool loopEnabled{};
+    LoopReadModel loop;
     bool metronomeEnabled{};
     audio::MetronomeLevelDb metronomeLevel;
     std::uint64_t temporalRevision{};

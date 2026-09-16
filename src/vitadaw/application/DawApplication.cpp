@@ -123,10 +123,12 @@ DawApplication::DawApplication(audio::IAudioEngineControl& audioEngine,
         session_.project.musicalTime(), session_.project.loopRange(),
         projectSampleRate, musicalRevision_);
     if (!temporal.success()) throw std::invalid_argument("Invalid prepared temporal context");
+    const auto loopView = temporal.prepared->loopView;
     int marker{};
     const audio::AudioFileCommitAction commit{&marker, [](void*) noexcept {}};
     if (!audioEngine_.commitPreparedTemporalContext(std::move(temporal.prepared), commit))
         throw std::runtime_error("Temporal context could not be committed");
+    preparedLoopView_ = loopView;
 }
 
 commands::CommandResult DawApplication::handle(const commands::Command& command) {
@@ -1244,26 +1246,21 @@ ui::timeline::TimelineSnapshot DawApplication::timelineSnapshot() const {
     result.musicalRevision = musicalRevision_;
     const auto position = musicalTime_->musicalPositionAt(transport_.position);
     if (position) result.musicalPosition = position.value;
-    result.loopRange = session_.project.loopRange();
-    result.loopEnabled = session_.loopEnabled;
+    result.loop.documentRange = session_.project.loopRange();
+    result.loop.enabled = session_.loopEnabled;
+    result.loop.temporalRevision = preparedLoopView_
+        ? preparedLoopView_->temporalRevision() : musicalRevision_;
+    result.loop.prepared = preparedLoopView_;
     result.metronomeEnabled = session_.metronomeEnabled;
     result.metronomeLevel = session_.metronomeLevel;
     result.temporalRevision = session_.appliedTemporalRevision;
-    if (result.loopRange) {
-        const auto exactStart = musicalTime_->exactProjectFrameAtTick(
-            result.loopRange->start);
-        const auto exactEnd = musicalTime_->exactProjectFrameAtTick(
-            result.loopRange->end);
-        const auto start = musicalTime_->preciseProjectFrameAtTick(result.loopRange->start);
-        const auto end = musicalTime_->preciseProjectFrameAtTick(result.loopRange->end);
-        if (exactStart && exactEnd && start && end) {
-            result.loopStart = start.value;
-            result.loopEnd = end.value;
-            const auto startLabel = musicalTime_->musicalPositionAt(exactStart.value);
-            const auto endLabel = musicalTime_->musicalPositionAt(exactEnd.value);
-            if (startLabel) result.loopStartPosition = startLabel.value;
-            if (endLabel) result.loopEndPosition = endLabel.value;
-        }
+    if (result.loop.prepared) {
+        const auto startLabel = musicalTime_->musicalPositionAt(
+            result.loop.prepared->exactStart().exactPosition());
+        const auto endLabel = musicalTime_->musicalPositionAt(
+            result.loop.prepared->exactEnd().exactPosition());
+        if (startLabel) result.loop.startPosition = startLabel.value;
+        if (endLabel) result.loop.endPosition = endLabel.value;
     }
     return result;
 }

@@ -303,11 +303,13 @@ ProjectDocument decode(const J& root) {
         fields(loop,{"startTick","endTick"});
         const auto start = integer(loop.at("startTick"), true);
         const auto end = integer(loop.at("endTick"), true);
-        if (start > musical::maximumCoordinate || end > musical::maximumCoordinate ||
-            end <= start) invalid("loopRange");
-        data.loopRange = musical::MusicalLoopRange{
+        if (start > musical::maximumCoordinate || end > musical::maximumCoordinate)
+            invalid("loopRange");
+        const musical::MusicalLoopRange decodedLoop{
             {static_cast<std::int64_t>(start)},
             {static_cast<std::int64_t>(end)}};
+        if (!decodedLoop.isStructurallyValid()) invalid("loopRange");
+        data.loopRange = decodedLoop;
     }
     const auto& settings=root.at("projectSettings"); fields(settings,{"name","sampleRateHz"});
     data.settings={string(settings.at("name")),timeline::SampleRate{number(settings.at("sampleRateHz"))}};

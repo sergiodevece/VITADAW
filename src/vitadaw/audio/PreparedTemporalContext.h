@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/musical/MusicalTime.h"
+#include "vitadaw/audio/DspFramePosition.h"
 #include "vitadaw/audio/ExactTemporal.h"
 
 #include <array>
@@ -13,6 +14,8 @@
 #include <vector>
 
 namespace vitadaw::audio {
+
+struct TemporalContextPreparationResult;
 
 inline constexpr std::size_t maximumClickTableFrames = 4096;
 inline constexpr std::size_t metronomeVoiceCount = 4;
@@ -41,6 +44,54 @@ struct PreparedLoopRange {
     [[nodiscard]] bool isValid() const noexcept;
 };
 
+// Read-only value derived from one certified temporal-context revision. Exact
+// helpers are pure and bounded; the common denominator remains an implementation
+// detail and is never a second mutable clock authority.
+struct ExactProjectFrameDuration {
+    DspFramePosition value;
+    [[nodiscard]] double approximate() const noexcept { return value.approximate(); }
+};
+
+class PreparedLoopView {
+public:
+    [[nodiscard]] const musical::MusicalLoopRange& musical() const noexcept {
+        return musical_;
+    }
+    [[nodiscard]] const DspFramePosition& exactStart() const noexcept {
+        return exactStart_;
+    }
+    [[nodiscard]] const DspFramePosition& exactEnd() const noexcept {
+        return exactEnd_;
+    }
+    [[nodiscard]] timeline::PreciseProjectFramePosition
+        presentationStart() const noexcept { return presentationStart_; }
+    [[nodiscard]] timeline::PreciseProjectFramePosition
+        presentationEnd() const noexcept { return presentationEnd_; }
+    [[nodiscard]] std::uint64_t temporalRevision() const noexcept {
+        return temporalRevision_;
+    }
+
+    [[nodiscard]] bool contains(DspFramePosition) const noexcept;
+    [[nodiscard]] std::optional<ExactProjectFrameDuration>
+        distanceToEnd(DspFramePosition) const noexcept;
+    [[nodiscard]] std::optional<DspFramePosition>
+        positionAfterWrap(DspFramePosition) const noexcept;
+    bool operator==(const PreparedLoopView&) const noexcept;
+
+private:
+    friend struct PreparedTemporalContext;
+    friend TemporalContextPreparationResult prepareTemporalContext(
+        const musical::MusicalTimeMap&, std::optional<musical::MusicalLoopRange>,
+        timeline::SampleRate, timeline::SampleRate, std::uint64_t);
+    musical::MusicalLoopRange musical_;
+    DspFramePosition exactStart_;
+    DspFramePosition exactEnd_;
+    timeline::PreciseProjectFramePosition presentationStart_;
+    timeline::PreciseProjectFramePosition presentationEnd_;
+    std::uint64_t temporalRevision_{};
+    exact::UInt128 commonDenominator_{1, 0};
+};
+
 struct PreparedClickTables {
     std::array<float, maximumClickTableFrames> normal{};
     std::array<float, maximumClickTableFrames> accent{};
@@ -64,6 +115,7 @@ struct PreparedTemporalContext {
     musical::MusicalTimeMap documentMap;
     std::unique_ptr<const musical::PreparedMusicalTimeMap> musicalTime;
     std::optional<PreparedLoopRange> loop;
+    std::optional<PreparedLoopView> loopView;
     PreparedClickTables clicks;
     std::vector<PreparedBeatSegment> beats;
     exact::ClockFormat exactClock;

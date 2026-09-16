@@ -318,6 +318,16 @@ void reducerContract() {
         loopPolicy);
     check(loopRestart.state.position.value == 20,
           "active loop policy restarts at its own boundary");
+    beyondContent.position = {10};
+    const auto preroll = transport::reduceTransport(
+        beyondContent, {transport::TransportActionKind::play, {}}, loopPolicy);
+    check(preroll.state.position.value == 10,
+          "Play before loop start preserves preroll position");
+    beyondContent.position = {201};
+    const auto afterLoop = transport::reduceTransport(
+        beyondContent, {transport::TransportActionKind::play, {}}, loopPolicy);
+    check(afterLoop.state.position.value == 20,
+          "Play after loop end restarts at exact loop start");
 }
 
 void queuedOrderingAndNavigation() {

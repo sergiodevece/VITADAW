@@ -1,4 +1,4 @@
-# VitaDAW 0.6.1 — Musical Time
+# VitaDAW 0.6.2 — Loop Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -253,6 +253,15 @@ producen errores distintos. La inversa queda acotada a una búsqueda de segmento
 y un máximo de 41 comparaciones de ticks. Grid, loop y metrónomo comparten los
 mismos anchors exactos; no se añade un segundo reloj ni estado musical mutable.
 El schema permanece en v3 y los BPM conservan exactamente sus bits binary64.
+
+VitaDAW 0.6.2 endurece Loop Foundation sobre la autoridad temporal existente:
+formaliza `[startTick,endTick)`, conserva el preroll anterior a loopStart, aplica
+wrap racional con overshoot íntegro y valida enable/disable contra el transporte
+proyectado. Una vista preparada read-only entrega a timeline rango documental,
+fronteras exactas/de presentación y revisión coherentes. Los rebuilds pueden
+cancelar voces del metrónomo, pero preservan la obligación musical de un click de
+loopStart atravesado para emitirlo exactamente una vez al reanudar. El scheduler
+de hasta 8191 segmentos continúa acotado y pendiente de benchmark profesional.
 
 ## Tecnología propuesta
 
@@ -651,6 +660,8 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.6.1 — Musical Time:** mapa musical preparado bidireccional, inverse y
   rounding racionales, consultas exactas de tempo/métrica, grid anclado a ticks
   y persistencia bit-exact de BPM sin crear otra autoridad temporal.
+- **0.6.2 — Loop Foundation:** contrato half-open exacto, admisión reconciliada,
+  obligación musical pendiente preservada en lifecycle y read model cohesionado.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -680,4 +691,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.5.5.md`](docs/validation-0.5.5.md) y
 [`docs/validation-0.5.6.md`](docs/validation-0.5.6.md) y
 [`docs/validation-0.6.0.md`](docs/validation-0.6.0.md) y
-[`docs/validation-0.6.1.md`](docs/validation-0.6.1.md).
+[`docs/validation-0.6.1.md`](docs/validation-0.6.1.md) y
+[`docs/validation-0.6.2.md`](docs/validation-0.6.2.md).

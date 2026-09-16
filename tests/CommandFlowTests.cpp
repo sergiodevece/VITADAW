@@ -182,7 +182,10 @@ public:
     bool commitPreparedTemporalContext(
         std::unique_ptr<vitadaw::audio::PreparedTemporalContext> prepared,
         vitadaw::audio::AudioFileCommitAction commit) noexcept override {
-        if (!prepared || !commit.isValid()) return false;
+        if (!prepared || !commit.isValid() || rejectNextTemporalCommit) {
+            rejectNextTemporalCommit = false;
+            return false;
+        }
         temporal = std::move(prepared);
         snapshot.temporalRevision = temporal->revision;
         commit.execute();
@@ -370,6 +373,7 @@ public:
     int structuralCommitRequests{};
     bool rejectNextStructuralPreparation{};
     bool rejectNextStructuralCommit{};
+    bool rejectNextTemporalCommit{};
     vitadaw::audio::ProcessingPlanSpecification liveSpecification;
     ResourceCounters resourceCounters;
     std::unique_ptr<vitadaw::audio::PreparedTemporalContext> temporal;
@@ -1099,6 +1103,17 @@ int main() {
     check(sessionApp.loopEnabled() &&
           sessionApp.history().currentStateToken() == loopToken,
           "applied loop state is observable without dirtying history");
+    const auto readModelA = sessionApp.timelineSnapshot().loop;
+    sessionAudio.rejectNextTemporalCommit = true;
+    const auto rejectedLoopB = sessionDispatcher.dispatch(
+        commands::SetLoopRangeMusical{{6 * musical::ppq},
+                                      {14 * musical::ppq}});
+    const auto readModelAfterFailure = sessionApp.timelineSnapshot().loop;
+    check(rejectedLoopB.status == commands::CommandStatus::rejected &&
+              sessionApp.project().loopRange() == readModelA.documentRange &&
+              readModelAfterFailure == readModelA &&
+              sessionApp.loopEnabled(),
+          "failed loop candidate preserves document, prepared view, revision and enabled policy atomically");
     check(sessionDispatcher.dispatch(commands::SetMetronomeEnabled{true}).status ==
               commands::CommandStatus::accepted &&
           sessionDispatcher.dispatch(commands::SetMetronomeLevel{{-18.0F}}).status ==

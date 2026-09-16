@@ -73,6 +73,7 @@ private:
     audio::PreparedAudibilityState audibility_;
     audio::AudioCommandSequence pendingAudioCommandSequence_{};
     std::unique_ptr<const musical::PreparedMusicalTimeMap> musicalTime_;
+    std::optional<audio::PreparedLoopView> preparedLoopView_;
     std::uint64_t musicalRevision_{};
 };
 

@@ -21,17 +21,20 @@ commands::CommandResult DawApplication::commitMusicalProject(project::ProjectSta
     if (!temporal.success())
         return {CommandStatus::rejected, std::move(temporal.errorMessage),
                 CommandError::validationFailed};
+    auto loopView = temporal.prepared->loopView;
     struct Context {
         DawApplication* application;
         project::ProjectState* candidate;
         std::unique_ptr<const musical::PreparedMusicalTimeMap>* prepared;
+        std::optional<audio::PreparedLoopView>* loopView;
         history::UndoManager::PendingAppend* pending;
         int direction;
-    } context{this, &candidate, &prepared, pending, direction};
+    } context{this, &candidate, &prepared, &loopView, pending, direction};
     const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
         auto& value = *static_cast<Context*>(raw);
         value.application->session_.project.swap(*value.candidate);
         value.application->musicalTime_.swap(*value.prepared);
+        value.application->preparedLoopView_.swap(*value.loopView);
         ++value.application->musicalRevision_;
         if (value.pending) value.application->session_.history.commit(std::move(*value.pending));
         else if (value.direction > 0) value.application->session_.history.commitRedo();

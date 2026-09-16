@@ -1703,6 +1703,46 @@ denominador fuera del callback solo para los límites racionales que interactúa
 con RT. Una integral, anchor, LCM o conversión de checkpoint que exceda la
 capacidad fija se rechaza antes del commit y preserva el contexto anterior.
 
+### Loop Foundation 0.6.2
+
+El contrato del loop permanece `MusicalLoopRange[startTick,endTick)`: start está
+incluido y end excluido. La validación estructural exige coordenadas dentro del
+dominio, orden estricto y 1024 ticks; una única preparación temporal certifica
+además 10 ms, un project frame, un device frame, las fronteras racionales y su
+compatibilidad con ClockFormat. No hay clamp, epsilon ni fallback aproximado.
+
+`PreparedLoopView` es un valor derivado e inmutable de una revisión preparada.
+Expone posiciones exactas y de presentación, y consultas puras de pertenencia,
+distancia a end y módulo post-wrap. No accede al engine, no asigna memoria y no
+expone ClockFormat ni temporales UInt256 a presentación. `LoopReadModel` publica
+documento, vista preparada, enabled y revisión como una unidad coherente; la UI
+ya no reconstruye fronteras desde doubles.
+
+Play conserva cualquier posición anterior a loopStart como preroll. Una posición
+en o posterior a loopEnd se relocaliza a start. Content duration sigue siendo
+descriptiva, GoToEnd continúa significando contentDuration y el loop activo evita
+el final natural. Enable/disable continúa siendo Stopped-only y ahora su admisión
+consulta el transporte reconciliado, incluido el orden de comandos pendientes.
+
+Para un formato certificado, la longitud L es al menos el avance exacto de un
+device frame. Si p<start, p+delta<end; si start<=p<end, p+delta<end+L. Por ello
+`ProjectPhase::advance()` puede cruzar como máximo una frontera por device frame
+y conservar su resultado booleano. Un callback puede efectuar varias vueltas
+mediante sucesivos subbloques. End nunca se renderiza como interior y el wrap es
+`start + ((p'-end) mod L)`.
+
+El checkpoint conserva únicamente la obligación musical mínima pendiente del
+metrónomo: intervalo de loopStart atravesado, evento aplazado y su acento. No
+duplica el scheduler ni conserva voces o PCM. Un rebuild duro puede cancelar
+voces, subsume seek/loopWrap pendientes para processors y restaura la obligación
+musical, que se coalesce y consume exactamente una vez en el siguiente scheduling.
+Stop, Seek y metronome-off sí limpian todo el estado pendiente.
+
+El scheduler permanece global por subbloque y acotado a 8191 segmentos. El loop
+puede aumentar el número de subbloques hasta la cota derivada de su mínimo de
+10 ms, pero no añade búsqueda por pista ni trabajo no acotado. El benchmark de
+deadline profesional sigue pendiente.
+
 ## Temporal State Model V1 y Musical Time 0.6.1
 
 Las autoridades quedan formalmente separadas:

@@ -13,11 +13,17 @@ inline constexpr std::int64_t ppq = 15360;
 inline constexpr std::size_t maximumEvents = 4096;
 // Explicit numerical envelope, separate from the audio document's range.
 inline constexpr std::int64_t maximumCoordinate = std::int64_t{1} << 40;
+inline constexpr std::int64_t minimumLoopTicks = 1024;
 struct MusicalTickPosition { std::int64_t value{}; bool operator==(const MusicalTickPosition&) const = default; };
 struct MusicalTickDuration { std::int64_t value{}; bool operator==(const MusicalTickDuration&) const = default; };
 struct MusicalLoopRange {
     MusicalTickPosition start;
     MusicalTickPosition end;
+    [[nodiscard]] constexpr bool isStructurallyValid() const noexcept {
+        return start.value >= 0 && end.value <= maximumCoordinate &&
+            end.value > start.value &&
+            end.value - start.value >= minimumLoopTicks;
+    }
     bool operator==(const MusicalLoopRange&) const = default;
 };
 struct QuarterNotePosition { double value{}; };

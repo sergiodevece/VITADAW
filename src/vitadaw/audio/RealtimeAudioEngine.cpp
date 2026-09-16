@@ -198,7 +198,9 @@ RealtimeAudioEngine::TemporalCheckpoint
 RealtimeAudioEngine::temporalCheckpoint() const noexcept {
     return {clock_.checkpoint(), loopEnabled_, metronomeEnabled_,
             clock_.isRunUntilStop(),
-            metronomeLevel_};
+            metronomeLevel_,
+            {pendingMetronomeWrap_, pendingMetronomeEvent_,
+             pendingMetronomeAccent_}};
 }
 
 bool RealtimeAudioEngine::restoreTemporalCheckpoint(
@@ -213,7 +215,13 @@ bool RealtimeAudioEngine::restoreTemporalCheckpoint(
         : std::nullopt;
     clock_.setPlaybackPolicy(loop, checkpoint.runUntilStop);
     metronomeLevelSmoother_.reset(prepareMetronomeLevel(metronomeLevel_));
-    clearMetronomeRuntime();
+    clearMetronomeVoices();
+    pendingMetronomeWrap_ = metronomeEnabled_ &&
+        checkpoint.pendingMetronomeBoundary.crossedLoopStart;
+    pendingMetronomeEvent_ = metronomeEnabled_ &&
+        checkpoint.pendingMetronomeBoundary.eventPending;
+    pendingMetronomeAccent_ = pendingMetronomeEvent_ &&
+        checkpoint.pendingMetronomeBoundary.accent;
     publishTransport();
     return true;
 }
@@ -239,7 +247,7 @@ void RealtimeAudioEngine::deviceErrorPreservingTransport() noexcept {
     const auto closure = lifecycleGate_.close(DeviceProcessingState::error);
     resolveCommandsThrough(closure.cancellationWatermark);
     resetProcessors();
-    clearMetronomeRuntime();
+    clearMetronomeVoices();
     publishTransport();
 }
 
@@ -251,7 +259,7 @@ void RealtimeAudioEngine::deviceInitialisingPreservingTransport() noexcept {
     const auto closure = lifecycleGate_.close(DeviceProcessingState::initializing);
     resolveCommandsThrough(closure.cancellationWatermark);
     resetProcessors();
-    clearMetronomeRuntime();
+    clearMetronomeVoices();
     publishTransport();
 }
 
@@ -306,8 +314,7 @@ AudioControlRequestResult RealtimeAudioEngine::tryRequestPlay() noexcept {
 AudioControlRequestResult RealtimeAudioEngine::trySetLoopEnabled(bool enabled) noexcept {
     refreshTransportProjection();
     if (deviceState() != DeviceProcessingState::operational ||
-        transportExchange_.snapshot().playback !=
-            transport::PlaybackState::stopped ||
+        projectedTransport_.playback != transport::PlaybackState::stopped ||
         (enabled && (temporalContext_ == nullptr || !temporalContext_->loop))) return {};
     return enqueue(CommandType::setLoopEnabled, {}, enabled ? 1.0F : 0.0F);
 }
@@ -833,6 +840,7 @@ void RealtimeAudioEngine::processSubBlock(
 
     if (!clock_.isPlaying()) {
         resetProcessors();
+        clearMetronomeRuntime();
     } else {
         processorDiscontinuity_ = processors::TemporalDiscontinuity::continuous;
     }
@@ -950,7 +958,6 @@ void RealtimeAudioEngine::resetProcessors() noexcept {
         }
     }
     processorDiscontinuity_ = processors::TemporalDiscontinuity::hardDiscontinuity;
-    clearMetronomeRuntime();
 }
 
 void RealtimeAudioEngine::distributeSends(PreparedSendRange range,
@@ -988,12 +995,20 @@ void RealtimeAudioEngine::advanceSmoothers(std::size_t frameCount) noexcept {
     }
 }
 
-void RealtimeAudioEngine::clearMetronomeRuntime() noexcept {
+void RealtimeAudioEngine::clearMetronomeVoices() noexcept {
     for (auto& voice : metronomeVoices_) voice = {};
     metronomeEventCount_ = 0;
+}
+
+void RealtimeAudioEngine::clearMetronomePendingScheduling() noexcept {
     pendingMetronomeEvent_ = false;
     pendingMetronomeAccent_ = false;
     pendingMetronomeWrap_ = false;
+}
+
+void RealtimeAudioEngine::clearMetronomeRuntime() noexcept {
+    clearMetronomeVoices();
+    clearMetronomePendingScheduling();
 }
 
 void RealtimeAudioEngine::prepareMetronomeEvents(
