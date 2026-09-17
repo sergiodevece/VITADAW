@@ -260,6 +260,22 @@ public:
     [[nodiscard]] virtual RecordingFinalizationResult finalizeRecording() {
         return {{}, {}, {}, "Recording finalization is not supported", {}};
     }
+    // Structured cleanup preserves a primary cause plus every retained media
+    // candidate.  The bool API remains as a compatibility view for existing
+    // non-recording engines.
+    [[nodiscard]] virtual RecordingCleanupResult discardRecordingWithDiagnostics(
+        bool removePublished, std::string primaryError = {}) noexcept {
+        RecordingCleanupResult result;
+        result.primaryError = std::move(primaryError);
+        static_cast<void>(discardRecording(removePublished));
+        return result;
+    }
+    // Invoked while the application owner is still alive. Implementations must
+    // quiesce RT, drain already accepted PCM if possible, retain media and never
+    // commit model/history from this operation.
+    [[nodiscard]] virtual RecordingCleanupResult shutdownRecording() noexcept {
+        return discardRecordingWithDiagnostics(true, "Recording cancelled during shutdown");
+    }
     [[nodiscard]] virtual bool discardRecording(
         bool /* removePublished */) noexcept { return true; }
     virtual void confirmRecordingCommit() noexcept {}

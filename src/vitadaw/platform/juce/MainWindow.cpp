@@ -212,7 +212,10 @@ public:
                 resultLabel_.setText("Error: " + juce::String(application_.recordingError()),
                                      juce::dontSendNotification);
             else if (recordingPhase == audio::RecordingPhase::complete)
-                resultLabel_.setText("OK: Recording committed",
+                resultLabel_.setText("OK: Recording committed" +
+                                     (application_.recordingError().empty()
+                                          ? juce::String{}
+                                          : " | " + juce::String(application_.recordingError())),
                                      juce::dontSendNotification);
         }
         addMonoTrack_.setEnabled(stopped);

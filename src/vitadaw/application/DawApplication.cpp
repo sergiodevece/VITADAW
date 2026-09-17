@@ -104,6 +104,8 @@ const char* recordingFailureMessage(audio::RecordingFailure failure) noexcept {
         return "Recording stopped because the WAV writer failed";
     case Failure::finalizationFailed:
         return "Recording could not be finalized";
+    case Failure::shutdown:
+        return "Recording cancelled during application shutdown";
     case Failure::none:
         return "Recording failed";
     }
@@ -210,19 +212,24 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 }
                 const auto request = audioEngine_.tryRequestRecord(preparation.request);
                 if (!request.accepted) {
-                    static_cast<void>(audioEngine_.discardRecording(true));
+                    const auto cleanup = audioEngine_.discardRecordingWithDiagnostics(
+                        true, "Realtime Record request was rejected");
                     recordingPhase_ = audio::RecordingPhase::failed;
-                    recordingError_ = "Realtime Record request was rejected";
+                    recordingError_ = cleanup.primaryError.empty()
+                        ? "Realtime Record request was rejected" : cleanup.primaryError;
+                    if (!cleanup.clean())
+                        recordingError_ += "; recording media retained for recovery";
                     return {CommandStatus::rejected, recordingError_,
                             CommandError::transportUnavailable};
                 }
                 activeRecording_ = preparation.request;
                 recordingPhase_ = audio::RecordingPhase::capturing;
-                recordingError_.clear();
+                recordingError_ = std::move(preparation.warningMessage);
                 pendingAudioCommandSequence_ = request.sequence;
                 transport_.playback = request.projectedPlayback;
                 transport_.position = request.projectedPosition;
-                return {CommandStatus::accepted, "Recording"};
+                return {CommandStatus::accepted,
+                        recordingError_.empty() ? "Recording" : recordingError_};
             } else if constexpr (std::is_same_v<T, CancelRecording>) {
                 if (!recordingBusy() || !audioEngine_.tryCancelRecording())
                     return {CommandStatus::rejected, "No active recording to cancel",
@@ -1260,8 +1267,9 @@ commands::CommandResult DawApplication::commitRecordedAudio(
     using namespace commands;
     const auto rejectAndClean = [this](std::string message,
                                        CommandError error) {
-        if (!audioEngine_.discardRecording(true))
-            message += "; recording media retained as an ownership-safe orphan";
+        const auto cleanup = audioEngine_.discardRecordingWithDiagnostics(true, message);
+        if (!cleanup.primaryError.empty()) message = cleanup.primaryError;
+        if (!cleanup.clean()) message += "; recording media retained for recovery";
         return CommandResult{CommandStatus::rejected, std::move(message), error};
     };
     if (!finalized.success() || !finalized.capture.track.isValid() ||
@@ -1580,6 +1588,24 @@ void DawApplication::synchroniseTransport() noexcept {
     session_.appliedTemporalRevision = snapshot.temporalRevision;
 }
 
+void DawApplication::shutdownRecording() noexcept {
+    if (!recordingBusy()) return;
+    const auto cleanup = audioEngine_.shutdownRecording();
+    recordingPhase_ = audio::RecordingPhase::failed;
+    recordingError_ = cleanup.primaryError.empty() ? "Recording cancelled during application shutdown"
+                                                    : cleanup.primaryError;
+    if (!cleanup.clean()) recordingError_ += "; recording media retained for recovery";
+    activeRecording_ = {};
+}
+
+commands::CommandResult DawApplication::recoverRecording(
+    const std::filesystem::path& file, tracks::TrackId track,
+    timeline::ProjectFramePosition position) {
+    // Recovery deliberately reuses normal transactional import; it cannot
+    // mutate ProjectState before media preparation succeeds.
+    return handle(commands::ImportAudioToTrack{file, track, position});
+}
+
 void DawApplication::synchroniseRecording() noexcept {
     if (!recordingBusy()) return;
     try {
@@ -1593,8 +1619,9 @@ void DawApplication::synchroniseRecording() noexcept {
         }
         if (capture.phase == audio::RecordingPhase::failed) {
             recordingError_ = recordingFailureMessage(capture.failure);
-            if (!audioEngine_.discardRecording(true))
-                recordingError_ += "; recording media retained as an ownership-safe orphan";
+            const auto cleanup = audioEngine_.discardRecordingWithDiagnostics(true, recordingError_);
+            if (!cleanup.primaryError.empty()) recordingError_ = cleanup.primaryError;
+            if (!cleanup.clean()) recordingError_ += "; recording media retained for recovery";
             if (audioEngine_.projectedTransportSnapshot().playing)
                 static_cast<void>(audioEngine_.tryRequestStop());
             activeRecording_ = {};
@@ -1609,8 +1636,9 @@ void DawApplication::synchroniseRecording() noexcept {
             recordingError_ = finalized.errorMessage.empty()
                                   ? "Recorded WAV could not be finalized"
                                   : finalized.errorMessage;
-            if (!audioEngine_.discardRecording(true))
-                recordingError_ += "; recording media retained as an ownership-safe orphan";
+            const auto cleanup = audioEngine_.discardRecordingWithDiagnostics(true, recordingError_);
+            if (!cleanup.primaryError.empty()) recordingError_ = cleanup.primaryError;
+            if (!cleanup.clean()) recordingError_ += "; recording media retained for recovery";
             activeRecording_ = {};
             return;
         }
@@ -1625,16 +1653,18 @@ void DawApplication::synchroniseRecording() noexcept {
         }
         activeRecording_ = {};
     } catch (const std::exception& error) {
-        const auto cleaned = audioEngine_.discardRecording(true);
+        const auto cleanup = audioEngine_.discardRecordingWithDiagnostics(true, error.what());
         recordingPhase_ = audio::RecordingPhase::failed;
-        recordingError_ = error.what();
-        if (!cleaned) recordingError_ += "; recording media retained as an ownership-safe orphan";
+        recordingError_ = cleanup.primaryError.empty() ? error.what() : cleanup.primaryError;
+        if (!cleanup.clean()) recordingError_ += "; recording media retained for recovery";
         activeRecording_ = {};
     } catch (...) {
-        const auto cleaned = audioEngine_.discardRecording(true);
+        const auto cleanup = audioEngine_.discardRecordingWithDiagnostics(
+            true, "Unexpected recording finalization failure");
         recordingPhase_ = audio::RecordingPhase::failed;
-        recordingError_ = "Unexpected recording finalization failure";
-        if (!cleaned) recordingError_ += "; recording media retained as an ownership-safe orphan";
+        recordingError_ = cleanup.primaryError.empty() ? "Unexpected recording finalization failure"
+                                                        : cleanup.primaryError;
+        if (!cleanup.clean()) recordingError_ += "; recording media retained for recovery";
         activeRecording_ = {};
     }
 }

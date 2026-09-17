@@ -2,7 +2,9 @@
 
 #include "vitadaw/audio/AudioDeviceState.h"
 #include "vitadaw/audio/IAudioEngineControl.h"
+#include "vitadaw/audio/RecordingRecovery.h"
 #include "vitadaw/audio/RealtimeAudioEngine.h"
+#include "vitadaw/platform/files/RecordingMediaIO.h"
 
 #include <juce_audio_devices/juce_audio_devices.h>
 
@@ -135,6 +137,9 @@ public:
     void serviceRecording() noexcept override;
     [[nodiscard]] audio::RecordingSnapshot recordingSnapshot() const noexcept override;
     [[nodiscard]] audio::RecordingFinalizationResult finalizeRecording() override;
+    [[nodiscard]] audio::RecordingCleanupResult discardRecordingWithDiagnostics(
+        bool removePublished, std::string primaryError = {}) noexcept override;
+    [[nodiscard]] audio::RecordingCleanupResult shutdownRecording() noexcept override;
     [[nodiscard]] bool discardRecording(bool removePublished) noexcept override;
     void confirmRecordingCommit() noexcept override;
 
@@ -155,6 +160,10 @@ private:
     struct PreparedProject;
     struct PreparedJuceAudioFile;
     struct PreparedJuceProcessingPlan;
+    struct RecoveryMetadataStatus {
+        bool available{};
+        std::string warning;
+    };
 
     void closeDevice(bool publishClosedState) noexcept;
     void beginDeviceReinitialisation() noexcept;
@@ -172,6 +181,10 @@ private:
         const std::filesystem::path&, std::error_code&) noexcept;
     [[nodiscard]] static bool pathHasIdentity(
         const std::filesystem::path&, FileIdentity) noexcept;
+    [[nodiscard]] static RecoveryMetadataStatus persistInitialRecoveryMetadata(
+        const std::filesystem::path&, const audio::RecordingRecoveryMarker&,
+        audio::RecordingRecoveryMarkerWriteOptions = {});
+    [[nodiscard]] bool finalizeRecordingFile(std::string&) noexcept;
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
         audio::AudioFileCommitAction modelCommit,
@@ -191,6 +204,8 @@ private:
     std::atomic<bool> suppressLifecycleNotification_{};
     std::atomic<bool> preserveTransportDuringRegistration_{};
     std::unique_ptr<juce::AudioFormatWriter> recordingWriter_;
+    std::unique_ptr<files::RecordingFileHandle> recordingFile_;
+    files::RecordingIoFaultInjection recordingIoFaults_;
     juce::AudioBuffer<float> recordingDrainBuffer_;
     std::filesystem::path recordingTemporaryPath_;
     std::filesystem::path recordingPublishedPath_;
@@ -200,6 +215,12 @@ private:
     std::uint64_t nextRecordingTemporaryNonce_{1};
     bool recordingWriterFailed_{};
     std::string recordingWriterError_;
+    std::string recordingRecoverySessionId_;
+    std::filesystem::path recordingRecoveryDirectory_;
+    bool recordingRecoveryMetadataAvailable_{};
+    std::string recordingRecoveryWarning_;
+    // Test-only fault seam; production retains the all-clear default.
+    audio::RecordingRecoveryMarkerWriteOptions recordingRecoveryMarkerWriteOptions_;
     bool callbackRegistered_{};
     bool changeListenerRegistered_{};
 };

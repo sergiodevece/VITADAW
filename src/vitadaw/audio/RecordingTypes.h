@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace vitadaw::audio {
 
@@ -30,6 +32,32 @@ enum class RecordingFailure : std::uint8_t {
     cancelled,
     writerFailed,
     finalizationFailed,
+    shutdown,
+};
+
+// These values describe retained media only.  They are deliberately not an
+// ownership claim: recovery may inspect/import a candidate, but never delete
+// it merely because it has a VitaDAW marker.
+enum class RecordingRecoveryClass : std::uint8_t {
+    temporary,
+    closedUncommitted,
+    publishedFinal,
+    incomplete,
+    ambiguous,
+};
+
+struct RecordingRecoveryArtifact {
+    std::string persistentSessionId;
+    std::filesystem::path path;
+    RecordingRecoveryClass classification{RecordingRecoveryClass::ambiguous};
+    bool recoverable{};
+};
+
+struct RecordingCleanupResult {
+    std::string primaryError;
+    std::vector<RecordingRecoveryArtifact> retainedArtifacts;
+
+    [[nodiscard]] bool clean() const noexcept { return retainedArtifacts.empty(); }
 };
 
 struct RecordingRequest {
@@ -65,8 +93,13 @@ struct RecordingPreflightRequest {
 };
 
 struct RecordingPreflightResult {
+    RecordingPreflightResult(RecordingRequest prepared = {}, std::string error = {},
+                             std::string warning = {})
+        : request(prepared), errorMessage(std::move(error)), warningMessage(std::move(warning)) {}
+
     RecordingRequest request;
     std::string errorMessage;
+    std::string warningMessage;
 
     [[nodiscard]] bool success() const noexcept {
         return request.session != 0 && errorMessage.empty();

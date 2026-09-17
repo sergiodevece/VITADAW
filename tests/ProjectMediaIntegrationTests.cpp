@@ -29,8 +29,126 @@ void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace vitadaw::platform::juce_adapter {
+namespace {
+constexpr auto virtualDeviceTypeName = "VitaDAW test device";
+constexpr auto virtualInputName = "VitaDAW test input";
+constexpr auto virtualOutputName = "VitaDAW test output";
+
+class VirtualAudioDevice final : public juce::AudioIODevice {
+public:
+    VirtualAudioDevice()
+        : AudioIODevice("VitaDAW test device", virtualDeviceTypeName) {}
+
+    juce::StringArray getOutputChannelNames() override { return {"Left", "Right"}; }
+    juce::StringArray getInputChannelNames() override { return {"Input 1", "Input 2"}; }
+    juce::Array<double> getAvailableSampleRates() override { return {48000.0}; }
+    juce::Array<int> getAvailableBufferSizes() override { return {256}; }
+    int getDefaultBufferSize() override { return 256; }
+    juce::String open(const juce::BigInteger& input, const juce::BigInteger& output,
+                      double rate, int buffer) override {
+        inputChannels_ = input;
+        outputChannels_ = output;
+        sampleRate_ = rate;
+        bufferSize_ = buffer;
+        open_ = true;
+        return {};
+    }
+    void close() override { open_ = false; }
+    bool isOpen() override { return open_; }
+    void start(juce::AudioIODeviceCallback* callback) override {
+        callback_ = callback;
+        playing_ = true;
+        if (callback_ != nullptr) callback_->audioDeviceAboutToStart(this);
+    }
+    void stop() override {
+        if (!playing_) return;
+        playing_ = false;
+        if (callback_ != nullptr) callback_->audioDeviceStopped();
+    }
+    bool isPlaying() override { return playing_; }
+    juce::String getLastError() override { return {}; }
+    int getCurrentBufferSizeSamples() override { return bufferSize_; }
+    double getCurrentSampleRate() override { return sampleRate_; }
+    int getCurrentBitDepth() override { return 32; }
+    juce::BigInteger getActiveOutputChannels() const override { return outputChannels_; }
+    juce::BigInteger getActiveInputChannels() const override { return inputChannels_; }
+    int getOutputLatencyInSamples() override { return 0; }
+    int getInputLatencyInSamples() override { return 0; }
+
+private:
+    juce::AudioIODeviceCallback* callback_{};
+    juce::BigInteger inputChannels_;
+    juce::BigInteger outputChannels_;
+    double sampleRate_{};
+    int bufferSize_{};
+    bool open_{};
+    bool playing_{};
+};
+
+class VirtualAudioDeviceType final : public juce::AudioIODeviceType {
+public:
+    VirtualAudioDeviceType() : AudioIODeviceType(virtualDeviceTypeName) {}
+
+    void scanForDevices() override {}
+    juce::StringArray getDeviceNames(bool wantInput) const override {
+        return wantInput ? juce::StringArray{virtualInputName}
+                         : juce::StringArray{virtualOutputName};
+    }
+    int getDefaultDeviceIndex(bool) const override { return 0; }
+    int getIndexOfDevice(juce::AudioIODevice*, bool) const override { return 0; }
+    bool hasSeparateInputsAndOutputs() const override { return true; }
+    juce::AudioIODevice* createDevice(const juce::String& output,
+                                      const juce::String& input) override {
+        if (output != virtualOutputName || input != virtualInputName) return nullptr;
+        return new VirtualAudioDevice;
+    }
+};
+} // namespace
+
 class PersistenceIntegrationAccess {
 public:
+    static bool configureHardwareFreeRecordingDevice(JuceAudioDeviceAdapter& adapter) {
+        adapter.deviceManager_.addAudioDeviceType(std::make_unique<VirtualAudioDeviceType>());
+        adapter.deviceManager_.setCurrentAudioDeviceType(virtualDeviceTypeName, false);
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        setup.inputDeviceName = virtualInputName;
+        setup.outputDeviceName = virtualOutputName;
+        setup.sampleRate = 48000.0;
+        setup.bufferSize = 256;
+        setup.useDefaultInputChannels = true;
+        setup.useDefaultOutputChannels = true;
+        if (adapter.deviceManager_.setAudioDeviceSetup(setup, false).isNotEmpty()) return false;
+        auto* device = adapter.deviceManager_.getCurrentAudioDevice();
+        if (device == nullptr) return false;
+        adapter.deviceSampleRate_ = timeline::SampleRate{device->getCurrentSampleRate()};
+        std::string error;
+        if (!adapter.reprepareForCurrentDevice(error)) return false;
+        adapter.attachAudioCallback(true);
+        return adapter.callbackRegistered_ &&
+               adapter.realtimeEngine_.deviceState() == audio::DeviceProcessingState::operational;
+    }
+    static void setRecoveryMarkerFault(JuceAudioDeviceAdapter& adapter,
+                                       audio::RecordingRecoveryMarkerFault fault) {
+        adapter.recordingRecoveryMarkerWriteOptions_ = {fault};
+    }
+    static bool writerAndCapturePrepared(const JuceAudioDeviceAdapter& adapter) {
+        return adapter.recordingWriter_ != nullptr && adapter.recordingFile_ != nullptr &&
+               adapter.realtimeEngine_.recordingSnapshot().phase == audio::RecordingPhase::idle;
+    }
+    static bool recoveryMarkerFailureIsNonBlocking(const std::filesystem::path& directory,
+                                                   audio::RecordingRecoveryMarkerFault fault) {
+        audio::RecordingRecoveryMarker marker;
+        marker.sessionId = "adapter-marker-" + std::to_string(static_cast<int>(fault));
+        marker.classification = audio::RecordingRecoveryClass::temporary;
+        marker.temporaryName = ".Recording 000001.part.wav";
+        marker.publishedName = "Recording 000001.wav";
+        marker.deviceSampleRate = timeline::SampleRate{48000};
+        const auto result = JuceAudioDeviceAdapter::persistInitialRecoveryMetadata(
+            directory, marker, audio::RecordingRecoveryMarkerWriteOptions{fault});
+        return !result.available &&
+               result.warning.find("Recording started, but crash-recovery metadata") !=
+                   std::string::npos;
+    }
     static std::optional<JuceAudioDeviceAdapter::FileIdentity> createExclusiveTemporary(
         const std::filesystem::path& path, std::error_code& error) {
         auto temporary = JuceAudioDeviceAdapter::createExclusiveTemporaryFile(path, error);
@@ -148,14 +266,58 @@ int main(){
           app.waveformCache().find({1})->levels[0].channels[0][0].maximum>0.2F,
           "waveform rebuilds from verified media on project reopen");
     check(engine.preparedAudioBytes()==480*sizeof(float),"one decoded PCM for ten clips");
+    std::error_code ownershipError;
     const auto externalTemporary = path(".Recording 000001.1.part.wav");
+    check(platform::juce_adapter::PersistenceIntegrationAccess::recoveryMarkerFailureIsNonBlocking(
+              path("marker-failure"), audio::RecordingRecoveryMarkerFault::create),
+          "actual adapter recovery-metadata seam classifies marker create failure as non-blocking");
+    std::filesystem::create_directories(path("marker-failure"), ownershipError);
+    check(!ownershipError &&
+              platform::juce_adapter::PersistenceIntegrationAccess::recoveryMarkerFailureIsNonBlocking(
+                  path("marker-failure"), audio::RecordingRecoveryMarkerFault::write) &&
+              platform::juce_adapter::PersistenceIntegrationAccess::recoveryMarkerFailureIsNonBlocking(
+                  path("marker-failure"), audio::RecordingRecoveryMarkerFault::sync) &&
+              platform::juce_adapter::PersistenceIntegrationAccess::recoveryMarkerFailureIsNonBlocking(
+                  path("marker-failure"), audio::RecordingRecoveryMarkerFault::close),
+          "actual adapter recovery-metadata seam preserves best-effort policy for write/fsync/close");
+    check(platform::juce_adapter::PersistenceIntegrationAccess::configureHardwareFreeRecordingDevice(engine),
+          "hardware-free JUCE recording preflight device is operational");
+    platform::juce_adapter::PersistenceIntegrationAccess::setRecoveryMarkerFault(
+        engine, audio::RecordingRecoveryMarkerFault::create);
+    const auto markerFailurePreflight = engine.prepareRecording(
+        {{1}, media::AudioChannelLayout::mono, path("marker-preflight.vitadaw")});
+    check(markerFailurePreflight.success() &&
+              markerFailurePreflight.warningMessage.find("crash-recovery metadata") !=
+                  std::string::npos &&
+              platform::juce_adapter::PersistenceIntegrationAccess::writerAndCapturePrepared(engine),
+          "real JUCE preflight continues through writer and capture after marker failure");
+    check(engine.tryRequestRecord(markerFailurePreflight.request).accepted &&
+              engine.recordingSnapshot().phase == audio::RecordingPhase::prepared,
+          "real JUCE preflight reaches and accepts the production Record request");
+    const auto markerFailureCleanup = engine.discardRecordingWithDiagnostics(
+        false, "test markerless cleanup");
+    check(!markerFailureCleanup.clean() && !markerFailureCleanup.retainedArtifacts.empty(),
+          "markerless preflight cleanup safely retains its temporary media");
+    platform::juce_adapter::PersistenceIntegrationAccess::setRecoveryMarkerFault(
+        engine, audio::RecordingRecoveryMarkerFault::none);
+    const auto secondPreflight = engine.prepareRecording(
+        {{1}, media::AudioChannelLayout::mono, path("marker-preflight.vitadaw")});
+    check(secondPreflight.success(),
+          "markerless cleanup allows the real adapter to preflight a subsequent Record");
+    check(secondPreflight.warningMessage.empty(),
+          "subsequent preflight clears the previous marker diagnostic");
+    check(platform::juce_adapter::PersistenceIntegrationAccess::writerAndCapturePrepared(engine),
+          "subsequent preflight recreates writer and capture resources");
+    check(engine.tryRequestRecord(secondPreflight.request).accepted,
+          "markerless cleanup resets the real adapter for a subsequent Record");
+    check(!engine.discardRecordingWithDiagnostics(false, "test subsequent cleanup").clean(),
+          "subsequent preflight cleanup remains ownership-safe");
     const auto ownedTemporary = path(".Recording 000001.2.part.wav");
     const auto abandonedTemporary = path(".Recording 000001.0.part.wav");
     const auto competingFinal = path("Recording 000001.wav");
     check(juce::File{juce::String(externalTemporary.wstring().c_str())}
               .replaceWithText("external temporary"),
           "create externally owned temporary-like fixture");
-    std::error_code ownershipError;
     check(platform::juce_adapter::PersistenceIntegrationAccess::closesExclusiveOnAbandon(
               abandonedTemporary, ownershipError),
           "exclusive temporary RAII closes its descriptor before stream ownership transfer");

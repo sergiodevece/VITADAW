@@ -118,6 +118,7 @@ public:
     [[nodiscard]] AudioControlRequestResult tryRequestRecord(
         RecordingRequest) noexcept;
     [[nodiscard]] bool tryCancelRecording() noexcept;
+    [[nodiscard]] bool failRecording(RecordingSessionId, RecordingFailure) noexcept;
     [[nodiscard]] RecordingSnapshot recordingSnapshot() const noexcept;
     [[nodiscard]] std::size_t drainRecording(AudioBlockView) noexcept;
     void resetRecordingCapture() noexcept;

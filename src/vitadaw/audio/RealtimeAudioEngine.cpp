@@ -577,6 +577,18 @@ bool RealtimeAudioEngine::tryCancelRecording() noexcept {
     return enqueue(CommandType::cancelRecord).accepted;
 }
 
+bool RealtimeAudioEngine::failRecording(RecordingSessionId session,
+                                        RecordingFailure reason) noexcept {
+    // Writer failures occur on the non-RT service thread.  They must terminalize
+    // the same capture directly rather than depending on command-queue space.
+    const auto snapshot = capture_.snapshot();
+    if (session == 0 || snapshot.session != session ||
+        (snapshot.phase != RecordingPhase::prepared &&
+         snapshot.phase != RecordingPhase::capturing)) return false;
+    capture_.fail(reason);
+    return true;
+}
+
 RecordingSnapshot RealtimeAudioEngine::recordingSnapshot() const noexcept {
     return capture_.snapshot();
 }

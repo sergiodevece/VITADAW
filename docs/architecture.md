@@ -2091,7 +2091,31 @@ rate, input, overflow, writer, decode, waveform, plan o revalidación dejan mode
 e historial sin cambios; si no puede limpiarse un WAV publicado se informa como
 medio huérfano.
 
-## Evolución hasta 0.7.0
+### Recording Recovery & Failure Hardening 0.7.1
+
+La finalización de grabación es una operación explícita no-RT: escribe la
+cabecera WAV final, observa errores, sincroniza el descriptor mediante `fsync`,
+publica con hard-link sin reemplazo y sincroniza el directorio. Un fallo de
+cabecera, escritura, `fsync`, cierre, publicación o sincronización impide el
+commit de ProjectState; el medio se conserva y nunca se borra por pathname.
+
+El cierre de aplicación detiene primero el timer, quiesce el callback, marca la
+sesión como `shutdown`, drena sólo PCM ya aceptado, cierra el medio y conserva
+el resultado como candidato de recovery. Nunca hace commit de proyecto o
+historial durante teardown. El fallo del writer es directo y session-aware, por
+lo que no depende de espacio en la cola CancelRecord.
+
+Cada intento crea markers inmutables, exclusivos y sincronizados junto al
+audio. Contienen ID aleatorio de sesión, basenames, layout, rate, frames, clase
+y fingerprint cuando existe. Permiten discovery tras reinicio; un marker roto se
+rechaza. No prueban ownership ni autorizan borrado. Recovery explícito reutiliza
+la validación/importación normal y su commit transaccional.
+
+0.7.1 ofrece durabilidad estándar de filesystem al final de una toma (`fsync`
+de archivo y directorio), siempre fuera de RT. No solicita `F_FULLFSYNC`, de
+modo que no promete la máxima garantía ante pérdida súbita de alimentación.
+
+## Evolución hasta 0.7.1
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.

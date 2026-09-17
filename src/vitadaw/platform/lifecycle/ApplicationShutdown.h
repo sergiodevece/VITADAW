@@ -19,6 +19,9 @@ void shutdownApplicationOwners(AudioOwner& audio,
         // The callback captures the outer application and addresses the window.
         // Clear it while both the adapter and every possible receiver are alive.
         audio->clearStateChangedCallback();
+        if constexpr (requires { application->shutdownRecording(); }) {
+            if (application) application->shutdownRecording();
+        }
         // Quiesce the device/RT consumer before destroying any session owner.
         // The adapter remains alive until after DawApplication, whose audio
         // control reference is non-owning.

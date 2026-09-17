@@ -122,6 +122,23 @@ void stereoAndInputFailures() {
                   audio::RecordingFailure::missingInput,
               "null or insufficient input fails explicitly");
     }
+    {
+        Harness h;
+        check(h.engine.tryRequestRecord({67, {10}, media::AudioChannelLayout::mono}).accepted,
+              "writer terminal fixture starts");
+        check(!h.engine.failRecording(999, audio::RecordingFailure::writerFailed) &&
+                  h.engine.failRecording(67, audio::RecordingFailure::writerFailed),
+              "stale writer failure cannot terminalize a newer session");
+        const auto failed = h.engine.recordingSnapshot();
+        check(failed.phase == audio::RecordingPhase::failed &&
+                  failed.failure == audio::RecordingFailure::writerFailed,
+              "writer failure terminalizes directly without a cancel command");
+        check(h.engine.tryRequestStop().accepted, "application may stop transport after writer failure");
+        h.engine.processBlock({nullptr, 0, 0}, h.deviceRate);
+        h.engine.resetRecordingCapture();
+        check(h.engine.tryRequestRecord({68, {10}, media::AudioChannelLayout::mono}).accepted,
+              "capture can be prepared again after direct writer terminalization");
+    }
 }
 
 void wrapAndOverflow() {

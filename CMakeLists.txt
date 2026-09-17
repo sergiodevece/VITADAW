@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.7.0 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.7.1 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -24,6 +24,7 @@ add_library(vitadaw_core
     src/vitadaw/audio/PreparedProcessingPlan.cpp
     src/vitadaw/audio/PreparedTemporalContext.cpp
     src/vitadaw/audio/RealtimeCapture.cpp
+    src/vitadaw/audio/RecordingRecovery.cpp
     src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
     src/vitadaw/history/UndoManager.cpp
@@ -31,6 +32,7 @@ add_library(vitadaw_core
     src/vitadaw/project/ProjectDocumentData.cpp
     src/vitadaw/persistence/ProjectPersistence.cpp
     src/vitadaw/platform/files/ProjectFileIO.cpp
+    src/vitadaw/platform/files/RecordingMediaIO.cpp
     src/vitadaw/processors/GainProcessor.cpp
     src/vitadaw/routing/RoutingState.cpp
     src/vitadaw/timeline/Time.cpp
@@ -283,6 +285,13 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_recording_application_tests tests/RecordingApplicationTests.cpp)
     target_link_libraries(vitadaw_recording_application_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_recording_application_tests COMMAND vitadaw_recording_application_tests)
+    add_executable(vitadaw_recording_recovery_tests tests/RecordingRecoveryTests.cpp)
+    target_link_libraries(vitadaw_recording_recovery_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recording_recovery_tests COMMAND vitadaw_recording_recovery_tests)
+
+    add_executable(vitadaw_recording_media_io_tests tests/RecordingMediaIOTests.cpp)
+    target_link_libraries(vitadaw_recording_media_io_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recording_media_io_tests COMMAND vitadaw_recording_media_io_tests)
 
     add_executable(vitadaw_audio_preparation_tests tests/AudioPreparationTests.cpp)
     target_link_libraries(vitadaw_audio_preparation_tests PRIVATE vitadaw_core)

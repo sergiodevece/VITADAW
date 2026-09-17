@@ -19,6 +19,13 @@ public:
 
     commands::CommandResult handle(const commands::Command& command) override;
     void synchroniseTransport() noexcept;
+    // Called by native shutdown before its audio adapter or this application is
+    // destroyed. It is intentionally cancellation/recovery only: no model or
+    // history commit may occur here.
+    void shutdownRecording() noexcept;
+    [[nodiscard]] commands::CommandResult recoverRecording(
+        const std::filesystem::path&, tracks::TrackId,
+        timeline::ProjectFramePosition = {});
 
     [[nodiscard]] const project::ProjectState& project() const noexcept;
     [[nodiscard]] const transport::TransportState& transport() const noexcept;

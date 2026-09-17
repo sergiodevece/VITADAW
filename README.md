@@ -1,4 +1,4 @@
-# VitaDAW 0.7.0 — Audio Recording Foundation
+# VitaDAW 0.7.1 — Recording Recovery & Failure Hardening
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa

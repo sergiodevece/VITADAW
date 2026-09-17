@@ -74,6 +74,8 @@ public:
     bool missingMedia{};
     bool cleanupFails{};
     bool deferFirstCallback{};
+    bool recoveryMetadataAvailable{true};
+    std::string recoveryWarning;
     unsigned commits{};
     unsigned discards{};
 
@@ -153,7 +155,7 @@ public:
         const audio::RecordingPreflightRequest& request) override {
         preparedLayout = request.layout;
         preparedRequest = {nextSession++, request.track, request.layout};
-        return {preparedRequest, {}};
+        return {preparedRequest, {}, recoveryWarning};
     }
     audio::AudioControlRequestResult tryRequestRecord(
         audio::RecordingRequest request) noexcept override {
@@ -184,13 +186,13 @@ public:
     }
     audio::RecordingFinalizationResult finalizeRecording() override {
         if (failFinalize)
-            return {{}, capture, mediaPath, "Injected writer/decode failure"};
+            return {{}, capture, mediaPath, "Injected writer/decode failure", recoveryWarning};
         auto file = std::make_unique<File>(preparedLayout, mediaPath);
         if (failWaveform) {
             file->waveform.reset();
             file->waveformDiagnostic = "Injected waveform failure";
         }
-        return {std::move(file), capture, mediaPath, {}};
+        return {std::move(file), capture, mediaPath, {}, recoveryWarning};
     }
     audio::AudioFilePreparationResult prepareVerifiedWav(
         const std::filesystem::path& path,
@@ -207,12 +209,84 @@ public:
         capture = {};
         return !cleanupFails;
     }
+    audio::RecordingCleanupResult discardRecordingWithDiagnostics(
+        bool removePublished, std::string primary = {}) noexcept override {
+        const auto clean = discardRecording(removePublished);
+        audio::RecordingCleanupResult result;
+        result.primaryError = std::move(primary);
+        if (!recoveryMetadataAvailable && !recoveryWarning.empty()) {
+            if (!result.primaryError.empty()) result.primaryError += "; ";
+            result.primaryError += recoveryWarning;
+        }
+        if (!clean) result.retainedArtifacts.push_back(
+            {"test-session", mediaPath, audio::RecordingRecoveryClass::publishedFinal, true});
+        return result;
+    }
+    audio::RecordingCleanupResult shutdownRecording() noexcept override {
+        return discardRecordingWithDiagnostics(true, "Recording cancelled during application shutdown");
+    }
     void confirmRecordingCommit() noexcept override { capture = {}; }
 };
 
 commands::CommandResult send(application::DawApplication& app,
                              commands::Command command) {
     return app.handle(command);
+}
+
+void recoveryMetadataWarningDoesNotBlockRecording() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    engine.recoveryMetadataAvailable = false;
+    engine.recoveryWarning =
+        "Recording started, but crash-recovery metadata could not be persisted: "
+        "create recovery marker '/virtual/Marker Audio/.vitadaw-recording-test.recovery' "
+        "failed (13): Permission denied";
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Marker warning"}).status ==
+              commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Marker.vitadaw"}).status ==
+              commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status ==
+              commands::CommandStatus::accepted,
+          "marker-warning fixture established");
+
+    const auto started = send(app, commands::Record{});
+    check(started.status == commands::CommandStatus::accepted &&
+              engine.capture.phase == audio::RecordingPhase::capturing &&
+              app.recordingPhase() == audio::RecordingPhase::capturing &&
+              started.message.find("crash-recovery metadata") != std::string::npos,
+          "non-fatal initial marker failure still creates writer/capture and accepts Record");
+    check(send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "markerless recording can stop normally");
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::complete &&
+              app.project().sources().size() == 1 &&
+              app.project().tracks()[0].clips.size() == 1 &&
+              app.recordingError().find("crash-recovery metadata") != std::string::npos,
+          "markerless recording finalizes, commits, and retains its warning");
+    check(send(app, commands::SaveProject{}).status == commands::CommandStatus::accepted,
+          "markerless committed recording can be saved before failure atomicity checks");
+
+    engine.failFinalize = true;
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              engine.capture.phase == audio::RecordingPhase::capturing,
+          "subsequent Record remains possible without recovery metadata");
+    check(send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "markerless failure-cleanup recording can stop");
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::failed &&
+              app.project().sources().size() == 1 && !app.session().dirty() &&
+              app.recordingError().find("crash-recovery metadata") != std::string::npos,
+          "markerless failure cleanup remains atomic and reports the degraded recovery state");
+
+    engine.failFinalize = false;
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted,
+          "failure cleanup releases markerless session for another Record");
+    app.shutdownRecording();
+    check(app.recordingPhase() == audio::RecordingPhase::failed &&
+              app.project().sources().size() == 1 && !app.session().dirty() &&
+              app.recordingError().find("crash-recovery metadata") != std::string::npos,
+          "graceful markerless shutdown retains media safely and reports unavailable metadata");
 }
 
 void recordingTransactionAndHistory() {
@@ -341,7 +415,7 @@ void failureAtomicityAndArmDeletion() {
     check(app.recordingPhase() == audio::RecordingPhase::failed &&
               app.project().sources().empty() && !app.session().dirty() &&
               engine.discards == 3 &&
-              app.recordingError().find("ownership-safe orphan") != std::string::npos,
+              app.recordingError().find("retained for recovery") != std::string::npos,
           "plan failure is atomic and reports failed published-media cleanup");
     engine.failPlan = false;
     engine.cleanupFails = false;
@@ -384,11 +458,72 @@ void preparedDeviceLossCleansApplicationSession() {
           "cleanup clears the active recording session for a subsequent Record");
 }
 
+void shutdownCancelsWithoutCommitting() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Shutdown"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Shutdown.vitadaw"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).status == commands::CommandStatus::accepted,
+          "shutdown fixture prepared");
+    const auto token = app.history().currentStateToken();
+    engine.cleanupFails = true;
+    app.shutdownRecording();
+    check(app.recordingPhase() == audio::RecordingPhase::failed && engine.discards == 1 &&
+              app.project().sources().empty() && app.history().currentStateToken() == token &&
+              !app.session().dirty() && app.armedTrack() == tracks::TrackId{1} &&
+              app.recordingError().find("retained for recovery") != std::string::npos,
+          "shutdown never commits and reports retained recovery media");
+    app.shutdownRecording();
+    check(engine.discards == 1, "repeated application shutdown is idempotent");
+
+    RecordingEngine preparedEngine;
+    application::DawApplication preparedApp{preparedEngine, timeline::SampleRate{48000.0}, files};
+    check(send(preparedApp, commands::AddAudioTrack{"Prepared shutdown"}).status ==
+              commands::CommandStatus::accepted &&
+              send(preparedApp, commands::SaveProjectAs{"/virtual/PreparedShutdown.vitadaw"}).status ==
+                  commands::CommandStatus::accepted &&
+              send(preparedApp, commands::SetTrackRecordArmed{{1}, true}).status ==
+                  commands::CommandStatus::accepted,
+          "prepared shutdown fixture established");
+    preparedEngine.deferFirstCallback = true;
+    check(send(preparedApp, commands::Record{}).status == commands::CommandStatus::accepted,
+          "prepared recording begins before shutdown");
+    preparedApp.shutdownRecording();
+    check(preparedEngine.discards == 1 && preparedApp.project().sources().empty() &&
+              !preparedApp.session().dirty(),
+          "shutdown also tears down a prepared session without committing");
+}
+
+void explicitRecoveryUsesTransactionalImport() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Recovery"}).status == commands::CommandStatus::accepted,
+          "recovery target track created");
+    const auto before = app.history().currentStateToken();
+    const auto dirtyBefore = app.session().dirty();
+    engine.failPlan = true;
+    check(app.recoverRecording("/recovery/failed.wav", {1}).status ==
+              commands::CommandStatus::rejected && app.project().sources().empty() &&
+              app.history().currentStateToken() == before && app.session().dirty() == dirtyBefore,
+          "failed explicit recovery leaves model, history and dirty state unchanged");
+    engine.failPlan = false;
+    check(app.recoverRecording("/recovery/salvaged.wav", {1}, {17}).status ==
+              commands::CommandStatus::accepted && app.project().sources().size() == 1 &&
+              app.project().tracks()[0].clips.size() == 1,
+          "valid explicit recovery reuses normal transactional import");
+}
+
 } // namespace
 
 int main() {
     recordingTransactionAndHistory();
+    recoveryMetadataWarningDoesNotBlockRecording();
     failureAtomicityAndArmDeletion();
     preparedDeviceLossCleansApplicationSession();
+    shutdownCancelsWithoutCommitting();
+    explicitRecoveryUsesTransactionalImport();
     std::cout << "Recording application tests passed\n";
 }
