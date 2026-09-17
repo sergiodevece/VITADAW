@@ -2093,27 +2093,40 @@ medio huérfano.
 
 ### Recording Recovery & Failure Hardening 0.7.1
 
-La finalización de grabación es una operación explícita no-RT: escribe la
-cabecera WAV final, observa errores, sincroniza el descriptor mediante `fsync`,
-publica con hard-link sin reemplazo y sincroniza el directorio. Un fallo de
-cabecera, escritura, `fsync`, cierre, publicación o sincronización impide el
-commit de ProjectState; el medio se conserva y nunca se borra por pathname.
+0.7.1 separa estrictamente el marker auxiliar de la media que compromete el
+proyecto. El preflight no-RT intenta escribir un marker exclusivo; si su create,
+write, `fsync` o close falla, el adaptador conserva un aviso con operación, ruta,
+código y mensaje del sistema, pero continúa con la preparación del writer y la
+solicitud de Record. Una sesión sin marker se representa explícitamente como
+degradada y conserva las rutas seguras de finalización, cleanup, shutdown y
+reintento.
 
-El cierre de aplicación detiene primero el timer, quiesce el callback, marca la
-sesión como `shutdown`, drena sólo PCM ya aceptado, cierra el medio y conserva
-el resultado como candidato de recovery. Nunca hace commit de proyecto o
-historial durante teardown. El fallo del writer es directo y session-aware, por
-lo que no depende de espacio en la cola CancelRecord.
+La finalización de la media sigue siendo bloqueante: escribe la cabecera WAV
+final, observa los errores de writer, sincroniza el descriptor, publica por
+hard-link sin reemplazo, verifica la identidad y sincroniza el directorio antes
+del commit de `ProjectState`. Un fallo de cabecera, escritura, cierre, `fsync`,
+publicación o sincronización impide ese commit. La limpieza no convierte una
+identidad observada en permiso de borrado por pathname; cuando no puede probar
+ownership de forma atómica, conserva el archivo como artefacto seguro.
 
-Cada intento crea markers inmutables, exclusivos y sincronizados junto al
-audio. Contienen ID aleatorio de sesión, basenames, layout, rate, frames, clase
-y fingerprint cuando existe. Permiten discovery tras reinicio; un marker roto se
-rechaza. No prueban ownership ni autorizan borrado. Recovery explícito reutiliza
-la validación/importación normal y su commit transaccional.
+El estado `prepared` se terminaliza antes de resetear la captura, igual que una
+captura ya activa. Esto permite cancelar, apagar o reintentar sin retener una
+sesión activa, y el teardown nunca hace commit de proyecto ni historial. La
+cobertura JUCE hardware-free ejecuta el `AudioDeviceManager` y
+`JuceAudioDeviceAdapter::prepareRecording()` productivos con un dispositivo
+virtual de test; cubre marker fallido, writer/captura preparados, Record
+aceptado, cleanup y una segunda preparación.
 
-0.7.1 ofrece durabilidad estándar de filesystem al final de una toma (`fsync`
-de archivo y directorio), siempre fuera de RT. No solicita `F_FULLFSYNC`, de
-modo que no promete la máxima garantía ante pérdida súbita de alimentación.
+En Windows, el marker usa `CreateFileW(..., CREATE_NEW, ...)`, `WriteFile`,
+`FlushFileBuffers` y `CloseHandle`, conservando el error de cada operación. Esa
+rama se revisó por inspección, no se compiló ni ejecutó con SDK/toolchain Windows
+en este cierre; no se documenta una garantía de finalización/durabilidad de media
+en Windows. Marker, filesystem I/O y finalización permanecen fuera del callback
+RT, que continúa delegando en `processBlock`.
+
+0.7.1 no integra un escaneo de markers al arranque ni un flujo de producto para
+recuperar automáticamente temporales o adoptar huérfanos. Tampoco añade
+garbage collection de esos artefactos.
 
 ## Evolución hasta 0.7.1
 
@@ -2218,6 +2231,10 @@ modo que no promete la máxima garantía ante pérdida súbita de alimentación.
 37. **Completado en 0.7.0:** armado exclusivo efímero, captura SPSC sin trabajo
     no-RT en callback, almacenamiento WAV transaccional y operación Record
     undoable/redoable con IDs estables y medio verificado.
+
+38. **Completado en 0.7.1:** marker de recovery auxiliar y best-effort,
+    persistencia crítica de media bloqueante, cleanup de `prepared`, shutdown y
+    reintento seguros, y cobertura JUCE hardware-free del preflight real.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

@@ -318,6 +318,52 @@ Stopped-only y undoable. Time Selection, Snap y previews no entran en
 opt-in mide mutación, preparación, publicación y transacción sin imponer todavía
 umbrales. El documento permanece en schema v3.
 
+## 0.7.1 - Recording Recovery Hardening
+
+VitaDAW 0.7.1 endurece la infraestructura de grabación ya introducida en 0.7.0.
+El objetivo es que los metadatos auxiliares de recovery no conviertan una toma
+válida en un Record rechazado, sin rebajar las barreras que protegen el WAV y el
+commit del proyecto.
+
+Durante el preflight no-RT el adaptador intenta persistir un recovery marker
+exclusivo junto a la media. Ese marker es auxiliar y **best-effort**: un fallo
+exclusivo de creación, escritura, sincronización o cierre no impide preparar el
+writer, aceptar Record ni finalizar una toma. El aviso conserva la operación, la
+ruta, el código del sistema y su mensaje legible. Una sesión que empieza sin
+marker mantiene esa condición degradada de forma explícita, pero puede limpiar,
+cerrar la aplicación y permitir otra grabación desde un estado limpio.
+
+La frontera con la media real permanece estricta. La creación y finalización del
+WAV, sus escrituras, el `fsync` de media, la publicación sin reemplazo, la
+verificación de identidad y el `fsync` del directorio son pasos críticos: un
+fallo impide el commit de `ProjectState`. Si un archivo no puede eliminarse con
+ownership demostrable de forma atómica, se conserva como artefacto seguro en vez
+de borrarse por pathname.
+
+El cleanup terminaliza tanto una captura `prepared` como una que ya está
+capturando antes de resetearla. Así no queda una sesión activa retenida entre
+preflight, cancelación, shutdown o reintento. Esta ruta no publica ni añade
+historial durante el teardown.
+
+La cobertura de integración hardware-free ejecuta
+`JuceAudioDeviceAdapter::prepareRecording()` real sobre el `AudioDeviceManager`
+productivo y un `AudioIODevice` virtual de test. Demuestra la secuencia de fallo
+del marker, writer/captura preparados, solicitud Record aceptada, cleanup y una
+segunda preparación correcta; no introduce una ruta alternativa de producción.
+
+En Windows, la persistencia del marker usa `CreateFileW` con `CREATE_NEW`,
+`WriteFile`, `FlushFileBuffers` y `CloseHandle`. Las cuatro fases conservan un
+diagnóstico diferenciado. Esta rama se revisó por inspección; no se compiló ni
+ejecutó con un SDK/toolchain Windows en el entorno macOS de cierre. No se afirma
+durabilidad integral de la finalización de grabación en Windows.
+
+El marker, el filesystem I/O y la finalización siguen fuera del callback RT; el
+callback continúa limitado a `processBlock`. 0.7.1 no añade recuperación
+automática tras crash, escaneo al arrancar, adopción de huérfanos, garbage
+collection de media, monitoring, compensación de latencia, punch/loop recording
+ni grabación multipista. Detalles de la evidencia de cierre:
+[`docs/validation-0.7.1.md`](docs/validation-0.7.1.md).
+
 ## Tecnología propuesta
 
 - **C++20** para el núcleo y el callback de audio.
@@ -732,6 +778,10 @@ La arquitectura y las reglas de tiempo real se describen en
   mono/estéreo por inputs 1–2 mediante ring SPSC preasignado, WAV temporal en
   `<ProjectName> Audio/`, publicación transaccional y Undo/Redo con identidad
   exacta y verificación del medio.
+- **0.7.1 — Recording Recovery Hardening:** marker auxiliar best-effort con
+  diagnósticos conservados, persistencia crítica de media sin rebajar, cleanup y
+  shutdown seguros también sin marker, corrección de `prepared` y cobertura
+  JUCE hardware-free del preflight real.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -767,4 +817,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.4.md`](docs/validation-0.6.4.md) y
 [`docs/validation-0.6.5.md`](docs/validation-0.6.5.md) y
 [`docs/validation-0.6.6.md`](docs/validation-0.6.6.md) y
-[`docs/validation-0.7.0.md`](docs/validation-0.7.0.md).
+[`docs/validation-0.7.0.md`](docs/validation-0.7.0.md) y
+[`docs/validation-0.7.1.md`](docs/validation-0.7.1.md).
