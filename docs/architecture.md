@@ -1860,6 +1860,42 @@ de RT -> commit conjunto. El callback no accede al modelo mutable, no asigna y
 no participa en validación ni rebuild. El schema continúa en v3; el orden ya se
 representaba en el array de pistas y los clips/contadores ya eran documentales.
 
+### Arrange Foundation Completion 0.6.6
+
+0.6.6 añade `TimeSelection[startFrame,exclusiveEndFrame)` como estado efímero
+del timeline. Está normalizada dentro del dominio certificado, no admite rango
+vacío y permanece separada de clip selection, pista activa, playhead y loop.
+Vive en `TimelineInteraction`: refresh, edición y Undo/Redo la conservan, mientras
+la adopción de otro documento reconstruye el componente y la elimina. No forma
+parte de `ProjectState`, dirty, historial ni schema.
+
+Snap también es una política portable de interacción. Recibe una posición cruda,
+targets preparados desde el estado original del gesto y una tolerancia visual
+convertida a frames; devuelve un `ProjectFramePosition` definitivo antes del
+comando. La resolución inicial es un beat y el estado comienza desactivado. Los
+targets son frame cero, beat grid, playhead, bordes de clips no movidos y bordes
+de Time Selection. La elección minimiza distancia y después aplica el orden
+estable clip edge, time-selection edge, playhead, frame zero, beat grid y, por
+último, menor frame. El comando y el dominio nunca reciben píxeles ni decisiones
+de snap.
+
+Al iniciar un gesto, los bordes de la Time Selection preexistente se capturan
+como targets estructurales: al crear otra selección representan el rango anterior
+que está siendo reemplazado y permanecen congelados hasta finalizar el gesto; los
+bordes del preview nuevo nunca se incorporan como targets.
+
+`Set Loop From Selection` no fusiona entidades: convierte el inicio al tick
+causal floor y el final exclusivo al tick ceil, y despacha el
+`SetLoopRangeMusical` existente. Por ello conserva preparación temporal,
+atomicidad, dirty y una entrada Undo/Redo; sigue siendo Stopped-only y no activa
+el loop. El schema continúa en v3 y el callback, renderer y reloj RT no cambian.
+
+La medición de rebuild se construye solo con el target opt-in
+`vitadaw_arrange_rebuild_benchmarks`. Usa sesiones deterministas sin I/O durante
+la ventana medida y separa mutación de modelo, preparación del plan,
+swap/publicación y transacción completa. Sus resultados son diagnósticos, no
+límites contractuales.
+
 ## Temporal State Model V1 y Musical Time 0.6.1
 
 Las autoridades quedan formalmente separadas:
@@ -2007,7 +2043,7 @@ de reset. Si un rebuild ocurre antes del DSP, su `hardDiscontinuity` subsume a
 Seek y se conservan los resets legítimos. Stop, lifecycle y loop conservan sus
 políticas anteriores; no se introduce una colección de causas ni otra API de inserts.
 
-## Evolución hasta 0.6.5
+## Evolución hasta 0.6.6
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -2103,6 +2139,9 @@ políticas anteriores; no se introduce una colección de causas ni otra API de i
 35. **Completado en 0.6.5:** Arrange Editing II con reorder por TrackId,
     multiselección efímera y Move/Delete/Duplicate múltiples, atómicos,
     undoables y contabilizados dentro del presupuesto de historial.
+
+36. **Completado en 0.6.6:** Time Selection efímera, Snap Foundation con
+    desempate determinista, copia explícita a Loop y benchmark opt-in del rebuild.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

@@ -29,7 +29,26 @@ TimelineComponent::TimelineComponent(commands::ICommandDispatcher& dispatcher,
     split_.onClick = [this] { dispatch(interaction_.splitCommand(snapshot_, transport_.position)); };
     duplicate_.onClick = [this] { dispatch(interaction_.duplicateCommand(snapshot_)); };
     delete_.onClick = [this] { dispatch(interaction_.deleteCommand()); };
-    for (auto* button : {&zoomOut_, &zoomIn_, &split_, &duplicate_, &delete_})
+    snap_.setClickingTogglesState(true);
+    snap_.setToggleState(false, juce::dontSendNotification);
+    snap_.onClick = [this] {
+        interaction_.setSnapEnabled(snap_.getToggleState());
+        repaint();
+    };
+    setLoopFromSelection_.onClick = [this] {
+        const auto command = interaction_.setLoopFromTimeSelectionCommand(
+            application_.musicalTime());
+        if (command) {
+            dispatch(command);
+        } else if (commandCompleted) {
+            commandCompleted({commands::CommandStatus::rejected,
+                              "Time selection cannot define a valid loop",
+                              commands::CommandError::validationFailed});
+        }
+    };
+    for (juce::Button* button : std::array<juce::Button*, 7>{
+             &zoomOut_, &zoomIn_, &split_, &duplicate_, &delete_, &snap_,
+             &setLoopFromSelection_})
         addAndMakeVisible(*button);
     rulerMode_.addItem("Seconds", 1);
     rulerMode_.addItem("Frames", 2);
@@ -37,6 +56,7 @@ TimelineComponent::TimelineComponent(commands::ICommandDispatcher& dispatcher,
     rulerMode_.setSelectedId(1);
     rulerMode_.onChange = [this] { repaint(); }; // presentation only; never dirty
     addAndMakeVisible(rulerMode_);
+    updateSelectionActions();
     updateScrollBars();
 }
 
@@ -62,6 +82,7 @@ void TimelineComponent::setTransportState(const transport::TransportState& state
     split_.setEnabled(editable);
     duplicate_.setEnabled(editable);
     delete_.setEnabled(editable);
+    updateSelectionActions();
     refreshModel(false);
     repaint();
 }
@@ -321,6 +342,32 @@ void TimelineComponent::paint(juce::Graphics& g) {
         }
     }
 
+    if (const auto& selection = interaction_.timeSelection()) {
+        const auto left = static_cast<float>(headerWidth +
+            transform_.projectFrameToX(selection->startFrame));
+        const auto right = static_cast<float>(headerWidth +
+            transform_.projectFrameToX(selection->exclusiveEndFrame));
+        const auto clippedLeft = std::max(left, static_cast<float>(headerWidth));
+        const auto clippedRight = std::min(
+            right, static_cast<float>(viewport.getRight()));
+        if (clippedRight > clippedLeft) {
+            const juce::Rectangle<float> region{
+                clippedLeft, static_cast<float>(toolbarHeight),
+                clippedRight - clippedLeft,
+                static_cast<float>(getHeight() - toolbarHeight -
+                                   scrollBarThickness)};
+            g.setColour(juce::Colour{0x385b8def});
+            g.fillRect(region);
+            g.setColour(juce::Colour{0xff79a7ff});
+            g.drawVerticalLine(static_cast<int>(std::round(left)),
+                               static_cast<float>(toolbarHeight),
+                               static_cast<float>(getHeight() - scrollBarThickness));
+            g.drawVerticalLine(static_cast<int>(std::round(right)),
+                               static_cast<float>(toolbarHeight),
+                               static_cast<float>(getHeight() - scrollBarThickness));
+        }
+    }
+
     const auto playheadX = static_cast<float>(headerWidth +
         transform_.projectFrameToX(transport_.position));
     if (playheadX >= headerWidth && playheadX <= viewport.getRight()) {
@@ -341,6 +388,8 @@ void TimelineComponent::resized() {
     split_.setBounds(toolbar.removeFromLeft(130));
     duplicate_.setBounds(toolbar.removeFromLeft(95));
     delete_.setBounds(toolbar.removeFromLeft(75));
+    snap_.setBounds(toolbar.removeFromLeft(105));
+    setLoopFromSelection_.setBounds(toolbar.removeFromLeft(190));
     rulerMode_.setBounds(toolbar.removeFromLeft(135));
     horizontal_.setBounds(headerWidth, getHeight() - scrollBarThickness,
                           std::max(0, getWidth() - headerWidth - scrollBarThickness), scrollBarThickness);
@@ -379,6 +428,29 @@ void TimelineComponent::setZoom(double zoom, double anchorX) {
     repaint();
 }
 
+std::int64_t TimelineComponent::snapToleranceFrames() const noexcept {
+    if (!snapshot_.projectSampleRate.isValid() ||
+        transform_.pixelsPerSecond() <= 0.0) return 0;
+    const auto frames = std::ceil(8.0 * snapshot_.projectSampleRate.hertz() /
+                                  transform_.pixelsPerSecond());
+    return static_cast<std::int64_t>(std::clamp(
+        frames, 0.0, static_cast<double>(
+            timeline::maximumSupportedProjectFrame().value)));
+}
+
+timeline::ProjectFramePosition TimelineComponent::supportedFrameAtX(
+    float componentX) const noexcept {
+    const auto frame = transform_.xToProjectFrame(componentX - headerWidth);
+    return {std::clamp(frame.value, std::int64_t{},
+                       timeline::maximumSupportedProjectFrame().value)};
+}
+
+void TimelineComponent::updateSelectionActions() noexcept {
+    setLoopFromSelection_.setEnabled(
+        transport_.playback == transport::PlaybackState::stopped &&
+        interaction_.timeSelection().has_value());
+}
+
 void TimelineComponent::dispatch(std::optional<commands::Command> command) {
     if (!command) {
         repaint();
@@ -402,8 +474,9 @@ void TimelineComponent::mouseDown(const juce::MouseEvent& event) {
         event.position.y < toolbarHeight + rulerHeight &&
         event.position.x >= headerWidth &&
         event.position.x <= viewportBounds().getRight()) {
-        const auto target = transform_.xToProjectFrame(event.position.x - headerWidth);
-        dispatch(commands::SeekToProjectFrame{target});
+        interaction_.beginTimeSelection(
+            supportedFrameAtX(event.position.x), snapshot_,
+            application_.musicalTime(), snapToleranceFrames());
         return;
     }
     const auto hit = timelineHitTest(event.position);
@@ -413,8 +486,11 @@ void TimelineComponent::mouseDown(const juce::MouseEvent& event) {
             laneHeight, verticalOffset_);
         if (track && event.position.x < headerWidth)
             interaction_.selectTrack(track);
-        else
+        else {
             interaction_.selectTrack({});
+            interaction_.clearTimeSelection();
+            updateSelectionActions();
+        }
         repaint();
         return;
     }
@@ -430,21 +506,50 @@ void TimelineComponent::mouseDown(const juce::MouseEvent& event) {
             event.position.x - headerWidth));
     } else if (interaction_.selections().size() == 1) {
         static_cast<void>(interaction_.beginGesture(
-            hit.kind, *hit.track, *hit.clip,
+            hit.kind, snapshot_, *hit.track, *hit.clip,
             event.position.x - headerWidth));
     }
     repaint();
 }
 void TimelineComponent::mouseDrag(const juce::MouseEvent& event) {
     if (transport_.playback == transport::PlaybackState::playing) return;
+    if (interaction_.timeSelectionGestureActive()) {
+        interaction_.updateTimeSelection(
+            supportedFrameAtX(event.position.x), application_.musicalTime(),
+            snapToleranceFrames());
+        updateSelectionActions();
+        repaint();
+        return;
+    }
     const auto target = ui::timeline::TimelineInteraction::trackAtVerticalPosition(
         snapshot_, event.position.y, toolbarHeight + rulerHeight,
         laneHeight, verticalOffset_);
     interaction_.updateGesture(event.position.x - headerWidth, transform_,
-                               snapshot_, target);
+                               snapshot_, target, application_.musicalTime(),
+                               snapToleranceFrames());
     repaint();
 }
-void TimelineComponent::mouseUp(const juce::MouseEvent&) {
+void TimelineComponent::mouseUp(const juce::MouseEvent& event) {
+    if (interaction_.timeSelectionGestureActive()) {
+        if (!event.mouseWasDraggedSinceMouseDown()) {
+            interaction_.clearTimeSelection();
+            updateSelectionActions();
+            dispatch(commands::SeekToProjectFrame{
+                supportedFrameAtX(event.position.x)});
+            return;
+        }
+        interaction_.updateTimeSelection(
+            supportedFrameAtX(event.position.x), application_.musicalTime(),
+            snapToleranceFrames());
+        const auto selected = interaction_.endTimeSelection();
+        updateSelectionActions();
+        if (!selected)
+            dispatch(commands::SeekToProjectFrame{
+                supportedFrameAtX(event.position.x)});
+        else
+            repaint();
+        return;
+    }
     if (interaction_.preview() && !interaction_.preview()->validTarget) {
         const auto hasTarget = interaction_.preview()->track.isValid();
         interaction_.cancelGesture();

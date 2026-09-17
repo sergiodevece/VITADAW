@@ -1,4 +1,4 @@
-# VitaDAW 0.6.5 — Arrange Editing II
+# VitaDAW 0.6.6 — Arrange Foundation Completion
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -301,6 +301,22 @@ acción de historial. Duplicate desplaza el bloque por su ancho temporal total,
 incluidos huecos, y devuelve sus nuevos IDs monotónicos para seleccionar el
 resultado. El orden del array de pistas conserva el reorder en Save/Load sin
 cambiar schema v3 ni el orden DSP independiente por `TrackId`.
+
+VitaDAW 0.6.6 completa la base del arrange con una Time Selection half-open
+efímera y Snap de interacción desactivado por defecto. El ruler conserva click
+como Seek y usa drag para seleccionar tiempo; la selección sobrevive a edición y
+Undo/Redo, coexiste con clips/pista activa y se limpia al cargar otro proyecto.
+Snap resuelve en project frames definitivos contra cero, beat, playhead, bordes
+de clips y de Time Selection, con desempate estable e independiente del orden de
+los snapshots. Move, MoveClips y Trim reciben la posición ya resuelta; Split @
+Playhead no cambia.
+
+`Set Loop From Selection` copia start floor/end ceil hacia el comando musical
+existente, conserva la selección, no activa el loop y mantiene su contrato
+Stopped-only y undoable. Time Selection, Snap y previews no entran en
+`ProjectState`, dirty, historial, persistencia ni RT. Un benchmark Release
+opt-in mide mutación, preparación, publicación y transacción sin imponer todavía
+umbrales. El documento permanece en schema v3.
 
 ## Tecnología propuesta
 
@@ -709,6 +725,9 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.6.5 — Arrange Editing II:** reorder de pistas por identidad estable,
   multiselección efímera y Move/Delete/Duplicate múltiples, atómicos y
   undoables con una sola preparación y commit por gesto.
+- **0.6.6 — Arrange Foundation Completion:** Time Selection efímera, Snap
+  portable de beat/frames/edges, copia explícita hacia Loop y primera medición
+  no contractual del coste de rebuild.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -742,4 +761,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.2.md`](docs/validation-0.6.2.md) y
 [`docs/validation-0.6.3.md`](docs/validation-0.6.3.md) y
 [`docs/validation-0.6.4.md`](docs/validation-0.6.4.md) y
-[`docs/validation-0.6.5.md`](docs/validation-0.6.5.md).
+[`docs/validation-0.6.5.md`](docs/validation-0.6.5.md) y
+[`docs/validation-0.6.6.md`](docs/validation-0.6.6.md).

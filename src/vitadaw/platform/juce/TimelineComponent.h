@@ -49,6 +49,10 @@ private:
     void updateScrollBars();
     void setZoom(double, double anchorX);
     void dispatch(std::optional<commands::Command>);
+    [[nodiscard]] std::int64_t snapToleranceFrames() const noexcept;
+    [[nodiscard]] timeline::ProjectFramePosition supportedFrameAtX(
+        float componentX) const noexcept;
+    void updateSelectionActions() noexcept;
     void scrollBarMoved(juce::ScrollBar*, double) override;
 
     commands::ICommandDispatcher& dispatcher_;
@@ -63,6 +67,8 @@ private:
     juce::ScrollBar vertical_{true};
     juce::TextButton zoomOut_{"-"}, zoomIn_{"+"};
     juce::TextButton split_{"Split @ Playhead"}, duplicate_{"Duplicate"}, delete_{"Delete"};
+    juce::ToggleButton snap_{"Snap: Beat"};
+    juce::TextButton setLoopFromSelection_{"Set Loop From Selection"};
     juce::ComboBox rulerMode_;
 };
 

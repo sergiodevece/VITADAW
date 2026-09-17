@@ -1,6 +1,7 @@
 #include "vitadaw/ui/timeline/TimelineModel.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -14,6 +15,20 @@ std::string clipLabel(const project::ProjectState& project, media::SourceId id) 
                            : source->media.originalPath;
     const auto filename = path.filename().string();
     return filename.empty() ? "Source " + std::to_string(id.value) : filename;
+}
+
+::vitadaw::timeline::ProjectFramePosition supportedFrame(
+    ::vitadaw::timeline::ProjectFramePosition frame) noexcept {
+    return {std::clamp(frame.value, std::int64_t{},
+        ::vitadaw::timeline::maximumSupportedProjectFrame().value)};
+}
+
+std::uint64_t frameDistance(
+    ::vitadaw::timeline::ProjectFramePosition a,
+    ::vitadaw::timeline::ProjectFramePosition b) noexcept {
+    return a.value >= b.value
+        ? static_cast<std::uint64_t>(a.value - b.value)
+        : static_cast<std::uint64_t>(b.value - a.value);
 }
 }
 
@@ -86,6 +101,65 @@ void CoordinateTransform::zoomAround(double newPixelsPerSecond, double anchorX) 
     setVisibleStartSeconds(anchorSeconds - anchorX / pixelsPerSecond_);
 }
 
+SnapResult SnapPolicy::resolve(
+    ::vitadaw::timeline::ProjectFramePosition raw,
+    std::int64_t toleranceFrames, bool enabled,
+    std::span<const SnapTarget> structuralTargets,
+    const musical::PreparedMusicalTimeMap* musicalTime) noexcept {
+    raw = supportedFrame(raw);
+    if (!enabled || toleranceFrames < 0) return {raw, {}};
+
+    std::optional<SnapTarget> best;
+    auto consider = [&](SnapTarget candidate) noexcept {
+        if (!::vitadaw::timeline::isSupportedProjectFramePosition(candidate.frame))
+            return;
+        const auto distance = frameDistance(raw, candidate.frame);
+        if (distance > static_cast<std::uint64_t>(toleranceFrames)) return;
+        if (!best) {
+            best = candidate;
+            return;
+        }
+        const auto bestDistance = frameDistance(raw, best->frame);
+        if (distance < bestDistance ||
+            (distance == bestDistance &&
+             (candidate.kind < best->kind ||
+              (candidate.kind == best->kind &&
+               candidate.frame.value < best->frame.value)))) {
+            best = candidate;
+        }
+    };
+    for (const auto target : structuralTargets) consider(target);
+
+    if (musicalTime != nullptr) {
+        const auto maximum = ::vitadaw::timeline::maximumSupportedProjectFrame().value;
+        const auto start = raw.value > toleranceFrames
+            ? raw.value - toleranceFrames : std::int64_t{};
+        const auto end = raw.value > maximum - toleranceFrames
+            ? maximum : raw.value + toleranceFrames;
+        std::array<musical::GridLine, 128> lines;
+        auto next = ::vitadaw::timeline::PreciseProjectFramePosition{
+            static_cast<double>(start)};
+        const auto exclusiveEnd = ::vitadaw::timeline::PreciseProjectFramePosition{
+            static_cast<double>(end) + 1.0};
+        for (;;) {
+            const auto grid = musicalTime->enumerateGridLines(
+                next, exclusiveEnd,
+                {musical::GridKind::beats, 1}, lines);
+            if (grid.error != musical::Error::none) break;
+            for (std::size_t index = 0; index < grid.count; ++index) {
+                const auto tick = musicalTime->tickAt(lines[index].position);
+                if (!tick) continue;
+                const auto frame = musicalTime->projectFrameAt(
+                    tick.value, musical::Rounding::nearest);
+                if (frame) consider({frame.value, SnapTargetKind::beatGrid});
+            }
+            if (!grid.hasMore || grid.count == 0) break;
+            next = grid.nextStart;
+        }
+    }
+    return best ? SnapResult{best->frame, best->kind} : SnapResult{raw, {}};
+}
+
 const ClipSnapshot* TimelineInteraction::find(const TimelineSnapshot& snapshot,
                                                clips::ClipId id) noexcept {
     for (const auto& track : snapshot.tracks)
@@ -98,6 +172,96 @@ void TimelineInteraction::select(std::optional<clips::ClipId> clip) noexcept {
     if (clip) selection_.push_back(*clip);
     if (!clip) selectedTrack_.reset();
     cancelGesture();
+}
+void TimelineInteraction::clearTimeSelection() noexcept {
+    timeSelection_.reset();
+    timeSelectionAnchor_.reset();
+}
+void TimelineInteraction::prepareSnapTargets(const TimelineSnapshot& snapshot,
+                                             bool excludeSelectedClips) {
+    snapTargets_.clear();
+    snapTargets_.push_back({{}, SnapTargetKind::frameZero});
+    if (::vitadaw::timeline::isSupportedProjectFramePosition(
+            snapshot.transportPosition)) {
+        snapTargets_.push_back(
+            {snapshot.transportPosition, SnapTargetKind::playhead});
+    }
+    if (timeSelection_) {
+        snapTargets_.push_back(
+            {timeSelection_->startFrame, SnapTargetKind::timeSelectionEdge});
+        snapTargets_.push_back(
+            {timeSelection_->exclusiveEndFrame,
+             SnapTargetKind::timeSelectionEdge});
+    }
+    for (const auto& track : snapshot.tracks) {
+        for (const auto& clip : track.clips) {
+            if (excludeSelectedClips && isSelected(clip.id)) continue;
+            if (::vitadaw::timeline::isSupportedProjectFramePosition(
+                    clip.projectStart)) {
+                snapTargets_.push_back(
+                    {clip.projectStart, SnapTargetKind::clipEdge});
+            }
+            const auto end = ::vitadaw::timeline::checkedExclusiveProjectEnd(
+                clip.projectStart, clip.duration);
+            if (end && ::vitadaw::timeline::isSupportedProjectFramePosition(*end))
+                snapTargets_.push_back({*end, SnapTargetKind::clipEdge});
+        }
+    }
+}
+::vitadaw::timeline::ProjectFramePosition TimelineInteraction::snapped(
+    ::vitadaw::timeline::ProjectFramePosition raw,
+    const musical::PreparedMusicalTimeMap& musicalTime,
+    std::int64_t toleranceFrames) const noexcept {
+    return SnapPolicy::resolve(raw, toleranceFrames, snapEnabled_, snapTargets_,
+                               &musicalTime).frame;
+}
+void TimelineInteraction::beginTimeSelection(
+    ::vitadaw::timeline::ProjectFramePosition anchor,
+    const TimelineSnapshot& snapshot,
+    const musical::PreparedMusicalTimeMap& musicalTime,
+    std::int64_t snapToleranceFrames) {
+    cancelGesture();
+    prepareSnapTargets(snapshot, false);
+    timeSelectionAnchor_ = snapped(supportedFrame(anchor), musicalTime,
+                                   snapToleranceFrames);
+}
+void TimelineInteraction::updateTimeSelection(
+    ::vitadaw::timeline::ProjectFramePosition current,
+    const musical::PreparedMusicalTimeMap& musicalTime,
+    std::int64_t snapToleranceFrames) noexcept {
+    if (!timeSelectionAnchor_) return;
+    current = snapped(supportedFrame(current), musicalTime,
+                      snapToleranceFrames);
+    const auto start = std::min(timeSelectionAnchor_->value, current.value);
+    const auto end = std::max(timeSelectionAnchor_->value, current.value);
+    if (start == end) timeSelection_.reset();
+    else timeSelection_ = TimeSelection{{start}, {end}};
+}
+bool TimelineInteraction::endTimeSelection() noexcept {
+    const auto result = timeSelection_.has_value();
+    timeSelectionAnchor_.reset();
+    snapTargets_.clear();
+    if (!result) timeSelection_.reset();
+    return result;
+}
+std::optional<commands::Command>
+TimelineInteraction::setLoopFromTimeSelectionCommand(
+    const musical::PreparedMusicalTimeMap& musicalTime) const noexcept {
+    if (!timeSelection_ || !timeSelection_->isValid()) return {};
+    const auto start = musicalTime.absoluteTickAt(timeSelection_->startFrame);
+    auto end = musicalTime.absoluteTickAt(timeSelection_->exclusiveEndFrame);
+    if (!start || !end) return {};
+    const auto exactEnd = musicalTime.exactProjectFrameAtTick(end.value);
+    if (!exactEnd) return {};
+    const audio::exact::Position selectionEnd{
+        timeSelection_->exclusiveEndFrame.value, {}};
+    if (audio::exact::comparePositions(exactEnd.value, selectionEnd) < 0) {
+        if (end.value.value == musical::maximumCoordinate) return {};
+        ++end.value.value;
+    }
+    const musical::MusicalLoopRange range{start.value, end.value};
+    if (!range.isStructurallyValid()) return {};
+    return commands::SetLoopRangeMusical{range.start, range.end};
 }
 void TimelineInteraction::selectClips(std::span<const clips::ClipId> clips) {
     selection_.assign(clips.begin(), clips.end());
@@ -170,11 +334,20 @@ bool TimelineInteraction::beginGesture(GestureKind kind,
     previews_.assign(1, original_);
     return true;
 }
+bool TimelineInteraction::beginGesture(GestureKind kind,
+                                       const TimelineSnapshot& snapshot,
+                                       const TrackSnapshot& track,
+                                       const ClipSnapshot& clip,
+                                       double pointerX) {
+    if (!beginGesture(kind, track, clip, pointerX)) return false;
+    prepareSnapTargets(snapshot);
+    return true;
+}
 bool TimelineInteraction::beginMoveGesture(
     const TimelineSnapshot& snapshot, const TrackSnapshot& track,
     const ClipSnapshot& clip, double pointerX) {
     if (!isSelected(clip.id) || selection_.size() <= 1) {
-        return beginGesture(GestureKind::move, track, clip, pointerX);
+        return beginGesture(GestureKind::move, snapshot, track, clip, pointerX);
     }
     if (!std::isfinite(pointerX)) return false;
     gesture_ = GestureKind::move;
@@ -205,6 +378,7 @@ bool TimelineInteraction::beginMoveGesture(
     original_ = *leader;
     selectedTrack_ = track.id;
     pointerOriginX_ = pointerX;
+    prepareSnapTargets(snapshot);
     return true;
 }
 void TimelineInteraction::updateGesture(double pointerX,
@@ -275,6 +449,64 @@ void TimelineInteraction::updateGesture(
     preview.track = found->id;
     preview.validTarget = found->layout == originalLayout_;
 }
+void TimelineInteraction::updateGesture(
+    double pointerX, const CoordinateTransform& transform,
+    const TimelineSnapshot& snapshot,
+    std::optional<tracks::TrackId> targetTrack,
+    const musical::PreparedMusicalTimeMap& musicalTime,
+    std::int64_t snapToleranceFrames) noexcept {
+    updateGesture(pointerX, transform, snapshot, targetTrack);
+    if (!snapEnabled_ || previews_.empty() || gesture_ == GestureKind::none)
+        return;
+    const auto origin = transform.xToProjectFrame(pointerOriginX_);
+    const auto current = transform.xToProjectFrame(pointerX);
+    const auto delta = static_cast<long double>(current.value) -
+                       static_cast<long double>(origin.value);
+    if (gesture_ == GestureKind::move) {
+        const auto raw = supportedFrame({static_cast<std::int64_t>(std::clamp(
+            static_cast<long double>(original_.projectStart.value) + delta,
+            static_cast<long double>(0),
+            static_cast<long double>(
+                ::vitadaw::timeline::maximumSupportedProjectFrame().value)))});
+        const auto target = snapped(raw, musicalTime, snapToleranceFrames);
+        auto minimumDelta = std::int64_t{std::numeric_limits<std::int64_t>::min()};
+        auto maximumDelta = std::int64_t{std::numeric_limits<std::int64_t>::max()};
+        for (const auto& original : originals_) {
+            minimumDelta = std::max(minimumDelta, -original.projectStart.value);
+            maximumDelta = std::min(maximumDelta,
+                ::vitadaw::timeline::maximumSupportedProjectFrame().value -
+                    original.projectStart.value);
+        }
+        const auto applied = std::clamp(
+            target.value - original_.projectStart.value,
+            minimumDelta, maximumDelta);
+        for (std::size_t index = 0; index < previews_.size(); ++index) {
+            previews_[index].projectStart = {
+                originals_[index].projectStart.value + applied};
+        }
+    } else if (gesture_ == GestureKind::trimLeft) {
+        const auto target = snapped(previews_.front().projectStart, musicalTime,
+                                    snapToleranceFrames);
+        const auto end = static_cast<double>(original_.projectStart.value) +
+                         original_.duration.value;
+        if (static_cast<double>(target.value) < end) {
+            previews_.front().projectStart = target;
+            previews_.front().duration.value = end - target.value;
+            previews_.front().sourceOffset.value = original_.sourceOffset.value +
+                static_cast<double>(target.value - original_.projectStart.value) *
+                    originalSourceFramesPerProjectFrame_;
+        }
+    } else if (gesture_ == GestureKind::trimRight) {
+        const auto rawEnd = ::vitadaw::timeline::checkedExclusiveProjectEnd(
+            original_.projectStart, previews_.front().duration);
+        if (rawEnd) {
+            const auto target = snapped(*rawEnd, musicalTime, snapToleranceFrames);
+            if (target.value > original_.projectStart.value)
+                previews_.front().duration.value = static_cast<double>(
+                    target.value - original_.projectStart.value);
+        }
+    }
+}
 
 std::optional<tracks::TrackId> TimelineInteraction::trackAtVerticalPosition(
     const TimelineSnapshot& snapshot, double pointerY,
@@ -319,6 +551,7 @@ void TimelineInteraction::cancelGesture() noexcept {
     gesture_ = GestureKind::none;
     originals_.clear();
     previews_.clear();
+    snapTargets_.clear();
 }
 const ClipPreview* TimelineInteraction::previewFor(clips::ClipId clip) const noexcept {
     const auto found = std::find_if(

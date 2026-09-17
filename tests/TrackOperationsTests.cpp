@@ -503,6 +503,18 @@ void arrangeEditingIIBatchOperations() {
                   {999}, {1}, commands::TrackPlacement::before}).error ==
                   commands::CommandError::trackNotFound,
           "reorder self is a no-op and missing TrackId is rejected");
+    for (int cycle = 0; cycle < 4; ++cycle) {
+        accepted(commands::ReorderAudioTrack{
+            {2}, {3}, commands::TrackPlacement::after});
+        accepted(commands::ReorderAudioTrack{
+            {2}, {3}, commands::TrackPlacement::before});
+    }
+    check(app.project().tracks()[0].id == tracks::TrackId{2} &&
+              app.project().tracks()[1].id == tracks::TrackId{3} &&
+              app.project().tracks()[2].id == tracks::TrackId{1} &&
+              app.project().routing().findTrackRoute({1}) != nullptr &&
+              app.project().routing().findTrackRoute({2}) != nullptr,
+          "repeated reorder returns to exact documentary order and preserves routing IDs");
 
     const auto preparationsBeforeMove = engine.preparations;
     const auto commitsBeforeMove = engine.commits;

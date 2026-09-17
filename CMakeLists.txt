@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.6.5 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.6.6 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -13,6 +13,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
 option(VITADAW_FETCH_JUCE "Download the pinned JUCE version when it is not installed" ON)
+option(VITADAW_BUILD_BENCHMARKS "Build VitaDAW non-gating benchmarks" OFF)
 
 add_library(vitadaw_core
     src/vitadaw/application/DawApplication.cpp
@@ -101,6 +102,12 @@ if(VITADAW_BUILD_APP)
     else()
         target_compile_options(vitadaw_app PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+endif()
+
+if(VITADAW_BUILD_BENCHMARKS)
+    add_executable(vitadaw_arrange_rebuild_benchmarks
+        tests/ArrangeRebuildBenchmarks.cpp)
+    target_link_libraries(vitadaw_arrange_rebuild_benchmarks PRIVATE vitadaw_core)
 endif()
 
 if(VITADAW_BUILD_TESTS)

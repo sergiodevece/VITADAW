@@ -92,6 +92,49 @@ private:
     double visibleStartSeconds_{};
 };
 
+struct TimeSelection {
+    ::vitadaw::timeline::ProjectFramePosition startFrame;
+    ::vitadaw::timeline::ProjectFramePosition exclusiveEndFrame;
+
+    [[nodiscard]] constexpr bool isValid() const noexcept {
+        return ::vitadaw::timeline::isSupportedProjectFramePosition(startFrame) &&
+               ::vitadaw::timeline::isSupportedProjectFramePosition(exclusiveEndFrame) &&
+               startFrame.value < exclusiveEndFrame.value;
+    }
+    bool operator==(const TimeSelection&) const = default;
+};
+
+// The numeric values are the complete, stable tie-break order. Structural
+// arrange anchors win ties before transport, origin and musical grid.
+enum class SnapTargetKind : unsigned {
+    clipEdge = 0,
+    timeSelectionEdge = 1,
+    playhead = 2,
+    frameZero = 3,
+    beatGrid = 4,
+};
+
+struct SnapTarget {
+    ::vitadaw::timeline::ProjectFramePosition frame;
+    SnapTargetKind kind{SnapTargetKind::beatGrid};
+    bool operator==(const SnapTarget&) const = default;
+};
+
+struct SnapResult {
+    ::vitadaw::timeline::ProjectFramePosition frame;
+    std::optional<SnapTargetKind> target;
+    bool operator==(const SnapResult&) const = default;
+};
+
+class SnapPolicy {
+public:
+    [[nodiscard]] static SnapResult resolve(
+        ::vitadaw::timeline::ProjectFramePosition raw,
+        std::int64_t toleranceFrames, bool enabled,
+        std::span<const SnapTarget> structuralTargets,
+        const musical::PreparedMusicalTimeMap* musicalTime = nullptr) noexcept;
+};
+
 enum class GestureKind { none, move, trimLeft, trimRight };
 
 struct ClipPreview {
@@ -118,6 +161,28 @@ public:
     [[nodiscard]] std::optional<tracks::TrackId> selectedTrack() const noexcept {
         return selectedTrack_;
     }
+    [[nodiscard]] const std::optional<TimeSelection>& timeSelection() const noexcept {
+        return timeSelection_;
+    }
+    [[nodiscard]] bool timeSelectionGestureActive() const noexcept {
+        return timeSelectionAnchor_.has_value();
+    }
+    [[nodiscard]] bool snapEnabled() const noexcept { return snapEnabled_; }
+    void setSnapEnabled(bool enabled) noexcept { snapEnabled_ = enabled; }
+    void clearTimeSelection() noexcept;
+    void beginTimeSelection(
+        ::vitadaw::timeline::ProjectFramePosition anchor,
+        const TimelineSnapshot& snapshot,
+        const musical::PreparedMusicalTimeMap& musicalTime,
+        std::int64_t snapToleranceFrames);
+    void updateTimeSelection(
+        ::vitadaw::timeline::ProjectFramePosition current,
+        const musical::PreparedMusicalTimeMap& musicalTime,
+        std::int64_t snapToleranceFrames) noexcept;
+    [[nodiscard]] bool endTimeSelection() noexcept;
+    [[nodiscard]] std::optional<commands::Command>
+        setLoopFromTimeSelectionCommand(
+            const musical::PreparedMusicalTimeMap& musicalTime) const noexcept;
     [[nodiscard]] const ClipPreview* previewFor(clips::ClipId clip) const noexcept;
     [[nodiscard]] const ClipPreview* preview() const noexcept {
         return previews_.empty() ? nullptr : &previews_.front();
@@ -134,6 +199,11 @@ public:
                                     const TrackSnapshot& track,
                                     const ClipSnapshot& clip,
                                     double pointerX) noexcept;
+    [[nodiscard]] bool beginGesture(GestureKind kind,
+                                    const TimelineSnapshot& snapshot,
+                                    const TrackSnapshot& track,
+                                    const ClipSnapshot& clip,
+                                    double pointerX);
     [[nodiscard]] bool beginMoveGesture(
         const TimelineSnapshot& snapshot, const TrackSnapshot& track,
         const ClipSnapshot& clip, double pointerX);
@@ -141,6 +211,11 @@ public:
     void updateGesture(double pointerX, const CoordinateTransform& transform,
                        const TimelineSnapshot& snapshot,
                        std::optional<tracks::TrackId> targetTrack) noexcept;
+    void updateGesture(double pointerX, const CoordinateTransform& transform,
+                       const TimelineSnapshot& snapshot,
+                       std::optional<tracks::TrackId> targetTrack,
+                       const musical::PreparedMusicalTimeMap& musicalTime,
+                       std::int64_t snapToleranceFrames) noexcept;
     [[nodiscard]] static std::optional<tracks::TrackId> trackAtVerticalPosition(
         const TimelineSnapshot& snapshot, double pointerY,
         double contentTop, double laneHeight, double verticalOffset) noexcept;
@@ -156,8 +231,18 @@ public:
 private:
     [[nodiscard]] static const ClipSnapshot* find(
         const TimelineSnapshot&, clips::ClipId) noexcept;
+    void prepareSnapTargets(const TimelineSnapshot& snapshot,
+                            bool excludeSelectedClips = true);
+    [[nodiscard]] ::vitadaw::timeline::ProjectFramePosition snapped(
+        ::vitadaw::timeline::ProjectFramePosition raw,
+        const musical::PreparedMusicalTimeMap& musicalTime,
+        std::int64_t toleranceFrames) const noexcept;
     std::vector<clips::ClipId> selection_;
     std::optional<tracks::TrackId> selectedTrack_;
+    std::optional<TimeSelection> timeSelection_;
+    std::optional<::vitadaw::timeline::ProjectFramePosition> timeSelectionAnchor_;
+    std::vector<SnapTarget> snapTargets_;
+    bool snapEnabled_{};
     GestureKind gesture_{GestureKind::none};
     ClipPreview original_{};
     std::vector<ClipPreview> originals_;

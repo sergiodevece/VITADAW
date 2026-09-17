@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <array>
 
 namespace {
 using namespace vitadaw;
@@ -318,6 +319,242 @@ void multipleSelectionTests() {
           "toggle removes every selected ClipId without conflating track context");
 }
 
+std::unique_ptr<const musical::PreparedMusicalTimeMap> preparedMusicalTime() {
+    auto prepared = musical::PreparedMusicalTimeMap::compile(
+        musical::MusicalTimeMap{}, timeline::SampleRate{48000.0});
+    check(static_cast<bool>(prepared), "default musical map prepares");
+    return std::move(prepared.value);
+}
+
+void timeSelectionTests() {
+    const auto map = preparedMusicalTime();
+    const auto snapshot = makeTimelineSnapshot(oneClipProject(), 1);
+    TimelineInteraction interaction;
+    interaction.selectClip(snapshot.tracks[0].id,
+                           snapshot.tracks[0].clips[0].id);
+
+    interaction.beginTimeSelection({96000}, snapshot, *map, 0);
+    interaction.updateTimeSelection({48000}, *map, 0);
+    check(interaction.timeSelection() == TimeSelection{{48000}, {96000}} &&
+              interaction.endTimeSelection(),
+          "reverse ruler drag normalizes a half-open time selection");
+    check(interaction.selection() == snapshot.tracks[0].clips[0].id &&
+              interaction.selectedTrack() == snapshot.tracks[0].id,
+          "time and clip selections coexist with the active track");
+
+    interaction.reconcile(snapshot);
+    check(interaction.timeSelection() == TimeSelection{{48000}, {96000}},
+          "ordinary refresh preserves time selection");
+    CoordinateTransform transformed{snapshot.projectSampleRate, 100.0, 0.0};
+    transformed.zoomAround(400.0, 200.0);
+    transformed.setVisibleStartSeconds(12.0);
+    check(interaction.timeSelection() == TimeSelection{{48000}, {96000}},
+          "zoom and scroll cannot mutate frame-authoritative time selection");
+    interaction.beginTimeSelection({1234}, snapshot, *map, 0);
+    interaction.updateTimeSelection({1234}, *map, 0);
+    check(!interaction.endTimeSelection() && !interaction.timeSelection(),
+          "an empty ruler gesture stores no time selection");
+
+    const auto maximum = timeline::maximumSupportedProjectFrame();
+    interaction.beginTimeSelection({maximum.value - 1}, snapshot, *map, 0);
+    interaction.updateTimeSelection({std::numeric_limits<std::int64_t>::max()},
+                                    *map, 0);
+    check(interaction.endTimeSelection() &&
+              interaction.timeSelection() ==
+                  TimeSelection{{maximum.value - 1}, maximum},
+          "time selection clamps to the certified project-frame domain");
+    interaction.clearTimeSelection();
+    check(!interaction.timeSelection(), "explicit project replacement clears time selection");
+}
+
+void snapPolicyTests() {
+    const auto map = preparedMusicalTime();
+    const std::array<SnapTarget, 4> targets{{
+        {{110}, SnapTargetKind::playhead},
+        {{90}, SnapTargetKind::clipEdge},
+        {{110}, SnapTargetKind::clipEdge},
+        {{90}, SnapTargetKind::timeSelectionEdge},
+    }};
+    auto reversed = targets;
+    std::reverse(reversed.begin(), reversed.end());
+    const auto first = SnapPolicy::resolve({100}, 20, true, targets);
+    const auto second = SnapPolicy::resolve({100}, 20, true, reversed);
+    check(first == SnapResult{{90}, SnapTargetKind::clipEdge} && first == second,
+          "snap ties use stable target priority then the lower frame");
+    check(SnapPolicy::resolve({100}, 20, false, targets) == SnapResult{{100}, {}},
+          "disabled snap preserves the raw frame");
+    const std::array zeroTarget{
+        SnapTarget{{0}, SnapTargetKind::frameZero}};
+    check(SnapPolicy::resolve({0}, 20, true, zeroTarget) ==
+              SnapResult{{0}, SnapTargetKind::frameZero} &&
+              SnapPolicy::resolve({9}, 20, true, zeroTarget) ==
+                  SnapResult{{0}, SnapTargetKind::frameZero},
+          "snap handles exact targets and frame zero");
+    check(SnapPolicy::resolve({23990}, 20, true, {}, map.get()) ==
+              SnapResult{{24000}, SnapTargetKind::beatGrid},
+          "fixed one-beat musical snap uses the exact prepared map");
+    check(SnapPolicy::resolve(
+              {std::numeric_limits<std::int64_t>::max()}, 0, false, {}) ==
+              SnapResult{timeline::maximumSupportedProjectFrame(), {}},
+          "snap output is always inside the certified frame domain");
+    CoordinateTransform zoom100{timeline::SampleRate{48000}, 100.0, 0.0};
+    CoordinateTransform zoom200{timeline::SampleRate{48000}, 200.0, 0.0};
+    const std::array edge{
+        SnapTarget{{48000}, SnapTargetKind::clipEdge}};
+    const auto raw100 = zoom100.xToProjectFrame(
+        zoom100.projectFrameToX({47990}));
+    const auto raw200 = zoom200.xToProjectFrame(
+        zoom200.projectFrameToX({47990}));
+    check(SnapPolicy::resolve(raw100, 3840, true, edge).frame.value == 48000 &&
+              SnapPolicy::resolve(raw200, 1920, true, edge).frame.value == 48000,
+          "zoom changes only visual tolerance, not the exact snap target");
+}
+
+void timeSelectionFrozenSnapTargetTests() {
+    const auto map = preparedMusicalTime();
+    project::ProjectState project{timeline::SampleRate{48000.0}, "Snap targets"};
+    auto ordered = makeTimelineSnapshot(project, 1);
+    ordered.tracks = {TrackSnapshot{
+        {1}, "Equivalent targets", media::AudioChannelLayout::mono,
+        {ClipSnapshot{{1}, {1}, {1000}, {1000.0}, {0}, 1.0, "first"},
+         ClipSnapshot{{2}, {1}, {1000}, {1000.0}, {0}, 1.0, "second"}}}};
+    auto reversed = ordered;
+    std::reverse(reversed.tracks.front().clips.begin(),
+                 reversed.tracks.front().clips.end());
+
+    auto seedSelection = [&](TimelineInteraction& interaction,
+                             const TimelineSnapshot& snapshot) {
+        interaction.setSnapEnabled(true);
+        interaction.beginTimeSelection({1000}, snapshot, *map, 0);
+        interaction.updateTimeSelection({2000}, *map, 0);
+        check(interaction.endTimeSelection() &&
+                  interaction.timeSelection() == TimeSelection{{1000}, {2000}},
+              "time-selection snap fixture stores the original range");
+    };
+
+    TimelineInteraction interaction;
+    seedSelection(interaction, ordered);
+    interaction.beginTimeSelection({1007}, ordered, *map, 10);
+    interaction.updateTimeSelection({1500}, *map, 10);
+    check(interaction.timeSelection() == TimeSelection{{1000}, {1500}},
+          "a replacement gesture snaps its anchor to the previous selection");
+    interaction.updateTimeSelection({1503}, *map, 10);
+    check(interaction.timeSelection() == TimeSelection{{1000}, {1503}},
+          "the new preview is never reinjected as a snap target");
+    interaction.updateTimeSelection({1993}, *map, 10);
+    const auto snappedToPreviousEnd = interaction.timeSelection();
+    interaction.updateTimeSelection({1993}, *map, 10);
+    check(snappedToPreviousEnd == TimeSelection{{1000}, {2000}} &&
+              interaction.timeSelection() == snappedToPreviousEnd &&
+              interaction.endTimeSelection(),
+          "frozen previous-selection targets replace deterministically without drift");
+
+    interaction.beginTimeSelection({3000}, ordered, *map, 10);
+    interaction.updateTimeSelection({4000}, *map, 10);
+    check(interaction.timeSelection() == TimeSelection{{3000}, {4000}} &&
+              interaction.endTimeSelection(),
+          "a replacement outside tolerance preserves its raw frames");
+
+    TimelineInteraction permuted;
+    seedSelection(permuted, reversed);
+    permuted.beginTimeSelection({1007}, reversed, *map, 10);
+    permuted.updateTimeSelection({1993}, *map, 10);
+    check(permuted.timeSelection() == TimeSelection{{1000}, {2000}} &&
+              permuted.endTimeSelection(),
+          "equivalent target ordering cannot change replacement snapping");
+}
+
+void snappedGestureTests() {
+    auto project = oneClipProject();
+    const auto source = project.sources().front().id;
+    static_cast<void>(project.addClip(project.tracks()[0].id, source,
+                                     {288000}, {48000}, {0}));
+    const auto snapshot = makeTimelineSnapshot(project, 1);
+    const auto map = preparedMusicalTime();
+    CoordinateTransform transform{snapshot.projectSampleRate, 100.0, 0.0};
+    TimelineInteraction interaction;
+    interaction.setSnapEnabled(true);
+    const auto& leader = snapshot.tracks[0].clips[0];
+    check(interaction.beginMoveGesture(snapshot, snapshot.tracks[0], leader,
+                                       100.0),
+          "snapped move begins from original snapshot");
+    interaction.updateGesture(601.0, transform, snapshot,
+                              snapshot.tracks[0].id, *map, 1000);
+    const auto firstPreview = interaction.preview()->projectStart;
+    interaction.updateGesture(601.0, transform, snapshot,
+                              snapshot.tracks[0].id, *map, 1000);
+    check(firstPreview == timeline::ProjectFramePosition{288000} &&
+              interaction.preview()->projectStart == firstPreview,
+          "clip edge snapping excludes the moving clip and never accumulates error");
+    const auto command = interaction.endGesture();
+    check(command && std::get<commands::MoveClip>(*command).projectStart == firstPreview,
+          "the final MoveClip receives the resolved exact frame");
+
+    const auto second = snapshot.tracks[0].clips[1].id;
+    const std::array group{leader.id, second};
+    interaction.selectClips(group);
+    check(interaction.beginMoveGesture(snapshot, snapshot.tracks[0], leader,
+                                       100.0),
+          "snapped group move begins from original members");
+    interaction.updateGesture(149.98, transform, snapshot,
+                              snapshot.tracks[0].id, *map, 100);
+    const auto groupCommand = interaction.endGesture();
+    check(groupCommand &&
+              std::get<commands::MoveClips>(*groupCommand).deltaFrames == 24000,
+          "MoveClips snaps its leader once and preserves one shared delta");
+
+    interaction.selectClip(snapshot.tracks[0].id, leader.id);
+    check(interaction.beginGesture(GestureKind::trimLeft, snapshot,
+                                   snapshot.tracks[0], leader, 100.0),
+          "snapped left trim begins");
+    interaction.updateGesture(150.02, transform, snapshot,
+                              snapshot.tracks[0].id, *map, 100);
+    const auto left = interaction.endGesture();
+    check(left && std::get<commands::TrimClipLeft>(*left).projectStart.value == 72000,
+          "Trim Left snaps only its moving edge");
+    check(interaction.beginGesture(GestureKind::trimRight, snapshot,
+                                   snapshot.tracks[0], leader, 100.0),
+          "snapped right trim begins");
+    interaction.updateGesture(50.02, transform, snapshot,
+                              snapshot.tracks[0].id, *map, 100);
+    const auto right = interaction.endGesture();
+    check(right && std::get<commands::TrimClipRight>(*right).projectEnd.value == 216000,
+          "Trim Right snaps only its moving exclusive edge");
+
+    interaction.selectClip(snapshot.tracks[0].id, leader.id);
+    interaction.beginTimeSelection({287500}, snapshot, *map, 1000);
+    interaction.updateTimeSelection({239500}, *map, 1000);
+    check(interaction.endTimeSelection() &&
+              interaction.timeSelection() == TimeSelection{{240000}, {288000}},
+          "time selection snaps to clip edges even when a clip is selected");
+}
+
+void loopFromTimeSelectionTests() {
+    const auto map = preparedMusicalTime();
+    const auto snapshot = makeTimelineSnapshot(oneClipProject(), 1);
+    TimelineInteraction interaction;
+    interaction.beginTimeSelection({24001}, snapshot, *map, 0);
+    interaction.updateTimeSelection({71999}, *map, 0);
+    check(interaction.endTimeSelection(), "loop source time selection exists");
+    const auto command = interaction.setLoopFromTimeSelectionCommand(*map);
+    check(command.has_value(), "valid time selection converts to a loop command");
+    const auto loop = std::get<commands::SetLoopRangeMusical>(*command);
+    const auto exactStart = map->exactProjectFrameAtTick(loop.start);
+    const auto exactEnd = map->exactProjectFrameAtTick(loop.end);
+    check(exactStart && exactEnd &&
+              audio::exact::comparePositions(exactStart.value, {24001, {}}) <= 0 &&
+              audio::exact::comparePositions(exactEnd.value, {71999, {}}) >= 0 &&
+              interaction.timeSelection() == TimeSelection{{24001}, {71999}},
+          "floor/ceil tick conversion contains and preserves time selection");
+
+    TimelineInteraction tooShort;
+    tooShort.beginTimeSelection({1000}, snapshot, *map, 0);
+    tooShort.updateTimeSelection({1001}, *map, 0);
+    check(tooShort.endTimeSelection() &&
+              !tooShort.setLoopFromTimeSelectionCommand(*map),
+          "a structurally too-short loop is rejected before dispatch");
+}
+
 void largeSessionTest() {
     project::ProjectState project{timeline::SampleRate{48000.0}, "Large UI"};
     for (int index = 0; index < 64; ++index)
@@ -332,7 +569,11 @@ void largeSessionTest() {
     }
     const auto snapshot = makeTimelineSnapshot(project, 99);
     std::size_t clips{};
+    std::vector<clips::ClipId> allClips;
+    allClips.reserve(1000);
     for (const auto& track : snapshot.tracks) clips += track.clips.size();
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips) allClips.push_back(clip.id);
     check(snapshot.tracks.size() == 64 && clips == 1000,
           "64-track/1000-clip read model must build without GUI components");
     TimelineInteraction interaction;
@@ -341,6 +582,15 @@ void largeSessionTest() {
     CoordinateTransform transform{snapshot.projectSampleRate, 20.0, 100.0};
     check(transform.isValid() && interaction.selection() == selected,
           "large-session selection, scroll and zoom remain ID-based and bounded");
+    interaction.selectClips(allClips);
+    interaction.setSnapEnabled(true);
+    const auto map = preparedMusicalTime();
+    interaction.beginTimeSelection({1}, snapshot, *map, 8);
+    interaction.updateTimeSelection({47999}, *map, 8);
+    check(interaction.endTimeSelection() &&
+              interaction.selections().size() == 1000 &&
+              interaction.timeSelection().has_value(),
+          "large multi-selection coexists with snapped time selection");
 }
 } // namespace
 
@@ -351,6 +601,11 @@ int main() {
     crossTrackInteractionTests();
     actionsAndRefreshTests();
     multipleSelectionTests();
+    timeSelectionTests();
+    snapPolicyTests();
+    timeSelectionFrozenSnapTargetTests();
+    snappedGestureTests();
+    loopFromTimeSelectionTests();
     largeSessionTest();
     std::cout << "Timeline UI foundation tests passed\n";
 }

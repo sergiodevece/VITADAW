@@ -420,6 +420,74 @@ void check(bool condition, std::string_view message) {
     }
 }
 
+void timeSelectionLoopApplicationTests() {
+    using namespace vitadaw;
+    FakeAudioEngine audio;
+    application::DawApplication app{audio, timeline::SampleRate{48000.0}};
+    commands::CommandDispatcher dispatch{app};
+    ui::timeline::TimelineInteraction interaction;
+    const auto token = app.history().currentStateToken();
+    const auto structuralPreparations = audio.structuralPrepareRequests;
+    const auto musicalRevision = app.musicalRevision();
+    interaction.setSnapEnabled(true);
+    interaction.beginTimeSelection({24001}, app.timelineSnapshot(),
+                                   app.musicalTime(), 0);
+    interaction.updateTimeSelection({71999}, app.musicalTime(), 0);
+    check(interaction.endTimeSelection() &&
+              app.project().tracks().empty() &&
+              app.project().sources().empty() &&
+              !app.project().loopRange() &&
+              app.history().currentStateToken() == token &&
+              !app.session().dirty() &&
+              audio.structuralPrepareRequests == structuralPreparations &&
+              app.musicalRevision() == musicalRevision,
+          "time selection and snap are ephemeral without plan preparation");
+    const auto command = interaction.setLoopFromTimeSelectionCommand(
+        app.musicalTime());
+    check(command.has_value(), "time selection builds existing loop command");
+    const auto result = dispatch.dispatch(*command);
+    check(result.status == commands::CommandStatus::accepted &&
+              app.project().loopRange().has_value() &&
+              app.history().size() == 1 && app.session().dirty() &&
+              interaction.timeSelection() ==
+                  ui::timeline::TimeSelection{{24001}, {71999}} &&
+              !app.loopEnabled(),
+          "Set Loop From Selection is one documentary edit and preserves selection");
+    const auto committedLoop = app.project().loopRange();
+    check(dispatch.dispatch(commands::Undo{}).status ==
+                  commands::CommandStatus::accepted &&
+              !app.project().loopRange() &&
+              dispatch.dispatch(commands::Redo{}).status ==
+                  commands::CommandStatus::accepted &&
+              app.project().loopRange() == committedLoop,
+          "selection-derived loop uses existing Undo/Redo history");
+
+    check(dispatch.dispatch(commands::Pause{}).status ==
+                  commands::CommandStatus::accepted,
+          "loop transport matrix enters Paused");
+    app.synchroniseTransport();
+    const auto pausedToken = app.history().currentStateToken();
+    const auto paused = dispatch.dispatch(*command);
+    check(paused.error == commands::CommandError::transportMustBeStopped &&
+              app.history().currentStateToken() == pausedToken &&
+              app.project().loopRange() == committedLoop,
+          "selection-derived loop remains Stopped-only while Paused");
+    check(dispatch.dispatch(commands::Stop{}).status ==
+                  commands::CommandStatus::accepted,
+          "loop transport matrix stops");
+    app.synchroniseTransport();
+    check(dispatch.dispatch(commands::SetLoopEnabled{true}).status ==
+                  commands::CommandStatus::accepted &&
+              dispatch.dispatch(commands::Play{}).status ==
+                  commands::CommandStatus::accepted,
+          "loop transport matrix enters Playing");
+    app.synchroniseTransport();
+    const auto playing = dispatch.dispatch(*command);
+    check(playing.error == commands::CommandError::transportMustBeStopped &&
+              app.project().loopRange() == committedLoop,
+          "selection-derived loop remains Stopped-only while Playing");
+}
+
 void firstImportRegressionTests() {
     using namespace vitadaw;
     {
@@ -578,6 +646,7 @@ void firstImportRegressionTests() {
 int main() {
     using namespace vitadaw;
     firstImportRegressionTests();
+    timeSelectionLoopApplicationTests();
     FakeAudioEngine audio;
     application::DawApplication app{audio, timeline::SampleRate{48000.0}};
     commands::CommandDispatcher dispatcher{app};
