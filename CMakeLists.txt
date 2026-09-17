@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.6.6 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.7.0 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -23,6 +23,7 @@ add_library(vitadaw_core
     src/vitadaw/audio/AudioDeviceState.cpp
     src/vitadaw/audio/PreparedProcessingPlan.cpp
     src/vitadaw/audio/PreparedTemporalContext.cpp
+    src/vitadaw/audio/RealtimeCapture.cpp
     src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
     src/vitadaw/history/UndoManager.cpp
@@ -70,6 +71,8 @@ if(VITADAW_BUILD_APP)
     juce_add_gui_app(vitadaw_app
         PRODUCT_NAME "VitaDAW"
         VERSION "${PROJECT_VERSION}"
+        MICROPHONE_PERMISSION_ENABLED TRUE
+        MICROPHONE_PERMISSION_TEXT "VitaDAW needs microphone access to record audio."
     )
 
     target_sources(vitadaw_app PRIVATE
@@ -196,6 +199,13 @@ if(VITADAW_BUILD_TESTS)
             add_test(NAME vitadaw_temporal_juce_${case}
                 COMMAND vitadaw_temporal_juce_integration_tests ${case})
         endforeach()
+        add_executable(vitadaw_juce_recording_input_setup_policy_tests
+            tests/JuceRecordingInputSetupPolicyTests.cpp)
+        target_include_directories(vitadaw_juce_recording_input_setup_policy_tests PRIVATE src)
+        target_link_libraries(vitadaw_juce_recording_input_setup_policy_tests PRIVATE
+            juce::juce_audio_devices)
+        add_test(NAME vitadaw_juce_recording_input_setup_policy_tests
+            COMMAND vitadaw_juce_recording_input_setup_policy_tests)
     endif()
     add_executable(vitadaw_undo_redo_tests tests/UndoRedoTests.cpp)
     target_link_libraries(vitadaw_undo_redo_tests PRIVATE vitadaw_core)
@@ -266,6 +276,13 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_realtime_audio_engine_tests tests/RealtimeAudioEngineTests.cpp)
     target_link_libraries(vitadaw_realtime_audio_engine_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_realtime_audio_engine_tests COMMAND vitadaw_realtime_audio_engine_tests)
+
+    add_executable(vitadaw_recording_capture_tests tests/RecordingCaptureTests.cpp)
+    target_link_libraries(vitadaw_recording_capture_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recording_capture_tests COMMAND vitadaw_recording_capture_tests)
+    add_executable(vitadaw_recording_application_tests tests/RecordingApplicationTests.cpp)
+    target_link_libraries(vitadaw_recording_application_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recording_application_tests COMMAND vitadaw_recording_application_tests)
 
     add_executable(vitadaw_audio_preparation_tests tests/AudioPreparationTests.cpp)
     target_link_libraries(vitadaw_audio_preparation_tests PRIVATE vitadaw_core)

@@ -244,6 +244,11 @@ void RealtimeAudioEngine::releasePreparedReferences() noexcept {
 }
 
 void RealtimeAudioEngine::deviceErrorPreservingTransport() noexcept {
+    if (capture_.isActive()) {
+        capture_.fail(RecordingFailure::deviceLost);
+        clock_.stop();
+        clock_.setPlaybackPolicy(std::nullopt, metronomeEnabled_);
+    }
     const auto closure = lifecycleGate_.close(DeviceProcessingState::error);
     resolveCommandsThrough(closure.cancellationWatermark);
     resetProcessors();
@@ -256,6 +261,11 @@ void RealtimeAudioEngine::deviceInitialising() noexcept {
 }
 
 void RealtimeAudioEngine::deviceInitialisingPreservingTransport() noexcept {
+    if (capture_.isActive()) {
+        capture_.fail(RecordingFailure::deviceLost);
+        clock_.stop();
+        clock_.setPlaybackPolicy(std::nullopt, metronomeEnabled_);
+    }
     const auto closure = lifecycleGate_.close(DeviceProcessingState::initializing);
     resolveCommandsThrough(closure.cancellationWatermark);
     resetProcessors();
@@ -285,9 +295,16 @@ DeviceProcessingState RealtimeAudioEngine::deviceState() const noexcept {
 
 void RealtimeAudioEngine::transitionAwayFromOperational(
     DeviceProcessingState state) noexcept {
+    const auto recording = capture_.isActive();
     const auto closure = lifecycleGate_.close(state);
     resolveCommandsThrough(closure.cancellationWatermark);
-    clock_.stopAndRewind();
+    if (recording) {
+        capture_.fail(RecordingFailure::deviceLost);
+        clock_.stop();
+        clock_.setPlaybackPolicy(std::nullopt, metronomeEnabled_);
+    } else {
+        clock_.stopAndRewind();
+    }
     resetProcessors();
     clearMetronomeRuntime();
     publishTransport();
@@ -333,6 +350,9 @@ AudioControlRequestResult RealtimeAudioEngine::trySetMetronomeLevel(
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestPause() noexcept {
+    if (capture_.isCapturing())
+        return {false, 0, AudioControlRejection::disallowedState,
+                transport::PlaybackState::playing, {}, false};
     if (deviceState() != DeviceProcessingState::operational)
         return {false, 0, AudioControlRejection::unavailable,
                 transport::PlaybackState::stopped, {}, false};
@@ -378,6 +398,9 @@ AudioControlRequestResult RealtimeAudioEngine::tryRequestStop() noexcept {
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestSeek(
     timeline::ProjectFramePosition position) noexcept {
+    if (capture_.isCapturing())
+        return {false, 0, AudioControlRejection::disallowedState,
+                transport::PlaybackState::playing, {}, false};
     if (deviceState() != DeviceProcessingState::operational)
         return {false, 0, AudioControlRejection::unavailable,
                 transport::PlaybackState::stopped, {}, false};
@@ -516,7 +539,63 @@ mixer::MeterSnapshot RealtimeAudioEngine::meterSnapshot() const noexcept {
     return meterExchange_.snapshot();
 }
 
+bool RealtimeAudioEngine::prepareRecordingCapture(std::size_t frameCapacity) {
+    return capture_.prepare(frameCapacity);
+}
+
+AudioControlRequestResult RealtimeAudioEngine::tryRequestRecord(
+    RecordingRequest request) noexcept {
+    refreshTransportProjection();
+    if (deviceState() != DeviceProcessingState::operational ||
+        projectedTransport_.playback != transport::PlaybackState::stopped ||
+        projectedLoopEnabled_ || !capture_.canPrepareRequest() || !request.session ||
+        !request.track.isValid()) {
+        return {false, 0, AudioControlRejection::disallowedState,
+                transport::PlaybackState::stopped, {}, false};
+    }
+    if (!capture_.prepareRequest(request)) {
+        return {false, 0, AudioControlRejection::disallowedState,
+                transport::PlaybackState::stopped, {}, false};
+    }
+    const auto result = enqueue(CommandType::beginRecord, {}, 0.0F, request);
+    if (!result.accepted) {
+        capture_.clearPreparedRequest();
+        return result;
+    }
+    projectedTransport_.playback = transport::PlaybackState::playing;
+    projectedTransportSequence_ = result.sequence;
+    return {true, result.sequence, AudioControlRejection::none,
+            projectedTransport_.playback, projectedTransport_.position, true};
+}
+
+bool RealtimeAudioEngine::tryCancelRecording() noexcept {
+    if (capture_.isPrepared()) {
+        capture_.cancel();
+        return true;
+    }
+    if (!capture_.isCapturing()) return false;
+    return enqueue(CommandType::cancelRecord).accepted;
+}
+
+RecordingSnapshot RealtimeAudioEngine::recordingSnapshot() const noexcept {
+    return capture_.snapshot();
+}
+
+std::size_t RealtimeAudioEngine::drainRecording(AudioBlockView output) noexcept {
+    return capture_.drain(output);
+}
+
+void RealtimeAudioEngine::resetRecordingCapture() noexcept {
+    capture_.reset();
+}
+
 void RealtimeAudioEngine::processBlock(AudioBlockView output,
+                                       timeline::SampleRate deviceSampleRate) noexcept {
+    processBlock({}, output, deviceSampleRate);
+}
+
+void RealtimeAudioEngine::processBlock(ConstAudioBlockView input,
+                                       AudioBlockView output,
                                        timeline::SampleRate deviceSampleRate) noexcept {
     for (std::size_t channel = 0; channel < output.channelCount; ++channel) {
         if (output.channels != nullptr && output.channels[channel] != nullptr) {
@@ -540,6 +619,14 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
         publishMeters();
         publishTransport();
         return;
+    }
+
+    const auto captureState = capture_.snapshot();
+    if (captureState.phase == RecordingPhase::capturing &&
+        captureState.deviceSampleRate != deviceSampleRate) {
+        capture_.fail(RecordingFailure::sampleRateChanged);
+    } else {
+        capture_.capture(input);
     }
 
     if (!clock_.isPlaying()) {
@@ -1117,7 +1204,8 @@ float RealtimeAudioEngine::renderMetronomeSample(std::size_t frame) noexcept {
 }
 
 AudioControlRequestResult RealtimeAudioEngine::enqueue(
-    CommandType type, timeline::ProjectFramePosition target, float value) noexcept {
+    CommandType type, timeline::ProjectFramePosition target, float value,
+    RecordingRequest recording) noexcept {
     if (pendingCommandCount_ == pendingCommandCapacity) {
         return {false, 0, AudioControlRejection::queueFull,
                 transport::PlaybackState::stopped, {}, false};
@@ -1151,7 +1239,7 @@ AudioControlRequestResult RealtimeAudioEngine::enqueue(
         return {false, 0, AudioControlRejection::unavailable,
                 transport::PlaybackState::stopped, {}, false};
     }
-    commands_[write] = {type, sequence, claim.generation, target, value};
+    commands_[write] = {type, sequence, claim.generation, target, value, recording};
 
     if (!lifecycleGate_.tryAccept(claim)) {
         return {false, 0, AudioControlRejection::unavailable,
@@ -1174,7 +1262,13 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
         read = (read + 1) % commandCapacity;
         if (queued.generation == generation) {
             if (queued.type == CommandType::stop) {
+                if (capture_.isCapturing()) capture_.stop();
                 clock_.stop();
+                const auto loop = loopEnabled_ && temporalContext_ != nullptr &&
+                                          temporalContext_->loop
+                    ? std::optional<RealtimeProjectClock::LoopBounds>{temporalContext_->loop->clockBounds}
+                    : std::nullopt;
+                clock_.setPlaybackPolicy(loop, metronomeEnabled_ && !loop);
                 resetProcessors();
                 clearMetronomeRuntime();
             } else if (queued.type == CommandType::pause) {
@@ -1191,6 +1285,17 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
                 }
             } else if (queued.type == CommandType::play) {
                 static_cast<void>(clock_.play());
+            } else if (queued.type == CommandType::beginRecord) {
+                if (capture_.begin(queued.recording, clock_.publicPosition(),
+                                   processingFormat_.sampleRate)) {
+                    static_cast<void>(clock_.record());
+                }
+            } else if (queued.type == CommandType::cancelRecord) {
+                capture_.cancel();
+                clock_.stop();
+                clock_.setPlaybackPolicy(std::nullopt, metronomeEnabled_);
+                resetProcessors();
+                clearMetronomeRuntime();
             } else if (queued.type == CommandType::setLoopEnabled) {
                 loopEnabled_ = queued.value != 0.0F;
                 const auto loop = loopEnabled_ && temporalContext_ != nullptr &&
@@ -1246,6 +1351,13 @@ void RealtimeAudioEngine::refreshTransportProjection() noexcept {
             projectionBase_.metronomeEnabled = command.value != 0.0F;
         } else if (command.type == CommandType::setMetronomeLevel) {
             projectionBase_.metronomeLevelDb = command.value;
+        } else if (command.type == CommandType::beginRecord) {
+            projectedTransport_.playback = transport::PlaybackState::playing;
+            projectedTransportSequence_ = command.sequence;
+        } else if (command.type == CommandType::cancelRecord) {
+            const auto reduction = transport::reduceTransport(projectedTransport_,
+                {transport::TransportActionKind::stop, {}}, transportReductionPolicy());
+            commitTransportProjection(reduction, command.sequence);
         } else if (command.type == CommandType::play || command.type == CommandType::pause ||
                    command.type == CommandType::stop || command.type == CommandType::seek) {
             const auto action = command.type == CommandType::play ? transport::TransportActionKind::play :

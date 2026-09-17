@@ -1366,6 +1366,49 @@ bool ProjectState::removeSource(media::SourceId source) noexcept {
     return true;
 }
 
+bool ProjectState::restoreHistoryRecording(
+    tracks::TrackId trackId, const media::AudioSource& source,
+    const clips::AudioClip& clip) {
+    auto* track = findTrackMutable(trackId);
+    if (track == nullptr || !source.isValid() || clip.source != source.id ||
+        source.id.value >= nextSourceId_.value ||
+        clip.id.value >= nextClipId_.value || findSource(source.id) != nullptr ||
+        findClip(clip.id) != nullptr || sources_.size() >= maximumSources ||
+        track->clips.size() >= maximumClipsPerTrack ||
+        !validateClip(*track, source, clip.projectStart, clip.duration,
+                      clip.sourceOffset)) {
+        return false;
+    }
+    std::size_t total{};
+    for (const auto& candidate : tracks_) total += candidate.clips.size();
+    if (total >= maximumClips) return false;
+    sources_.push_back(source);
+    try {
+        track = findTrackMutable(trackId);
+        track->clips.push_back(clip);
+    } catch (...) {
+        sources_.pop_back();
+        throw;
+    }
+    sortTrackClips(*track);
+    return true;
+}
+
+bool ProjectState::deleteHistoryRecording(
+    tracks::TrackId trackId, const media::AudioSource& source,
+    const clips::AudioClip& clip) noexcept {
+    auto* track = findTrackMutable(trackId);
+    const auto* existingSource = findSource(source.id);
+    const auto* existingClip = findClip(clip.id);
+    if (track == nullptr || existingSource == nullptr || existingClip == nullptr ||
+        *existingClip != clip || *existingSource != source ||
+        trackContainingClip(clip.id) != trackId) {
+        return false;
+    }
+    if (!deleteClip(clip.id)) return false;
+    return removeSource(source.id);
+}
+
 timeline::ProjectFrameCount ProjectState::projectContentDuration() const noexcept {
     return duration();
 }

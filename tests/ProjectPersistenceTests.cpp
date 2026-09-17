@@ -163,6 +163,10 @@ std::string encode(const project::ProjectState& p, const std::filesystem::path& 
 }
 void codecTests() {
     const auto p = complex(); const auto original = encode(p);
+    const auto written = nlohmann::json::parse(original);
+    check(written.at("schemaVersion") == 3 &&
+              written.at("writerAppVersion") == "0.7.0",
+          "newly written project reports schema v3 and VitaDAW 0.7.0");
     check(original.find("metronome") == std::string::npos,
           "metronome enabled and level are not project persistence fields");
     check(original == encode(p), "deterministic bytes");

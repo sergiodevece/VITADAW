@@ -10,6 +10,10 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <filesystem>
+#include <optional>
+
+namespace juce { class AudioFormatWriter; }
 
 namespace vitadaw::platform::juce_adapter {
 
@@ -19,6 +23,31 @@ class JuceAudioDeviceAdapter final : public audio::IAudioEngineControl,
 public:
     using StateChangedCallback = std::function<void(const audio::AudioDeviceState&)>;
     static constexpr std::size_t preparationMemoryBudgetBytes = 512U * 1024U * 1024U;
+    // Pathnames are not ownership. Capture identity at O_EXCL creation and
+    // verify it again before destructive pathname operations.
+    struct FileIdentity {
+        std::uint64_t device{};
+        std::uint64_t inode{};
+
+        [[nodiscard]] bool valid() const noexcept { return device != 0 || inode != 0; }
+        bool operator==(const FileIdentity&) const = default;
+    };
+    struct ExclusiveTemporaryFile {
+        ExclusiveTemporaryFile(int descriptor, FileIdentity fileIdentity) noexcept
+            : identity(fileIdentity), descriptor_(descriptor) {}
+        ~ExclusiveTemporaryFile() noexcept;
+        ExclusiveTemporaryFile(const ExclusiveTemporaryFile&) = delete;
+        ExclusiveTemporaryFile& operator=(const ExclusiveTemporaryFile&) = delete;
+        ExclusiveTemporaryFile(ExclusiveTemporaryFile&&) noexcept;
+        ExclusiveTemporaryFile& operator=(ExclusiveTemporaryFile&&) noexcept;
+
+        [[nodiscard]] int release() noexcept;
+        FileIdentity identity;
+
+    private:
+        friend class PersistenceIntegrationAccess; // Hardware-free ownership tests.
+        int descriptor_{-1};
+    };
 
     JuceAudioDeviceAdapter();
     ~JuceAudioDeviceAdapter() override;
@@ -98,6 +127,16 @@ public:
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot projectedTransportSnapshot() noexcept override;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
+    [[nodiscard]] audio::RecordingPreflightResult prepareRecording(
+        const audio::RecordingPreflightRequest&) override;
+    [[nodiscard]] audio::AudioControlRequestResult tryRequestRecord(
+        audio::RecordingRequest) noexcept override;
+    [[nodiscard]] bool tryCancelRecording() noexcept override;
+    void serviceRecording() noexcept override;
+    [[nodiscard]] audio::RecordingSnapshot recordingSnapshot() const noexcept override;
+    [[nodiscard]] audio::RecordingFinalizationResult finalizeRecording() override;
+    [[nodiscard]] bool discardRecording(bool removePublished) noexcept override;
+    void confirmRecordingCommit() noexcept override;
 
 private:
     friend class PersistenceIntegrationAccess; // Hardware-free test harness only.
@@ -129,6 +168,10 @@ private:
         const audio::ProcessingPlanSpecification& specification,
         std::string& errorMessage);
     [[nodiscard]] bool reprepareForCurrentDevice(std::string& errorMessage);
+    [[nodiscard]] static std::optional<ExclusiveTemporaryFile> createExclusiveTemporaryFile(
+        const std::filesystem::path&, std::error_code&) noexcept;
+    [[nodiscard]] static bool pathHasIdentity(
+        const std::filesystem::path&, FileIdentity) noexcept;
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
         audio::AudioFileCommitAction modelCommit,
@@ -147,6 +190,16 @@ private:
     std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
     std::atomic<bool> suppressLifecycleNotification_{};
     std::atomic<bool> preserveTransportDuringRegistration_{};
+    std::unique_ptr<juce::AudioFormatWriter> recordingWriter_;
+    juce::AudioBuffer<float> recordingDrainBuffer_;
+    std::filesystem::path recordingTemporaryPath_;
+    std::filesystem::path recordingPublishedPath_;
+    std::optional<FileIdentity> recordingTemporaryIdentity_;
+    std::optional<FileIdentity> recordingPublishedIdentity_;
+    audio::RecordingSessionId nextRecordingSession_{1};
+    std::uint64_t nextRecordingTemporaryNonce_{1};
+    bool recordingWriterFailed_{};
+    std::string recordingWriterError_;
     bool callbackRegistered_{};
     bool changeListenerRegistered_{};
 };

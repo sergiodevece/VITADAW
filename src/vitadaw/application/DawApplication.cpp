@@ -87,6 +87,29 @@ commands::CommandError importCommandError(
     return Error::preparationFailed;
 }
 
+const char* recordingFailureMessage(audio::RecordingFailure failure) noexcept {
+    using Failure = audio::RecordingFailure;
+    switch (failure) {
+    case Failure::overflow:
+        return "Recording stopped because the capture buffer overflowed";
+    case Failure::missingInput:
+        return "Recording stopped because the requested input channels disappeared";
+    case Failure::deviceLost:
+        return "Recording stopped because the audio device was lost";
+    case Failure::sampleRateChanged:
+        return "Recording stopped because the device sample rate changed";
+    case Failure::cancelled:
+        return "Recording cancelled";
+    case Failure::writerFailed:
+        return "Recording stopped because the WAV writer failed";
+    case Failure::finalizationFailed:
+        return "Recording could not be finalized";
+    case Failure::none:
+        return "Recording failed";
+    }
+    return "Recording failed";
+}
+
 const char* importFailureMessage(
     audio::AudioFilePreparationFailure failure) noexcept {
     using Failure = audio::AudioFilePreparationFailure;
@@ -135,9 +158,77 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
     using namespace commands;
     // Serialized application-thread entry point; RT never reads the history.
     try {
+        if (recordingBusy() &&
+            !std::holds_alternative<Stop>(command) &&
+            !std::holds_alternative<CancelRecording>(command)) {
+            return {CommandStatus::rejected,
+                    "Recording is capturing or finalizing",
+                    CommandError::invalidState};
+        }
         return std::visit([&](const auto& value) -> CommandResult {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (commands::isMusicalCommand<T>) {
+            if constexpr (std::is_same_v<T, SetTrackRecordArmed>) {
+                if (transport_.playback != transport::PlaybackState::stopped)
+                    return {CommandStatus::rejected, "Stop before changing record arm",
+                            CommandError::transportMustBeStopped};
+                if (value.armed) {
+                    if (session_.project.findTrack(value.track) == nullptr)
+                        return {CommandStatus::rejected, "Audio track not found",
+                                CommandError::trackNotFound};
+                    session_.armedTrack = value.track;
+                    return {CommandStatus::accepted, "Track armed"};
+                }
+                if (session_.armedTrack && *session_.armedTrack == value.track)
+                    session_.armedTrack.reset();
+                return {CommandStatus::accepted, "Track disarmed"};
+            } else if constexpr (std::is_same_v<T, Record>) {
+                if (transport_.playback != transport::PlaybackState::stopped)
+                    return {CommandStatus::rejected, "Record requires Stopped",
+                            CommandError::transportMustBeStopped};
+                if (session_.loopEnabled)
+                    return {CommandStatus::rejected, "Disable Loop before recording",
+                            CommandError::invalidState};
+                if (!session_.armedTrack)
+                    return {CommandStatus::rejected, "Arm an audio track before recording",
+                            CommandError::selectTargetTrack};
+                if (session_.projectFilePath.empty())
+                    return {CommandStatus::rejected, "Save the project before recording",
+                            CommandError::invalidState};
+                const auto* track = session_.project.findTrack(*session_.armedTrack);
+                if (track == nullptr) {
+                    session_.armedTrack.reset();
+                    return {CommandStatus::rejected, "Armed audio track no longer exists",
+                            CommandError::trackNotFound};
+                }
+                auto preparation = audioEngine_.prepareRecording(
+                    {*session_.armedTrack, track->layout, session_.projectFilePath});
+                if (!preparation.success()) {
+                    recordingPhase_ = audio::RecordingPhase::failed;
+                    recordingError_ = std::move(preparation.errorMessage);
+                    return {CommandStatus::rejected, recordingError_,
+                            CommandError::preparationFailed};
+                }
+                const auto request = audioEngine_.tryRequestRecord(preparation.request);
+                if (!request.accepted) {
+                    static_cast<void>(audioEngine_.discardRecording(true));
+                    recordingPhase_ = audio::RecordingPhase::failed;
+                    recordingError_ = "Realtime Record request was rejected";
+                    return {CommandStatus::rejected, recordingError_,
+                            CommandError::transportUnavailable};
+                }
+                activeRecording_ = preparation.request;
+                recordingPhase_ = audio::RecordingPhase::capturing;
+                recordingError_.clear();
+                pendingAudioCommandSequence_ = request.sequence;
+                transport_.playback = request.projectedPlayback;
+                transport_.position = request.projectedPosition;
+                return {CommandStatus::accepted, "Recording"};
+            } else if constexpr (std::is_same_v<T, CancelRecording>) {
+                if (!recordingBusy() || !audioEngine_.tryCancelRecording())
+                    return {CommandStatus::rejected, "No active recording to cancel",
+                            CommandError::invalidState};
+                return {CommandStatus::accepted, "Recording cancellation scheduled"};
+            } else if constexpr (commands::isMusicalCommand<T>) {
                 return musicalCommand(command);
             } else if constexpr (std::is_same_v<T, SaveProject> || std::is_same_v<T, SaveProjectAs> ||
                           std::is_same_v<T, LoadProject>) {
@@ -208,11 +299,16 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                 if (!pending)
                     return {CommandStatus::rejected, "History capacity exceeded",
                             CommandError::historyCapacityExceeded};
-                return commitStructuralProject(
+                auto result = commitStructuralProject(
                     std::move(candidate),
                     std::is_same_v<T, AddAudioTrack> ? "Audio track added"
                                                      : "Audio track deleted",
                     &*pending);
+                if (result.status == CommandStatus::accepted &&
+                    session_.armedTrack &&
+                    session_.project.findTrack(*session_.armedTrack) == nullptr)
+                    session_.armedTrack.reset();
+                return result;
             } else if constexpr (std::is_same_v<T, MoveClips> ||
                                  std::is_same_v<T, DeleteClips> ||
                                  std::is_same_v<T, DuplicateClips>) {
@@ -354,13 +450,24 @@ commands::CommandResult DawApplication::traverseHistory(bool forward) {
     const auto expectedToken = forward ? entry->beforeStateToken : entry->afterStateToken;
     if (session_.history.currentStateToken() != expectedToken)
         return {CommandStatus::rejected, "History state diverged", CommandError::historyInvalid};
+    if (forward) {
+        if (const auto* recording =
+                std::get_if<history::RecordAudio>(&entry->operation.payload)) {
+            return redoRecordedAudio(*recording);
+        }
+    }
     auto candidate = session_.project;
     if (!entry->operation.apply(candidate, forward))
         return {CommandStatus::rejected, "History entities diverged", CommandError::historyInvalid};
     if (entry->operation.isMusical())
         return commitMusicalProject(std::move(candidate), nullptr, forward ? 1 : -1);
-    return commitStructuralProject(std::move(candidate), forward ? "Redo committed" : "Undo committed",
-                                   nullptr, forward ? 1 : -1);
+    auto result = commitStructuralProject(
+        std::move(candidate), forward ? "Redo committed" : "Undo committed",
+        nullptr, forward ? 1 : -1);
+    if (result.status == CommandStatus::accepted && session_.armedTrack &&
+        session_.project.findTrack(*session_.armedTrack) == nullptr)
+        session_.armedTrack.reset();
+    return result;
 }
 
 commands::CommandResult DawApplication::execute(const commands::Command& command) {
@@ -1148,6 +1255,186 @@ commands::CommandResult DawApplication::commitStructuralProject(
             commands::CommandError::none, {}, std::move(createdClips)};
 }
 
+commands::CommandResult DawApplication::commitRecordedAudio(
+    audio::RecordingFinalizationResult finalized) {
+    using namespace commands;
+    const auto rejectAndClean = [this](std::string message,
+                                       CommandError error) {
+        if (!audioEngine_.discardRecording(true))
+            message += "; recording media retained as an ownership-safe orphan";
+        return CommandResult{CommandStatus::rejected, std::move(message), error};
+    };
+    if (!finalized.success() || !finalized.capture.track.isValid() ||
+        finalized.capture.acceptedDeviceFrames.value == 0) {
+        return rejectAndClean(
+            finalized.errorMessage.empty() ? "Recorded WAV could not be finalized"
+                                           : std::move(finalized.errorMessage),
+            CommandError::preparationFailed);
+    }
+    if (finalized.capture.track != activeRecording_.track ||
+        session_.project.findTrack(finalized.capture.track) == nullptr) {
+        return rejectAndClean("Recorded TrackId is no longer valid",
+                              CommandError::trackNotFound);
+    }
+    const auto metadata = finalized.prepared->metadata;
+    if (metadata.sourceFrameCount != finalized.capture.acceptedDeviceFrames ||
+        metadata.sourceSampleRate != finalized.capture.deviceSampleRate ||
+        metadata.channelCount != media::channelCount(finalized.capture.layout)) {
+        return rejectAndClean("Recorded WAV metadata does not match capture",
+                              CommandError::preparationFailed);
+    }
+    if (!finalized.prepared->waveform) {
+        return rejectAndClean(
+            finalized.prepared->waveformDiagnostic.empty()
+                ? "Recorded waveform could not be prepared"
+                : finalized.prepared->waveformDiagnostic,
+            CommandError::preparationFailed);
+    }
+
+    auto candidate = session_.project;
+    project::ProjectState::ImportedAudio imported;
+    try {
+        imported = candidate.importAudioToTrack(
+            finalized.capture.track, finalized.prepared->media,
+            metadata.sourceFrameCount, metadata.sourceSampleRate,
+            finalized.capture.layout, finalized.capture.projectStart);
+    } catch (...) {
+        return rejectAndClean("Recorded project material could not be staged",
+                              CommandError::preparationFailed);
+    }
+    const auto* source = candidate.findSource(imported.source);
+    const auto* clip = candidate.findClip(imported.clip);
+    if (source == nullptr || clip == nullptr) {
+        return rejectAndClean("Recorded source or clip was not created",
+                              CommandError::preparationFailed);
+    }
+    history::UndoableOperation operation;
+    operation.payload = history::RecordAudio{finalized.capture.track, *source, *clip};
+    auto pending = session_.history.stage(std::move(operation));
+    if (!pending) {
+        return rejectAndClean("History capacity exceeded",
+                              CommandError::historyCapacityExceeded);
+    }
+
+    auto candidateWaveforms = session_.waveforms;
+    if (candidateWaveforms.store(imported.source,
+                                 finalized.prepared->waveform) !=
+        waveform::WaveformCache::StoreResult::stored) {
+        return rejectAndClean("Recorded waveform exceeds the cache budget",
+                              CommandError::capacityExceeded);
+    }
+    auto plan = audioEngine_.prepareProcessingPlanWithAudio(
+        makePlanSpecification(candidate), imported.source,
+        std::move(finalized.prepared));
+    if (!plan.success()) {
+        return rejectAndClean(std::move(plan.errorMessage),
+                              CommandError::preparationFailed);
+    }
+
+    struct Context {
+        DawApplication* app;
+        project::ProjectState* candidate;
+        waveform::WaveformCache* waveforms;
+        history::UndoManager::PendingAppend* pending;
+        audio::PreparedAudibilityState audibility;
+        transport::PlaybackState playback;
+        timeline::ProjectFramePosition position;
+    } context{this, &candidate, &candidateWaveforms, &*pending,
+              resolveAudibility(candidate), transport::PlaybackState::stopped,
+              audioEngine_.transportSnapshot().position};
+    const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
+        auto& c = *static_cast<Context*>(raw);
+        c.app->session_.project.swap(*c.candidate);
+        c.app->session_.waveforms.swap(*c.waveforms);
+        c.app->audibility_ = c.audibility;
+        c.app->transport_.synchronise(c.playback, c.position,
+                                      c.app->session_.project.duration());
+        c.app->session_.history.commit(std::move(*c.pending));
+    }};
+    if (!audioEngine_.commitPreparedProcessingPlanPreservingTransport(
+            std::move(plan.prepared), commit)) {
+        return rejectAndClean("Recorded processing plan could not be committed",
+                              CommandError::commitFailed);
+    }
+    audioEngine_.confirmRecordingCommit();
+    return {CommandStatus::accepted, "Recording committed", CommandError::none,
+            {}, {imported.clip}};
+}
+
+commands::CommandResult DawApplication::redoRecordedAudio(
+    const history::RecordAudio& recording) {
+    using namespace commands;
+    if (session_.project.findTrack(recording.track) == nullptr)
+        return {CommandStatus::rejected, "Recorded TrackId is unavailable",
+                CommandError::historyInvalid};
+    if (!recording.source.media.fingerprint)
+        return {CommandStatus::rejected, "Recorded media has no fingerprint",
+                CommandError::historyInvalid};
+    auto prepared = audioEngine_.prepareVerifiedWav(
+        recording.source.media.originalPath,
+        *recording.source.media.fingerprint, 0);
+    if (!prepared.success())
+        return {CommandStatus::rejected,
+                prepared.errorMessage.empty() ? "Recorded media is missing or changed"
+                                              : std::move(prepared.errorMessage),
+                CommandError::preparationFailed, std::move(prepared.result)};
+    if (prepared.prepared->metadata.sourceFrameCount != recording.source.frameCount ||
+        prepared.prepared->metadata.sourceSampleRate != recording.source.sampleRate ||
+        prepared.prepared->metadata.channelCount !=
+            media::channelCount(recording.source.layout))
+        return {CommandStatus::rejected, "Recorded media metadata changed",
+                CommandError::preparationFailed};
+    if (!prepared.prepared->waveform)
+        return {CommandStatus::rejected,
+                prepared.prepared->waveformDiagnostic.empty()
+                    ? "Recorded waveform could not be prepared"
+                    : prepared.prepared->waveformDiagnostic,
+                CommandError::preparationFailed};
+
+    auto candidate = session_.project;
+    history::UndoableOperation operation;
+    operation.payload = recording;
+    if (!operation.apply(candidate, true))
+        return {CommandStatus::rejected, "Recording history diverged",
+                CommandError::historyInvalid};
+    auto candidateWaveforms = session_.waveforms;
+    if (candidateWaveforms.store(recording.source.id,
+                                 prepared.prepared->waveform) !=
+        waveform::WaveformCache::StoreResult::stored)
+        return {CommandStatus::rejected,
+                "Recorded waveform exceeds the cache budget",
+                CommandError::capacityExceeded};
+    auto plan = audioEngine_.prepareProcessingPlanWithAudio(
+        makePlanSpecification(candidate), recording.source.id,
+        std::move(prepared.prepared));
+    if (!plan.success())
+        return {CommandStatus::rejected, std::move(plan.errorMessage),
+                CommandError::preparationFailed};
+    struct Context {
+        DawApplication* app;
+        project::ProjectState* candidate;
+        waveform::WaveformCache* waveforms;
+        audio::PreparedAudibilityState audibility;
+        transport::PlaybackState playback;
+        timeline::ProjectFramePosition position;
+    } context{this, &candidate, &candidateWaveforms, resolveAudibility(candidate),
+              transport_.playback, transport_.position};
+    const audio::AudioFileCommitAction commit{&context, [](void* raw) noexcept {
+        auto& c = *static_cast<Context*>(raw);
+        c.app->session_.project.swap(*c.candidate);
+        c.app->session_.waveforms.swap(*c.waveforms);
+        c.app->audibility_ = c.audibility;
+        c.app->transport_.synchronise(c.playback, c.position,
+                                      c.app->session_.project.duration());
+        c.app->session_.history.commitRedo();
+    }};
+    if (!audioEngine_.commitPreparedProcessingPlanPreservingTransport(
+            std::move(plan.prepared), commit))
+        return {CommandStatus::rejected, "Recorded Redo plan could not be committed",
+                CommandError::commitFailed};
+    return {CommandStatus::accepted, "Recording restored"};
+}
+
 audio::PreparedAudibilityState DawApplication::resolveAudibility(
     const project::ProjectState& project, tracks::TrackId overriddenTrack,
     const mixer::TrackMixState* trackMix,
@@ -1275,6 +1562,7 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
 }
 
 void DawApplication::synchroniseTransport() noexcept {
+    synchroniseRecording();
     const auto snapshot = audioEngine_.projectedTransportSnapshot();
     if (std::max(snapshot.lastProcessedCommandSequence, snapshot.projectedThroughTicket) <
         pendingAudioCommandSequence_) {
@@ -1290,6 +1578,65 @@ void DawApplication::synchroniseTransport() noexcept {
     session_.metronomeEnabled = snapshot.metronomeEnabled;
     session_.metronomeLevel = {snapshot.metronomeLevelDb};
     session_.appliedTemporalRevision = snapshot.temporalRevision;
+}
+
+void DawApplication::synchroniseRecording() noexcept {
+    if (!recordingBusy()) return;
+    try {
+        audioEngine_.serviceRecording();
+        const auto capture = audioEngine_.recordingSnapshot();
+        if (capture.session != activeRecording_.session) return;
+        recordingPhase_ = capture.phase;
+        if (capture.phase == audio::RecordingPhase::capturing ||
+            capture.phase == audio::RecordingPhase::prepared) {
+            return;
+        }
+        if (capture.phase == audio::RecordingPhase::failed) {
+            recordingError_ = recordingFailureMessage(capture.failure);
+            if (!audioEngine_.discardRecording(true))
+                recordingError_ += "; recording media retained as an ownership-safe orphan";
+            if (audioEngine_.projectedTransportSnapshot().playing)
+                static_cast<void>(audioEngine_.tryRequestStop());
+            activeRecording_ = {};
+            return;
+        }
+        if (capture.phase != audio::RecordingPhase::complete) return;
+
+        recordingPhase_ = audio::RecordingPhase::finalizing;
+        auto finalized = audioEngine_.finalizeRecording();
+        if (!finalized.success()) {
+            recordingPhase_ = audio::RecordingPhase::failed;
+            recordingError_ = finalized.errorMessage.empty()
+                                  ? "Recorded WAV could not be finalized"
+                                  : finalized.errorMessage;
+            if (!audioEngine_.discardRecording(true))
+                recordingError_ += "; recording media retained as an ownership-safe orphan";
+            activeRecording_ = {};
+            return;
+        }
+        auto finalizationWarning = finalized.warningMessage;
+        auto committed = commitRecordedAudio(std::move(finalized));
+        if (committed.status == commands::CommandStatus::accepted) {
+            recordingPhase_ = audio::RecordingPhase::complete;
+            recordingError_ = std::move(finalizationWarning);
+        } else {
+            recordingPhase_ = audio::RecordingPhase::failed;
+            recordingError_ = std::move(committed.message);
+        }
+        activeRecording_ = {};
+    } catch (const std::exception& error) {
+        const auto cleaned = audioEngine_.discardRecording(true);
+        recordingPhase_ = audio::RecordingPhase::failed;
+        recordingError_ = error.what();
+        if (!cleaned) recordingError_ += "; recording media retained as an ownership-safe orphan";
+        activeRecording_ = {};
+    } catch (...) {
+        const auto cleaned = audioEngine_.discardRecording(true);
+        recordingPhase_ = audio::RecordingPhase::failed;
+        recordingError_ = "Unexpected recording finalization failure";
+        if (!cleaned) recordingError_ += "; recording media retained as an ownership-safe orphan";
+        activeRecording_ = {};
+    }
 }
 
 const project::ProjectState& DawApplication::project() const noexcept {

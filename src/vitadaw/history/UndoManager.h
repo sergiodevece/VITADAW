@@ -44,6 +44,11 @@ struct DuplicateClips {
 struct DeleteClips {
     std::vector<project::ProjectState::ClipHistoryState> removed;
 };
+struct RecordAudio {
+    tracks::TrackId track;
+    media::AudioSource source;
+    clips::AudioClip clip;
+};
 
 // Model values only. No borrowed views or prepared/runtime ownership.
 class UndoableOperation {
@@ -53,7 +58,7 @@ public:
                                  TempoEdit, SignatureEdit, LoopRangeEdit,
                                  AddAudioTrack, DeleteAudioTrack,
                                  ReorderAudioTrack, MoveClips,
-                                 DuplicateClips, DeleteClips>;
+                                 DuplicateClips, DeleteClips, RecordAudio>;
     Payload payload;
     [[nodiscard]] bool isMusical() const noexcept {
         return std::holds_alternative<TempoEdit>(payload) ||

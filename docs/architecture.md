@@ -2043,7 +2043,55 @@ de reset. Si un rebuild ocurre antes del DSP, su `hardDiscontinuity` subsume a
 Seek y se conservan los resets legítimos. Stop, lifecycle y loop conservan sus
 políticas anteriores; no se introduce una colección de causas ni otra API de inserts.
 
-## Evolución hasta 0.6.6
+### Audio Recording Foundation 0.7.0
+
+El armado de grabación pertenece a `ProjectSession`, no a `ProjectState`: sólo
+puede existir una pista armada, se identifica por `TrackId`, no se persiste ni
+entra en historial. `Record` exige transporte Stopped, loop desactivado y un
+proyecto ya guardado. Mono selecciona input 1 y estéreo inputs 1–2. La apertura
+de entrada se hace exclusivamente durante el preflight no-RT.
+
+`RealtimeCapture` es un ring PCM SPSC portable con dos canales preasignados. El
+callback es su único productor y el servicio de grabación su único consumidor.
+El comando `beginRecord` fija en el callback el `ProjectFrame` inicial y la
+frecuencia del dispositivo; el mismo callback ya pertenece a la toma. `Stop`
+cierra antes de copiar su callback, de modo que éste queda excluido. Cada bloque
+se acepta entero o, si no cabe, la sesión termina con `overflow`. El callback no
+reserva, libera, bloquea, escribe archivos, crea IDs ni toca modelo o historial.
+El estado terminal se publica como un único valor atómico que contiene fase y
+causa: `complete` siempre implica `none` y `failed` una causa concreta. Stop y
+un fallo de dispositivo compiten mediante CAS; el primero que terminaliza gana.
+Una transición de dispositivo también invalida una solicitud ya preparada pero
+todavía no consumida, por lo que un `beginRecord` de la generación antigua no
+puede arrancar más tarde.
+
+El adaptador JUCE crea el temporal con `O_EXCL` y conserva ese descriptor dentro
+del `OutputStream` que recibe el writer WAV float de 32 bits; no vuelve a abrir
+el pathname. El descriptor aporta una identidad estable `{device,inode}`. Tras
+Stop cierra el writer, verifica esa identidad y publica mediante hard-link sin
+reemplazo en el mismo directorio `<ProjectName> Audio/` (por tanto requiere un
+filesystem local que soporte hard links en el mismo volumen). POSIX no aporta
+`unlink` condicionado atómicamente por `{device,inode}`: para no transformar
+un check de identidad en una autorización insegura de borrado, 0.7.0 no borra
+por pathname ni el temporal ni un final publicado durante rollback/finalización.
+Los conserva como huérfanos explícitos cuando no llegan al commit; una ruta
+planificada, una colisión o una sustitución posterior nunca autorizan borrar el
+objeto que actualmente ocupe el pathname. Después calcula huella y metadata con la vía de importación ya
+existente, decodifica PCM, prepara waveform y plan, y sólo entonces intercambia
+proyecto, caché, audibilidad e historial en un commit `noexcept` que preserva el
+locator detenido. El medio conserva sample rate del dispositivo y número exacto
+de frames; la duración de proyecto se deriva mediante las conversiones exactas
+existentes, sin resampling RT.
+
+`history::RecordAudio` conserva `TrackId`, `AudioSource` y `AudioClip` completos.
+Undo elimina clip y fuente sin borrar el WAV ni rebobinar contadores. Redo
+verifica huella, vuelve a decodificar y prepara el plan antes de restaurar los
+mismos IDs. Un medio ausente/cambiado no mueve el cursor. Fallos de dispositivo,
+rate, input, overflow, writer, decode, waveform, plan o revalidación dejan modelo
+e historial sin cambios; si no puede limpiarse un WAV publicado se informa como
+medio huérfano.
+
+## Evolución hasta 0.7.0
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -2142,6 +2190,10 @@ políticas anteriores; no se introduce una colección de causas ni otra API de i
 
 36. **Completado en 0.6.6:** Time Selection efímera, Snap Foundation con
     desempate determinista, copia explícita a Loop y benchmark opt-in del rebuild.
+
+37. **Completado en 0.7.0:** armado exclusivo efímero, captura SPSC sin trabajo
+    no-RT en callback, almacenamiento WAV transaccional y operación Record
+    undoable/redoable con IDs estables y medio verificado.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

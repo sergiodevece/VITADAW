@@ -13,7 +13,7 @@ std::string_view UndoableOperation::label() const noexcept {
         "history.deleteClip", "history.tempo", "history.timeSignature",
         "history.loopRange", "history.addAudioTrack", "history.deleteAudioTrack",
         "history.reorderAudioTrack", "history.moveClips",
-        "history.duplicateClips", "history.deleteClips"};
+        "history.duplicateClips", "history.deleteClips", "history.recordAudio"};
     return labels[payload.index()];
 }
 
@@ -45,6 +45,12 @@ std::size_t UndoableOperation::approximateMemoryBytes() const noexcept {
         else if constexpr (std::is_same_v<T, DeleteClips>)
             return edit.removed.capacity() *
                    sizeof(project::ProjectState::ClipHistoryState);
+        else if constexpr (std::is_same_v<T, RecordAudio>)
+            return edit.source.media.originalPath.native().size() +
+                   (edit.source.media.projectRelativePath
+                        ? edit.source.media.projectRelativePath->native().size() : 0) +
+                   (edit.source.media.fingerprint
+                        ? edit.source.media.fingerprint->sha256.capacity() : 0);
         return 0;
     }, payload);
 }
@@ -90,6 +96,12 @@ bool UndoableOperation::apply(project::ProjectState& candidate, bool forward) co
             return forward
                 ? candidate.deleteHistoryClips(edit.removed)
                 : candidate.restoreHistoryClips(edit.removed);
+        } else if constexpr (std::is_same_v<T, RecordAudio>) {
+            return forward
+                ? candidate.restoreHistoryRecording(edit.track, edit.source,
+                                                    edit.clip)
+                : candidate.deleteHistoryRecording(edit.track, edit.source,
+                                                   edit.clip);
         } else if constexpr (std::is_same_v<T, MoveClip>) {
             return candidate.transferHistoryClip(
                 forward ? edit.beforeTrack : edit.afterTrack,

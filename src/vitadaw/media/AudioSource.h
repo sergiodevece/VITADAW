@@ -57,6 +57,7 @@ struct AudioSource {
         return id.isValid() && media.isValid() && frameCount.value > 0 &&
                sampleRate.isValid();
     }
+    bool operator==(const AudioSource&) const = default;
 };
 
 } // namespace vitadaw::media

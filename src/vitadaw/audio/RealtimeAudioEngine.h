@@ -8,6 +8,7 @@
 #include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/audio/MixerSmoother.h"
 #include "vitadaw/audio/RealtimeMeterExchange.h"
+#include "vitadaw/audio/RealtimeCapture.h"
 #include "vitadaw/audio/RealtimeProjectClock.h"
 #include "vitadaw/audio/RealtimeTransportExchange.h"
 #include "vitadaw/audio/TrackMixerProcessing.h"
@@ -111,7 +112,19 @@ public:
     [[nodiscard]] RealtimeTransportSnapshot projectedTransportSnapshot() noexcept;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
 
+    // prepareRecordingCapture is quiescent/non-RT. Input capture itself is
+    // driven by the same callback and command generation as transport.
+    [[nodiscard]] bool prepareRecordingCapture(std::size_t frameCapacity);
+    [[nodiscard]] AudioControlRequestResult tryRequestRecord(
+        RecordingRequest) noexcept;
+    [[nodiscard]] bool tryCancelRecording() noexcept;
+    [[nodiscard]] RecordingSnapshot recordingSnapshot() const noexcept;
+    [[nodiscard]] std::size_t drainRecording(AudioBlockView) noexcept;
+    void resetRecordingCapture() noexcept;
+
     void processBlock(AudioBlockView output,
+                      timeline::SampleRate deviceSampleRate) noexcept;
+    void processBlock(ConstAudioBlockView input, AudioBlockView output,
                       timeline::SampleRate deviceSampleRate) noexcept;
 
 private:
@@ -120,7 +133,7 @@ private:
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 
     enum class CommandType : std::uint8_t {
-        play, pause, stop, seek, setLoopEnabled,
+        play, pause, stop, seek, beginRecord, cancelRecord, setLoopEnabled,
         setMetronomeEnabled, setMetronomeLevel
     };
     struct QueuedCommand {
@@ -129,6 +142,7 @@ private:
         std::uint64_t generation{};
         timeline::ProjectFramePosition target;
         float value{};
+        RecordingRequest recording;
     };
     struct TrackMixCommand {
         std::size_t trackIndex{};
@@ -167,7 +181,7 @@ private:
 
     [[nodiscard]] AudioControlRequestResult enqueue(
         CommandType type, timeline::ProjectFramePosition target = {},
-        float value = 0.0F) noexcept;
+        float value = 0.0F, RecordingRequest recording = {}) noexcept;
     void refreshTransportProjection() noexcept;
     [[nodiscard]] transport::TransportReductionPolicy
     transportReductionPolicy() const noexcept;
@@ -261,6 +275,7 @@ private:
     std::array<mixer::StereoPeak, maximumBusCount> busPeaks_{};
     mixer::StereoPeak masterPeak_;
     RealtimeMeterExchange meterExchange_;
+    RealtimeCapture capture_;
     processors::TemporalDiscontinuity processorDiscontinuity_{
         processors::TemporalDiscontinuity::hardDiscontinuity};
     bool loopEnabled_{};

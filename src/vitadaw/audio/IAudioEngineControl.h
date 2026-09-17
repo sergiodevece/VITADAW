@@ -3,6 +3,7 @@
 #include "vitadaw/audio/RealtimeTransportExchange.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
+#include "vitadaw/audio/RecordingTypes.h"
 #include "vitadaw/mixer/Metering.h"
 #include "vitadaw/timeline/Time.h"
 #include "vitadaw/tracks/AudioTrack.h"
@@ -49,6 +50,18 @@ public:
 };
 
 using PreparedAudioFilePtr = std::unique_ptr<PreparedAudioFile>;
+
+struct RecordingFinalizationResult {
+    PreparedAudioFilePtr prepared;
+    RecordingSnapshot capture;
+    std::filesystem::path publishedFile;
+    std::string errorMessage;
+    std::string warningMessage;
+
+    [[nodiscard]] bool success() const noexcept {
+        return prepared != nullptr && errorMessage.empty();
+    }
+};
 
 struct AudioFilePreparationResult {
     AudioFilePreparationResult(PreparedAudioFilePtr p = {}, std::string message = {},
@@ -225,6 +238,31 @@ public:
         return transportSnapshot();
     }
     [[nodiscard]] virtual mixer::MeterSnapshot meterSnapshot() const noexcept = 0;
+
+    // Recording preflight/finalization are non-RT. Implementations may perform
+    // device configuration and filesystem work there. Only tryRequestRecord and
+    // the callback-side capture path cross the bounded RT command boundary.
+    [[nodiscard]] virtual RecordingPreflightResult prepareRecording(
+        const RecordingPreflightRequest&) {
+        return {{}, "Recording is not supported"};
+    }
+    [[nodiscard]] virtual AudioControlRequestResult tryRequestRecord(
+        RecordingRequest) noexcept {
+        AudioControlRequestResult result;
+        result.rejection = AudioControlRejection::unavailable;
+        return result;
+    }
+    [[nodiscard]] virtual bool tryCancelRecording() noexcept { return false; }
+    virtual void serviceRecording() noexcept {}
+    [[nodiscard]] virtual RecordingSnapshot recordingSnapshot() const noexcept {
+        return {};
+    }
+    [[nodiscard]] virtual RecordingFinalizationResult finalizeRecording() {
+        return {{}, {}, {}, "Recording finalization is not supported", {}};
+    }
+    [[nodiscard]] virtual bool discardRecording(
+        bool /* removePublished */) noexcept { return true; }
+    virtual void confirmRecordingCommit() noexcept {}
 };
 
 } // namespace vitadaw::audio

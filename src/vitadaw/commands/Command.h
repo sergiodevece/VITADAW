@@ -19,6 +19,9 @@ struct AddAudioTrack {
     std::string name{};
     media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
 };
+struct SetTrackRecordArmed { tracks::TrackId track; bool armed{}; };
+struct Record {};
+struct CancelRecording {};
 struct DeleteAudioTrack { tracks::TrackId track; };
 enum class TrackPlacement { before, after };
 struct ReorderAudioTrack {
@@ -184,6 +187,7 @@ struct SetProcessorParameter {
 };
 
 using Command = std::variant<AddAudioTrack, DeleteAudioTrack, ReorderAudioTrack,
+                             SetTrackRecordArmed, Record, CancelRecording,
                              AddBus, LoadAudioFile,
                              ImportAudioToTrack, ImportAudioFile,
                              AddClip, RemoveClip,

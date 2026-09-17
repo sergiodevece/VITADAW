@@ -1,4 +1,4 @@
-# VitaDAW 0.6.6 — Arrange Foundation Completion
+# VitaDAW 0.7.0 — Audio Recording Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -728,6 +728,10 @@ La arquitectura y las reglas de tiempo real se describen en
 - **0.6.6 — Arrange Foundation Completion:** Time Selection efímera, Snap
   portable de beat/frames/edges, copia explícita hacia Loop y primera medición
   no contractual del coste de rebuild.
+- **0.7.0 — Audio Recording Foundation:** arm exclusivo y efímero, captura
+  mono/estéreo por inputs 1–2 mediante ring SPSC preasignado, WAV temporal en
+  `<ProjectName> Audio/`, publicación transaccional y Undo/Redo con identidad
+  exacta y verificación del medio.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -762,4 +766,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.3.md`](docs/validation-0.6.3.md) y
 [`docs/validation-0.6.4.md`](docs/validation-0.6.4.md) y
 [`docs/validation-0.6.5.md`](docs/validation-0.6.5.md) y
-[`docs/validation-0.6.6.md`](docs/validation-0.6.6.md).
+[`docs/validation-0.6.6.md`](docs/validation-0.6.6.md) y
+[`docs/validation-0.7.0.md`](docs/validation-0.7.0.md).

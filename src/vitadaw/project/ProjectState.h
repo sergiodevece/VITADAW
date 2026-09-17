@@ -253,6 +253,12 @@ private:
         std::size_t targetIndex) noexcept;
     [[nodiscard]] bool restoreHistoryClips(
         std::span<const ClipHistoryState> clips);
+    [[nodiscard]] bool restoreHistoryRecording(
+        tracks::TrackId, const media::AudioSource&,
+        const clips::AudioClip&);
+    [[nodiscard]] bool deleteHistoryRecording(
+        tracks::TrackId, const media::AudioSource&,
+        const clips::AudioClip&) noexcept;
     [[nodiscard]] bool deleteHistoryClips(
         std::span<const ClipHistoryState> clips) noexcept;
     [[nodiscard]] bool replaceHistoryClips(

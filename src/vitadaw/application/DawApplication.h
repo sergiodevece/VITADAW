@@ -42,6 +42,15 @@ public:
     [[nodiscard]] bool loopEnabled() const noexcept { return session_.loopEnabled; }
     [[nodiscard]] bool metronomeEnabled() const noexcept { return session_.metronomeEnabled; }
     [[nodiscard]] audio::MetronomeLevelDb metronomeLevel() const noexcept { return session_.metronomeLevel; }
+    [[nodiscard]] std::optional<tracks::TrackId> armedTrack() const noexcept {
+        return session_.armedTrack;
+    }
+    [[nodiscard]] audio::RecordingPhase recordingPhase() const noexcept {
+        return recordingPhase_;
+    }
+    [[nodiscard]] const std::string& recordingError() const noexcept {
+        return recordingError_;
+    }
     [[nodiscard]] ui::timeline::MetronomeReadModel
         metronomeReadModel() const noexcept;
 
@@ -62,6 +71,14 @@ private:
         history::UndoManager::PendingAppend* pending = nullptr,
         int historyDirection = 0,
         std::vector<clips::ClipId> createdClips = {});
+    [[nodiscard]] commands::CommandResult commitRecordedAudio(
+        audio::RecordingFinalizationResult);
+    [[nodiscard]] commands::CommandResult redoRecordedAudio(
+        const history::RecordAudio&);
+    void synchroniseRecording() noexcept;
+    [[nodiscard]] bool recordingBusy() const noexcept {
+        return activeRecording_.session != 0;
+    }
     [[nodiscard]] audio::PreparedAudibilityState resolveAudibility(
         const project::ProjectState& project,
         tracks::TrackId overriddenTrack = {},
@@ -78,6 +95,9 @@ private:
     std::unique_ptr<const musical::PreparedMusicalTimeMap> musicalTime_;
     std::optional<audio::PreparedLoopView> preparedLoopView_;
     std::uint64_t musicalRevision_{};
+    audio::RecordingRequest activeRecording_;
+    audio::RecordingPhase recordingPhase_{audio::RecordingPhase::idle};
+    std::string recordingError_;
 };
 
 } // namespace vitadaw::application

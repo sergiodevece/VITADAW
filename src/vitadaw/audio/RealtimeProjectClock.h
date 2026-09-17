@@ -30,6 +30,10 @@ public:
         if (duration_.value <= 0 && !loop_ && !runUntilStop_) return false;
         return transition({transport::TransportActionKind::play, {}}).accepted;
     }
+    bool record() noexcept {
+        runUntilStop_ = true;
+        return transition({transport::TransportActionKind::record, {}}).accepted;
+    }
     void pause() noexcept { static_cast<void>(transition({transport::TransportActionKind::pause, {}})); }
     void stop() noexcept { static_cast<void>(transition({transport::TransportActionKind::stop, {}})); }
     bool seek(timeline::ProjectFramePosition target) noexcept {

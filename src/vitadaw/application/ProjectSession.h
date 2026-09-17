@@ -2,6 +2,7 @@
 #include "vitadaw/history/UndoManager.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/waveform/WaveformCache.h"
+#include <optional>
 
 namespace vitadaw::application {
 struct ProjectSession {
@@ -15,6 +16,7 @@ struct ProjectSession {
     audio::MetronomeLevelDb metronomeLevel{};
     waveform::WaveformCache waveforms;
     std::uint64_t appliedTemporalRevision{};
+    std::optional<tracks::TrackId> armedTrack;
     [[nodiscard]] bool dirty() const noexcept { return history.currentStateToken() != savedStateToken; }
     void adopt(project::ProjectState& candidate, std::filesystem::path& path,
                waveform::WaveformCache& candidateWaveforms) noexcept {
@@ -27,6 +29,7 @@ struct ProjectSession {
         metronomeEnabled = false;
         metronomeLevel = {};
         appliedTemporalRevision = 0;
+        armedTrack.reset();
     }
 };
 } // namespace vitadaw::application

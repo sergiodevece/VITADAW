@@ -5,8 +5,11 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <fcntl.h>
 #include <iostream>
 #include <new>
+#include <optional>
+#include <unistd.h>
 
 namespace {
 std::atomic<bool> countRealtimeAllocations{};
@@ -28,6 +31,34 @@ void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); 
 namespace vitadaw::platform::juce_adapter {
 class PersistenceIntegrationAccess {
 public:
+    static std::optional<JuceAudioDeviceAdapter::FileIdentity> createExclusiveTemporary(
+        const std::filesystem::path& path, std::error_code& error) {
+        auto temporary = JuceAudioDeviceAdapter::createExclusiveTemporaryFile(path, error);
+        if (!temporary) return std::nullopt;
+        static_cast<void>(::close(temporary->release()));
+        return temporary->identity;
+    }
+    static bool closesExclusiveOnAbandon(const std::filesystem::path& path,
+                                         std::error_code& error) {
+        auto temporary = JuceAudioDeviceAdapter::createExclusiveTemporaryFile(path, error);
+        if (!temporary) return false;
+        const auto descriptor = temporary->descriptor_;
+        temporary.reset(); // Models allocation failure before stream construction.
+        errno = 0;
+        return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+    }
+    static bool discard(JuceAudioDeviceAdapter& adapter,
+                        const std::filesystem::path& temporary,
+                        std::optional<JuceAudioDeviceAdapter::FileIdentity> temporaryIdentity,
+                        const std::filesystem::path& published,
+                        std::optional<JuceAudioDeviceAdapter::FileIdentity> publishedIdentity,
+                        bool removePublished) {
+        adapter.recordingTemporaryPath_ = temporary;
+        adapter.recordingTemporaryIdentity_ = temporaryIdentity;
+        adapter.recordingPublishedPath_ = published;
+        adapter.recordingPublishedIdentity_ = publishedIdentity;
+        return adapter.discardRecording(removePublished);
+    }
     static float render(JuceAudioDeviceAdapter& adapter) {
         // Never initialise AudioDeviceManager: exclusive, synchronous test consumer.
         adapter.realtimeEngine_.deviceInitialising();
@@ -117,6 +148,98 @@ int main(){
           app.waveformCache().find({1})->levels[0].channels[0][0].maximum>0.2F,
           "waveform rebuilds from verified media on project reopen");
     check(engine.preparedAudioBytes()==480*sizeof(float),"one decoded PCM for ten clips");
+    const auto externalTemporary = path(".Recording 000001.1.part.wav");
+    const auto ownedTemporary = path(".Recording 000001.2.part.wav");
+    const auto abandonedTemporary = path(".Recording 000001.0.part.wav");
+    const auto competingFinal = path("Recording 000001.wav");
+    check(juce::File{juce::String(externalTemporary.wstring().c_str())}
+              .replaceWithText("external temporary"),
+          "create externally owned temporary-like fixture");
+    std::error_code ownershipError;
+    check(platform::juce_adapter::PersistenceIntegrationAccess::closesExclusiveOnAbandon(
+              abandonedTemporary, ownershipError),
+          "exclusive temporary RAII closes its descriptor before stream ownership transfer");
+    check(!platform::juce_adapter::PersistenceIntegrationAccess::createExclusiveTemporary(
+              externalTemporary, ownershipError).has_value() &&
+              juce::File{juce::String(externalTemporary.wstring().c_str())}
+                  .loadFileAsString() == "external temporary",
+          "exclusive temporary creation never deletes a pre-existing temporary-like file");
+    ownershipError.clear();
+    const auto ownedTemporaryIdentity =
+        platform::juce_adapter::PersistenceIntegrationAccess::createExclusiveTemporary(
+            ownedTemporary, ownershipError);
+    check(ownedTemporaryIdentity &&
+              !platform::juce_adapter::PersistenceIntegrationAccess::discard(
+                  engine, ownedTemporary, ownedTemporaryIdentity, {}, std::nullopt, false) &&
+              juce::File{juce::String(ownedTemporary.wstring().c_str())}.existsAsFile() &&
+              juce::File{juce::String(externalTemporary.wstring().c_str())}.existsAsFile(),
+          "temporary cleanup retains an owned orphan rather than deleting by pathname");
+    const auto publishedTemporary = path(".Recording 000001.3.part.wav");
+    const auto replacedTemporary = path(".Recording 000001.4.part.wav");
+    const auto ownedPublishedTemporary =
+        platform::juce_adapter::PersistenceIntegrationAccess::createExclusiveTemporary(
+            publishedTemporary, ownershipError);
+    check(ownedPublishedTemporary &&
+              juce::File{juce::String(competingFinal.wstring().c_str())}
+                  .replaceWithText("external final"),
+          "create publication-collision fixtures");
+    std::filesystem::create_hard_link(publishedTemporary, competingFinal, ownershipError);
+    check(ownershipError &&
+              juce::File{juce::String(competingFinal.wstring().c_str())}
+                  .loadFileAsString() == "external final",
+          "no-replace publication preserves a competing final file");
+    check(!platform::juce_adapter::PersistenceIntegrationAccess::discard(
+              engine, publishedTemporary, ownedPublishedTemporary, competingFinal, std::nullopt, true) &&
+              juce::File{juce::String(competingFinal.wstring().c_str())}
+                  .loadFileAsString() == "external final",
+          "failed publication cleanup never deletes an unowned competing final");
+
+    const auto ownedFinalTemporary = path(".Recording 000002.3.part.wav");
+    const auto ownedFinalIdentity =
+        platform::juce_adapter::PersistenceIntegrationAccess::createExclusiveTemporary(
+            ownedFinalTemporary, ownershipError);
+    const auto ownedFinal = path("Recording 000002.wav");
+    ownershipError.clear();
+    std::filesystem::create_hard_link(ownedFinalTemporary, ownedFinal, ownershipError);
+    check(ownedFinalIdentity && !ownershipError &&
+              !platform::juce_adapter::PersistenceIntegrationAccess::discard(
+                  engine, ownedFinalTemporary, ownedFinalIdentity, ownedFinal,
+                  ownedFinalIdentity, false) &&
+              juce::File{juce::String(ownedFinal.wstring().c_str())}.existsAsFile(),
+          "owned final survives retained temporary cleanup");
+    check(!platform::juce_adapter::PersistenceIntegrationAccess::discard(
+              engine, {}, std::nullopt, ownedFinal, ownedFinalIdentity, true) &&
+              juce::File{juce::String(ownedFinal.wstring().c_str())}.existsAsFile(),
+          "rollback retains a published final as an explicit safe orphan");
+
+    const auto replacementTemporary = path(".Recording 000003.3.part.wav");
+    const auto replacementIdentity =
+        platform::juce_adapter::PersistenceIntegrationAccess::createExclusiveTemporary(
+            replacementTemporary, ownershipError);
+    const auto replaceableFinal = path("Recording 000003.wav");
+    ownershipError.clear();
+    std::filesystem::create_hard_link(replacementTemporary, replaceableFinal, ownershipError);
+    check(replacementIdentity && !ownershipError && std::filesystem::remove(replaceableFinal, ownershipError) &&
+              juce::File{juce::String(replaceableFinal.wstring().c_str())}
+                  .replaceWithText("replacement final") &&
+              !platform::juce_adapter::PersistenceIntegrationAccess::discard(
+                  engine, replacementTemporary, replacementIdentity, replaceableFinal,
+                  replacementIdentity, true) &&
+              juce::File{juce::String(replaceableFinal.wstring().c_str())}
+                  .loadFileAsString() == "replacement final",
+          "cleanup rejects a final pathname replaced after publication");
+
+    const auto replacedTemporaryIdentity =
+        platform::juce_adapter::PersistenceIntegrationAccess::createExclusiveTemporary(
+            replacedTemporary, ownershipError);
+    check(replacedTemporaryIdentity && std::filesystem::remove(replacedTemporary, ownershipError) &&
+              juce::File{juce::String(replacedTemporary.wstring().c_str())}
+                  .replaceWithText("replacement temporary") &&
+              !platform::juce_adapter::PersistenceIntegrationAccess::discard(
+                  engine, replacedTemporary, replacedTemporaryIdentity, {}, std::nullopt, false) &&
+              juce::File{juce::String(replacedTemporary.wstring().c_str())}
+                  .loadFileAsString() == "replacement temporary",
+          "cleanup never deletes a temporary pathname replaced after exclusive creation");
     engine.shutdown();check(dir.deleteRecursively(),"remove own temporary files");
     std::cout<<"JUCE media persistence integration passed without audio hardware\n";
 }

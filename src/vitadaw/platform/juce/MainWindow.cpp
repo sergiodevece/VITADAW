@@ -90,6 +90,18 @@ public:
         playButton_.onClick = [this] { dispatch(commands::Play{}); };
         pauseButton_.onClick = [this] { dispatch(commands::Pause{}); };
         stopButton_.onClick = [this] { dispatch(commands::Stop{}); };
+        armButton_.onClick = [this] {
+            const auto selected = timeline_.selectedTrackId();
+            if (!selected) {
+                showResult({commands::CommandStatus::rejected,
+                            "Select a track before arming it",
+                            commands::CommandError::selectTargetTrack});
+                return;
+            }
+            dispatch(commands::SetTrackRecordArmed{
+                *selected, application_.armedTrack() != selected});
+        };
+        recordButton_.onClick = [this] { dispatch(commands::Record{}); };
         undoButton_.onClick = [this] { dispatch(commands::Undo{}); };
         redoButton_.onClick = [this] { dispatch(commands::Redo{}); };
         saveButton_.onClick = [this] { dispatch(commands::SaveProject{}); };
@@ -155,6 +167,8 @@ public:
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_})
             addAndMakeVisible(*button);
+        addAndMakeVisible(armButton_);
+        addAndMakeVisible(recordButton_);
         updateHistoryControls();
     }
 
@@ -181,6 +195,26 @@ public:
         for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_})
             button->setEnabled(state.playback == transport::PlaybackState::stopped);
         const auto stopped = state.playback == transport::PlaybackState::stopped;
+        const auto recordingPhase = application_.recordingPhase();
+        const auto recordingBusy = recordingPhase == audio::RecordingPhase::capturing ||
+                                   recordingPhase == audio::RecordingPhase::finalizing;
+        const auto selected = timeline_.selectedTrackId();
+        const auto armed = application_.armedTrack();
+        armButton_.setButtonText(armed && selected == armed ? "Disarm Track" : "Arm Track");
+        armButton_.setEnabled(stopped && !recordingBusy && selected.has_value());
+        recordButton_.setEnabled(stopped && !recordingBusy && armed.has_value());
+        recordButton_.setColour(juce::TextButton::buttonColourId,
+                                recordingBusy ? juce::Colours::darkred
+                                              : juce::Colour{0xff9d2028});
+        if (recordingPhase != displayedRecordingPhase_) {
+            displayedRecordingPhase_ = recordingPhase;
+            if (recordingPhase == audio::RecordingPhase::failed)
+                resultLabel_.setText("Error: " + juce::String(application_.recordingError()),
+                                     juce::dontSendNotification);
+            else if (recordingPhase == audio::RecordingPhase::complete)
+                resultLabel_.setText("OK: Recording committed",
+                                     juce::dontSendNotification);
+        }
         addMonoTrack_.setEnabled(stopped);
         addStereoTrack_.setEnabled(stopped);
         deleteTrack_.setEnabled(stopped);
@@ -258,6 +292,10 @@ public:
         metronomeLevel_.setBounds(loopRow.removeFromLeft(190));
 
         auto commandRow = bounds.removeFromTop(32);
+        armButton_.setBounds(commandRow.removeFromLeft(112));
+        commandRow.removeFromLeft(5);
+        recordButton_.setBounds(commandRow.removeFromLeft(84));
+        commandRow.removeFromLeft(10);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_}) {
             const auto width = button == &loadProjectButton_ ? 126 :
@@ -424,6 +462,7 @@ private:
     juce::TextButton moveTrackUp_{"Move Track Up"};
     juce::TextButton moveTrackDown_{"Move Track Down"};
     juce::TextButton playButton_{"Play"}, pauseButton_{"Pause"}, stopButton_{"Stop"};
+    juce::TextButton armButton_{"Arm Track"}, recordButton_{"Record"};
     juce::TextButton undoButton_{"Undo"}, redoButton_{"Redo"};
     juce::TextButton saveButton_{"Save"}, saveAsButton_{"Save As..."};
     juce::TextButton loadProjectButton_{"Load Project..."};
@@ -437,6 +476,7 @@ private:
     juce::ToggleButton metronomeEnabled_{"Metronome"};
     juce::Slider metronomeLevel_{juce::Slider::LinearHorizontal,
                                  juce::Slider::TextBoxRight};
+    audio::RecordingPhase displayedRecordingPhase_{audio::RecordingPhase::idle};
     std::unique_ptr<juce::FileChooser> fileChooser_;
 };
 

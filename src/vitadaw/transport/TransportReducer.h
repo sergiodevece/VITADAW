@@ -8,7 +8,9 @@
 
 namespace vitadaw::transport {
 
-enum class TransportActionKind : std::uint8_t { play, pause, stop, seek, finish, rewind };
+enum class TransportActionKind : std::uint8_t {
+    play, record, pause, stop, seek, finish, rewind
+};
 
 struct TransportAction {
     TransportActionKind kind{TransportActionKind::stop};
@@ -72,6 +74,9 @@ struct TransportReductionPolicy {
             next.playback = PlaybackState::playing;
             return {true, next, false, ClockEffect::locate};
         }
+        next.playback = PlaybackState::playing;
+        return {true, next, false};
+    case TransportActionKind::record:
         next.playback = PlaybackState::playing;
         return {true, next, false};
     case TransportActionKind::pause:

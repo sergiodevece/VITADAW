@@ -1,19 +1,166 @@
 #include "vitadaw/platform/juce/JuceAudioDeviceAdapter.h"
 #include "vitadaw/audio/AudioPreparationPolicy.h"
 #include "vitadaw/platform/files/ProjectFileIO.h"
+#include "vitadaw/platform/juce/RecordingInputSetupPolicy.h"
 
 #include <juce_audio_formats/juce_audio_formats.h>
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <exception>
+#include <cerrno>
+#include <filesystem>
+#include <fcntl.h>
+#include <iomanip>
 #include <limits>
 #include <new>
+#include <sstream>
+#include <system_error>
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace vitadaw::platform::juce_adapter {
+
+namespace {
+
+void closeDescriptor(int descriptor) noexcept {
+#if defined(_WIN32)
+    if (descriptor >= 0) static_cast<void>(::_close(descriptor));
+#else
+    if (descriptor >= 0) static_cast<void>(::close(descriptor));
+#endif
+}
+
+class OwnedDescriptorOutputStream final : public juce::OutputStream {
+public:
+    explicit OwnedDescriptorOutputStream(
+        JuceAudioDeviceAdapter::ExclusiveTemporaryFile&& file) noexcept
+        : descriptor_(file.release()) {}
+    ~OwnedDescriptorOutputStream() override { closeDescriptor(descriptor_); }
+
+    void flush() override {
+#if !defined(_WIN32)
+        if (descriptor_ >= 0) static_cast<void>(::fsync(descriptor_));
+#endif
+    }
+    bool setPosition(juce::int64 position) override {
+        if (position < 0 || descriptor_ < 0) return false;
+#if defined(_WIN32)
+        if (::_lseeki64(descriptor_, position, SEEK_SET) < 0) return false;
+#else
+        if (::lseek(descriptor_, static_cast<off_t>(position), SEEK_SET) < 0) return false;
+#endif
+        position_ = position;
+        return true;
+    }
+    juce::int64 getPosition() override { return position_; }
+    bool write(const void* bytes, size_t count) override {
+        const auto* cursor = static_cast<const std::byte*>(bytes);
+        while (count != 0) {
+#if defined(_WIN32)
+            const auto written = ::_write(descriptor_, cursor,
+                                          static_cast<unsigned int>(std::min<std::size_t>(count, UINT_MAX)));
+#else
+            const auto written = ::write(descriptor_, cursor, count);
+#endif
+            if (written <= 0) return false;
+            cursor += written;
+            count -= static_cast<std::size_t>(written);
+            position_ += written;
+        }
+        return true;
+    }
+
+private:
+    int descriptor_;
+    juce::int64 position_{};
+};
+
+[[nodiscard]] std::optional<JuceAudioDeviceAdapter::FileIdentity> descriptorIdentity(
+    int descriptor) noexcept {
+    struct stat state {};
+#if defined(_WIN32)
+    if (::_fstat64(descriptor, &state) != 0) return std::nullopt;
+#else
+    if (::fstat(descriptor, &state) != 0) return std::nullopt;
+#endif
+    return JuceAudioDeviceAdapter::FileIdentity{
+        static_cast<std::uint64_t>(state.st_dev), static_cast<std::uint64_t>(state.st_ino)};
+}
+
+[[nodiscard]] std::optional<JuceAudioDeviceAdapter::FileIdentity> pathnameIdentity(
+    const std::filesystem::path& path) noexcept {
+    struct stat state {};
+#if defined(_WIN32)
+    if (::_stat64(path.string().c_str(), &state) != 0) return std::nullopt;
+#else
+    if (::lstat(path.c_str(), &state) != 0) return std::nullopt;
+#endif
+    return JuceAudioDeviceAdapter::FileIdentity{
+        static_cast<std::uint64_t>(state.st_dev), static_cast<std::uint64_t>(state.st_ino)};
+}
+
+} // namespace
+
+JuceAudioDeviceAdapter::ExclusiveTemporaryFile::~ExclusiveTemporaryFile() noexcept {
+    closeDescriptor(descriptor_);
+}
+
+JuceAudioDeviceAdapter::ExclusiveTemporaryFile::ExclusiveTemporaryFile(
+    ExclusiveTemporaryFile&& other) noexcept
+    : identity(other.identity), descriptor_(std::exchange(other.descriptor_, -1)) {}
+
+JuceAudioDeviceAdapter::ExclusiveTemporaryFile&
+JuceAudioDeviceAdapter::ExclusiveTemporaryFile::operator=(ExclusiveTemporaryFile&& other) noexcept {
+    if (this == &other) return *this;
+    closeDescriptor(descriptor_);
+    descriptor_ = std::exchange(other.descriptor_, -1);
+    identity = other.identity;
+    return *this;
+}
+
+int JuceAudioDeviceAdapter::ExclusiveTemporaryFile::release() noexcept {
+    return std::exchange(descriptor_, -1);
+}
+
+std::optional<JuceAudioDeviceAdapter::ExclusiveTemporaryFile>
+JuceAudioDeviceAdapter::createExclusiveTemporaryFile(
+    const std::filesystem::path& path, std::error_code& error) noexcept {
+#if defined(_WIN32)
+    const auto descriptor = ::_open(path.string().c_str(),
+                                   _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                                   _S_IREAD | _S_IWRITE);
+#else
+    const auto descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
+    if (descriptor < 0) {
+        error = {errno, std::generic_category()};
+        return std::nullopt;
+    }
+    const auto identity = descriptorIdentity(descriptor);
+    if (!identity || !identity->valid()) {
+        error = {errno != 0 ? errno : EIO, std::generic_category()};
+        closeDescriptor(descriptor);
+        return std::nullopt;
+    }
+    return ExclusiveTemporaryFile{descriptor, *identity};
+}
+
+bool JuceAudioDeviceAdapter::pathHasIdentity(
+    const std::filesystem::path& path, FileIdentity identity) noexcept {
+    const auto actual = pathnameIdentity(path);
+    return actual && *actual == identity;
+}
 
 struct JuceAudioDeviceAdapter::PreparedAudio {
     juce::AudioBuffer<float> samples;
@@ -89,7 +236,10 @@ bool JuceAudioDeviceAdapter::initialise() {
 }
 
 bool JuceAudioDeviceAdapter::reinitialise() { return initialise(); }
-void JuceAudioDeviceAdapter::shutdown() noexcept { closeDevice(true); }
+void JuceAudioDeviceAdapter::shutdown() noexcept {
+    closeDevice(true);
+    static_cast<void>(discardRecording(true));
+}
 
 void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
     if (deviceSampleRate_.isValid() &&
@@ -628,11 +778,318 @@ mixer::MeterSnapshot JuceAudioDeviceAdapter::meterSnapshot() const noexcept {
     return realtimeEngine_.meterSnapshot();
 }
 
+audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
+    const audio::RecordingPreflightRequest& request) {
+    if (!request.track.isValid() || request.projectFile.empty() ||
+        !request.projectFile.is_absolute()) {
+        return {{}, "Save the project to an absolute path before recording"};
+    }
+    if (recordingWriter_ || realtimeEngine_.recordingSnapshot().busy())
+        return {{}, "Another recording is already prepared or active"};
+    const auto channels = static_cast<int>(media::channelCount(request.layout));
+    if (channels < 1 || channels > 2)
+        return {{}, "Only mono and stereo recording are supported"};
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr)
+        return {{}, "No audio device is available"};
+
+    const auto callbackWasRegistered = callbackRegistered_;
+    const auto previousSetup = deviceManager_.getAudioDeviceSetup();
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    auto* deviceType = deviceManager_.getCurrentDeviceTypeObject();
+    if (deviceType == nullptr)
+        return {{}, "No audio input device type is available"};
+    const auto inputDeviceNames = deviceType->getDeviceNames(true);
+    const auto inputSetup = detail::makeRecordingInputSetup(
+        previousSetup, inputDeviceNames, deviceType->getDefaultDeviceIndex(true), channels);
+    if (!inputSetup.success()) return {{}, inputSetup.errorMessage};
+
+    detachAudioCallback(true);
+    const auto setup = inputSetup.setup;
+    const auto rollback = [&](std::string message) {
+        const auto restoreError = deviceManager_.setAudioDeviceSetup(previousSetup, false);
+        auto* restoredDevice = deviceManager_.getCurrentAudioDevice();
+        deviceSampleRate_ = timeline::SampleRate{
+            restoredDevice != nullptr ? restoredDevice->getCurrentSampleRate() : 0.0};
+        std::string preparationError;
+        const bool restored = restoreError.isEmpty() && deviceSampleRate_.isValid() &&
+            reprepareForCurrentDevice(preparationError) &&
+            realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
+        if (restored && callbackWasRegistered) {
+            try { attachAudioCallback(true); }
+            catch (...) {
+                realtimeEngine_.deviceErrorPreservingTransport();
+                return audio::RecordingPreflightResult{
+                    {}, message + "; previous audio callback could not be restored"};
+            }
+        }
+        if (restored) {
+            refreshState();
+            return audio::RecordingPreflightResult{{}, std::move(message)};
+        }
+        realtimeEngine_.deviceErrorPreservingTransport();
+        if (!preparationError.empty())
+            message += "; rollback failed: " + preparationError;
+        else if (restoreError.isNotEmpty())
+            message += "; rollback failed: " + restoreError.toStdString();
+        else
+            message += "; rollback failed";
+        return audio::RecordingPreflightResult{{}, std::move(message)};
+    };
+    const auto setupError = deviceManager_.setAudioDeviceSetup(setup, false);
+    if (setupError.isNotEmpty())
+        return rollback("Audio inputs could not be activated: " + setupError.toStdString());
+    device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr || !detail::recordingInputChannelsAreAvailableAndActive(
+                                 static_cast<std::size_t>(device->getInputChannelNames().size()),
+                                 device->getActiveInputChannels(), channels)) {
+        return rollback("The selected audio input device does not provide the requested active input channels");
+    }
+    deviceSampleRate_ = timeline::SampleRate{
+        device != nullptr ? device->getCurrentSampleRate() : 0.0};
+    std::string reprepareError;
+    if (!deviceSampleRate_.isValid() ||
+        !reprepareForCurrentDevice(reprepareError)) {
+        return rollback(reprepareError.empty()
+                            ? "The input device has an invalid sample rate"
+                            : std::move(reprepareError));
+    }
+
+    try {
+        constexpr double captureSeconds = 2.0;
+        const auto capacityDouble = std::ceil(deviceSampleRate_.hertz() * captureSeconds);
+        if (capacityDouble <= 0.0 ||
+            capacityDouble > static_cast<double>(std::numeric_limits<std::size_t>::max()) ||
+            !realtimeEngine_.prepareRecordingCapture(
+                static_cast<std::size_t>(capacityDouble))) {
+            return rollback("The realtime recording buffer could not be prepared");
+        }
+
+        const auto audioDirectory = request.projectFile.parent_path() /
+            (request.projectFile.stem().string() + " Audio");
+        std::error_code filesystemError;
+        std::filesystem::create_directories(audioDirectory, filesystemError);
+        if (filesystemError)
+            throw std::filesystem::filesystem_error(
+                "create recording directory", audioDirectory, filesystemError);
+
+        const auto session = nextRecordingSession_;
+        if (session == 0) throw std::runtime_error("Recording session counter exhausted");
+        std::ostringstream name;
+        name << "Recording " << std::setw(6) << std::setfill('0') << session;
+        auto published = audioDirectory / (name.str() + ".wav");
+        while (std::filesystem::exists(published, filesystemError) && !filesystemError) {
+            if (++nextRecordingSession_ == 0)
+                throw std::runtime_error("Recording session counter exhausted");
+            name.str({});
+            name.clear();
+            name << "Recording " << std::setw(6) << std::setfill('0')
+                 << nextRecordingSession_;
+            published = audioDirectory / (name.str() + ".wav");
+        }
+        if (filesystemError)
+            throw std::filesystem::filesystem_error(
+                "inspect recording destination", published, filesystemError);
+        std::filesystem::path temporary;
+        for (;;) {
+            if (nextRecordingTemporaryNonce_ == 0)
+                throw std::runtime_error("Recording temporary counter exhausted");
+            temporary = audioDirectory / ("." + name.str() + "." +
+                                          std::to_string(nextRecordingTemporaryNonce_++) +
+                                          ".part.wav");
+            auto exclusive = createExclusiveTemporaryFile(temporary, filesystemError);
+            if (exclusive) {
+                // Publish cleanup metadata before allocation or writer setup can
+                // throw.  The identity, not the pathname, authorizes cleanup.
+                recordingTemporaryPath_ = temporary;
+                recordingPublishedPath_ = published;
+                recordingTemporaryIdentity_ = exclusive->identity;
+                std::unique_ptr<juce::OutputStream> stream =
+                    std::make_unique<OwnedDescriptorOutputStream>(std::move(*exclusive));
+                juce::WavAudioFormat format;
+                auto writer = format.createWriterFor(
+                    stream, juce::AudioFormatWriterOptions{}
+                                .withSampleRate(deviceSampleRate_.hertz())
+                                .withNumChannels(channels)
+                                .withBitsPerSample(32)
+                                .withSampleFormat(
+                                    juce::AudioFormatWriterOptions::SampleFormat::floatingPoint));
+                if (!writer)
+                    throw std::runtime_error("The WAV writer could not be created");
+                recordingWriter_ = std::move(writer);
+                break;
+            }
+            if (filesystemError == std::errc::file_exists) {
+                filesystemError.clear();
+                continue;
+            }
+            throw std::filesystem::filesystem_error(
+                "create exclusive recording temporary", temporary, filesystemError);
+        }
+        recordingDrainBuffer_.setSize(channels, 8192, false, true, false);
+        recordingWriterFailed_ = false;
+        recordingWriterError_.clear();
+        const audio::RecordingRequest prepared{
+            nextRecordingSession_++, request.track, request.layout};
+        if (callbackWasRegistered) attachAudioCallback(true);
+        refreshState();
+        return {prepared, {}};
+    } catch (const std::exception& error) {
+        recordingWriter_.reset();
+        realtimeEngine_.resetRecordingCapture();
+        const bool retainedTemporary = !recordingTemporaryPath_.empty();
+        recordingTemporaryPath_.clear();
+        recordingPublishedPath_.clear();
+        recordingTemporaryIdentity_.reset();
+        recordingPublishedIdentity_.reset();
+        return rollback(std::string{error.what()} + (retainedTemporary
+            ? "; recording temporary retained as an ownership-safe orphan"
+            : ""));
+    }
+}
+
+audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestRecord(
+    audio::RecordingRequest request) noexcept {
+    if (!recordingWriter_ || request.session == 0) return {};
+    return realtimeEngine_.tryRequestRecord(request);
+}
+
+bool JuceAudioDeviceAdapter::tryCancelRecording() noexcept {
+    return realtimeEngine_.tryCancelRecording();
+}
+
+void JuceAudioDeviceAdapter::serviceRecording() noexcept {
+    if (!recordingWriter_) return;
+    const auto snapshot = realtimeEngine_.recordingSnapshot();
+    const auto channels = static_cast<int>(media::channelCount(snapshot.layout));
+    if (channels < 1 || channels > recordingDrainBuffer_.getNumChannels()) return;
+    std::array<float*, 2> output{};
+    for (int channel = 0; channel < channels; ++channel)
+        output[static_cast<std::size_t>(channel)] =
+            recordingDrainBuffer_.getWritePointer(channel);
+    while (true) {
+        const auto drained = realtimeEngine_.drainRecording(
+            {output.data(), static_cast<std::size_t>(channels),
+             static_cast<std::size_t>(recordingDrainBuffer_.getNumSamples())});
+        if (drained == 0) break;
+        if (!recordingWriter_->writeFromAudioSampleBuffer(
+                recordingDrainBuffer_, 0, static_cast<int>(drained))) {
+            recordingWriterFailed_ = true;
+            recordingWriterError_ = "The captured samples could not be written to WAV";
+            static_cast<void>(realtimeEngine_.tryCancelRecording());
+            break;
+        }
+    }
+    if (recordingWriterFailed_ && snapshot.phase == audio::RecordingPhase::capturing)
+        static_cast<void>(realtimeEngine_.tryCancelRecording());
+}
+
+audio::RecordingSnapshot JuceAudioDeviceAdapter::recordingSnapshot() const noexcept {
+    auto result = realtimeEngine_.recordingSnapshot();
+    if (recordingWriterFailed_ && result.phase != audio::RecordingPhase::capturing &&
+        result.phase != audio::RecordingPhase::prepared) {
+        result.phase = audio::RecordingPhase::failed;
+        result.failure = audio::RecordingFailure::writerFailed;
+    }
+    return result;
+}
+
+audio::RecordingFinalizationResult JuceAudioDeviceAdapter::finalizeRecording() {
+    serviceRecording();
+    const auto capture = recordingSnapshot();
+    audio::RecordingFinalizationResult result;
+    result.capture = capture;
+    result.publishedFile = recordingPublishedPath_;
+    if (capture.phase != audio::RecordingPhase::complete ||
+        capture.acceptedDeviceFrames.value == 0 || recordingWriterFailed_) {
+        result.errorMessage = recordingWriterError_.empty()
+                                  ? "Capture did not complete successfully"
+                                  : recordingWriterError_;
+        return result;
+    }
+    recordingWriter_.reset(); // Closes the descriptor that was opened with O_EXCL.
+    std::error_code error;
+    // Hard-link publication is an atomic no-replace operation in the sibling
+    // directory. Unlike rename on POSIX, it cannot replace a file which
+    // appeared after name selection.
+    if (!recordingTemporaryIdentity_ ||
+        !pathHasIdentity(recordingTemporaryPath_, *recordingTemporaryIdentity_)) {
+        result.errorMessage = "The owned recording temporary was replaced before publication";
+        return result;
+    }
+    std::filesystem::create_hard_link(recordingTemporaryPath_, recordingPublishedPath_, error);
+    if (error) {
+        result.errorMessage = "The recorded WAV could not be published: " + error.message();
+        return result;
+    }
+    if (!pathHasIdentity(recordingPublishedPath_, *recordingTemporaryIdentity_)) {
+        result.errorMessage = "The recording publication identity could not be verified";
+        return result;
+    }
+    recordingPublishedIdentity_ = recordingTemporaryIdentity_;
+    // POSIX has no atomic identity-conditioned unlink.  Retaining this hidden
+    // temporary is safer than a check-then-unlink that could delete a pathname
+    // replacement.  It is reported to the application as an orphan.
+    result.warningMessage =
+        "Recorded WAV published; temporary retained as an ownership-safe orphan";
+    auto prepared = prepareWav(recordingPublishedPath_);
+    if (!prepared.success()) {
+        result.errorMessage = prepared.errorMessage.empty()
+                                  ? "The recorded WAV could not be decoded"
+                                  : std::move(prepared.errorMessage);
+        return result;
+    }
+    // Decoding is pathname-based. Reject a destination which changed while it
+    // was being verified so ProjectState can never commit that replacement.
+    if (!recordingPublishedIdentity_ ||
+        !pathHasIdentity(recordingPublishedPath_, *recordingPublishedIdentity_)) {
+        result.errorMessage = "The recorded WAV was replaced during verification";
+        return result;
+    }
+    result.prepared = std::move(prepared.prepared);
+    return result;
+}
+
+bool JuceAudioDeviceAdapter::discardRecording(bool removePublished) noexcept {
+    if (realtimeEngine_.recordingSnapshot().phase == audio::RecordingPhase::capturing)
+        static_cast<void>(realtimeEngine_.tryCancelRecording());
+    recordingWriter_.reset();
+    // Never delete recording media by pathname: a prior identity observation is
+    // not an atomic authorization for unlink on supported POSIX filesystems.
+    // Retention is reported as an orphan instead of risking external deletion.
+    const bool retainedTemporary = !recordingTemporaryPath_.empty();
+    const bool retainedPublished = removePublished && recordingPublishedIdentity_.has_value();
+    recordingTemporaryPath_.clear();
+    recordingPublishedPath_.clear();
+    recordingTemporaryIdentity_.reset();
+    recordingPublishedIdentity_.reset();
+    recordingWriterFailed_ = false;
+    recordingWriterError_.clear();
+    realtimeEngine_.resetRecordingCapture();
+    return !retainedTemporary && !retainedPublished;
+}
+
+void JuceAudioDeviceAdapter::confirmRecordingCommit() noexcept {
+    recordingWriter_.reset();
+    // See discardRecording: the successfully published final remains valid and
+    // its hidden temporary is retained rather than deleted by pathname.
+    recordingTemporaryPath_.clear();
+    recordingPublishedPath_.clear();
+    recordingTemporaryIdentity_.reset();
+    recordingPublishedIdentity_.reset();
+    recordingWriterFailed_ = false;
+    recordingWriterError_.clear();
+    realtimeEngine_.resetRecordingCapture();
+}
+
 void JuceAudioDeviceAdapter::audioDeviceIOCallbackWithContext(
-    const float* const*, int, float* const* output, int channels, int frames,
+    const float* const* input, int inputChannels,
+    float* const* output, int outputChannels, int frames,
     const juce::AudioIODeviceCallbackContext&) noexcept {
     realtimeEngine_.processBlock(
-        {output, static_cast<std::size_t>(std::max(0, channels)),
+        {input, static_cast<std::size_t>(std::max(0, inputChannels)),
+         static_cast<std::size_t>(std::max(0, frames))},
+        {output, static_cast<std::size_t>(std::max(0, outputChannels)),
          static_cast<std::size_t>(std::max(0, frames))},
         deviceSampleRate_);
 }
