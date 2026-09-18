@@ -1,4 +1,4 @@
-# VitaDAW 0.7.1 — Recording Recovery & Failure Hardening
+# VitaDAW 0.7.2 — Input Monitoring Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -363,6 +363,36 @@ automática tras crash, escaneo al arrancar, adopción de huérfanos, garbage
 collection de media, monitoring, compensación de latencia, punch/loop recording
 ni grabación multipista. Detalles de la evidencia de cierre:
 [`docs/validation-0.7.1.md`](docs/validation-0.7.1.md).
+
+## 0.7.2 - Input Monitoring Foundation
+
+VitaDAW 0.7.2 añade *software input monitoring* manual, apagado por defecto y
+separado de Playback y Recording. Record no habilita Monitoring, Stop Record no
+lo deshabilita y Play, Stop, Seek o Loop no cambian su estado. No existe modo
+Auto: sólo un Disable explícito, una pérdida real de dispositivo/input/output o
+el shutdown pueden apagarlo; una pérdida no se auto-reactiva.
+
+El gain de monitor es efímero, con rango `[-100, 0] dB`, default `-12 dB`,
+smoothing RT de aproximadamente 5 ms y publicación *latest-value-wins* para
+cambios continuos. La UI mínima despacha Enable, Disable, Toggle y gain a
+través del Command System; no modifica `ProjectState`, historial, dirty state
+ni persistencia. El medidor de input publica el pico pre-gain y no abre hardware
+por sí mismo.
+
+Capture consume siempre input raw antes de cualquier escritura de salida. La
+ruta de monitor usa staging estéreo preasignado para proteger aliasing total o
+parcial entre input/output, admite la base mono/estéreo y no reserva en el
+callback. Un preflight de hardware fuera de RT abre o certifica el input; las
+demandas de Recording y Monitoring coexisten y el lifecycle reconfigura de forma
+segura ante cambios de device, sample rate o buffer size. Si Monitoring seguía
+activo, la finalización de una toma conserva su input y su ruta tras Stop.
+
+Una pérdida real de device, input u output fuerza Monitoring OFF por seguridad.
+No hay compensación de latencia, direct monitoring hardware, monitor por pista,
+plugins, sends/inserts, buses de monitor, routing avanzado, grabación multipista,
+punch/loop recording, MIDI monitoring ni talkback. Detalles de diseño y
+validación: [`docs/design-input-monitoring-0.7.2.md`](docs/design-input-monitoring-0.7.2.md)
+y [`docs/validation-0.7.2.md`](docs/validation-0.7.2.md).
 
 ## Tecnología propuesta
 
@@ -782,6 +812,10 @@ La arquitectura y las reglas de tiempo real se describen en
   diagnósticos conservados, persistencia crítica de media sin rebajar, cleanup y
   shutdown seguros también sin marker, corrección de `prepared` y cobertura
   JUCE hardware-free del preflight real.
+- **0.7.2 — Input Monitoring Foundation:** monitoring manual RT con gain
+  suavizado, preflight/lifecycle de dispositivo, staging alias-safe, meter de
+  input y UI mínima; coexistencia segura de Recording + Monitoring, incluido
+  Monitoring activo tras Stop Recording, validada también en smoke físico.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -818,4 +852,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.5.md`](docs/validation-0.6.5.md) y
 [`docs/validation-0.6.6.md`](docs/validation-0.6.6.md) y
 [`docs/validation-0.7.0.md`](docs/validation-0.7.0.md) y
-[`docs/validation-0.7.1.md`](docs/validation-0.7.1.md).
+[`docs/validation-0.7.1.md`](docs/validation-0.7.1.md) y
+[`docs/validation-0.7.2.md`](docs/validation-0.7.2.md).

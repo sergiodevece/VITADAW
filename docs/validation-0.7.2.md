@@ -2,13 +2,13 @@
 
 ## Estado
 
-La validación automatizada de Input Monitoring Foundation A/B/C está preparada
-para auditoría. La validación física sigue pendiente y no se declara completa
-en este documento.
+Input Monitoring Foundation está validado de forma automatizada y mediante
+smoke físico en macOS. Esta evidencia no convierte la rama Windows, revisada
+por inspección, en una validación ejecutada sobre Windows.
 
 ## Validado automáticamente
 
-- build completo y suite completa;
+- build completo y suite completa: 53/53;
 - Commands de Enable, Disable, Toggle y Set Monitor Gain sin `ProjectState`,
   historial ni dirty state;
 - staging alias-safe, Capture raw y reproducción más Monitoring;
@@ -20,18 +20,22 @@ en este documento.
   `Monitoring ON → Record → Stop → Monitoring remains active`: la ruta
   productiva virtual verifica la señal de entrada/salida después de finalizar,
   una segunda toma, Disable durante Recording y cancelación sin device loss;
-- ASan+UBSan y TSan focalizados;
+- ASan+UBSan y TSan focalizados, sin diagnósticos;
 - `git diff --check` limpio al finalizar la validación automatizada.
 
-## Pendiente de smoke físico
+## Smoke físico
 
-- Monitoring solo, Playback + Monitoring y Recording + Monitoring;
-- cambio de Monitor Gain durante una toma y verificación de WAV intacto;
-- activación/desactivación de Monitoring durante Recording;
-- segunda grabación, Undo/Redo documental y cierre con Monitoring activo.
+- Monitoring parado, durante Playback y durante Recording: OK;
+- `Monitoring ON → Record → Stop → Monitoring remains active`: OK;
+- segunda grabación: OK;
+- Disable Monitoring durante Recording no interrumpe Recording: OK;
+- `Monitoring OFF → Record → Stop` permanece OFF: OK;
+- WAV, finalización y reproducción: OK.
 
 ## Limitaciones
 
 - No existe direct monitor hardware, detección de feedback, compensación de
   latencia, routing avanzado, monitor por pista ni grabación multipista.
 - El input meter no abre hardware por sí mismo; sólo observa input ya activo.
+- Windows fue revisado por inspección, pero no compilado ni ejecutado con SDK o
+  toolchain Windows en este entorno macOS.

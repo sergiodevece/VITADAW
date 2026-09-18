@@ -2128,7 +2128,30 @@ RT, que continúa delegando en `processBlock`.
 recuperar automáticamente temporales o adoptar huérfanos. Tampoco añade
 garbage collection de esos artefactos.
 
-## Evolución hasta 0.7.1
+### Input Monitoring Foundation 0.7.2
+
+0.7.2 añade una ruta de *software input monitoring* estrictamente manual y
+efímera. El adaptador JUCE conserva la propiedad del preflight y de la demanda
+física de input; `DawApplication` expone Commands/read model sin tocar
+`ProjectState`, historial, dirty state ni persistencia; y el callback aplica la
+mezcla, gain suavizado y publicación RT. Monitoring empieza OFF, usa gain
+`[-100, 0] dB` (default `-12 dB`) y no se activa ni desactiva por Record,
+Playback, Stop, Seek o Loop.
+
+Capture recibe el input raw antes de limpiar o escribir output. Cuando la ruta
+está activa, el callback usa staging mono/estéreo preasignado para no depender
+de que input/output no aliasen; no reserva, bloquea, registra ni configura
+hardware en RT. Los cambios de device, sample rate o buffer re-preparan la
+ruta fuera del callback. Una pérdida real de device/input/output fuerza
+Monitoring OFF y no hay auto-reactivación. La demanda de Monitoring es
+independiente de Recording: Stop Recording finaliza media y proyecto sin apagar
+una ruta de monitor aún solicitada.
+
+No se implementan direct monitoring hardware, modo Auto, compensación de
+latencia, monitor por pista, buses/routing de monitor, plugins, MIDI monitoring
+ni grabación multipista.
+
+## Evolución hasta 0.7.2
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -2235,6 +2258,10 @@ garbage collection de esos artefactos.
 38. **Completado en 0.7.1:** marker de recovery auxiliar y best-effort,
     persistencia crítica de media bloqueante, cleanup de `prepared`, shutdown y
     reintento seguros, y cobertura JUCE hardware-free del preflight real.
+
+39. **Completado en 0.7.2:** Input Monitoring Foundation manual con core RT,
+    preflight/lifecycle JUCE, staging alias-safe, meter/UI mínima y coexistencia
+    segura con Recording, incluido Monitoring activo después de Stop Recording.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.
