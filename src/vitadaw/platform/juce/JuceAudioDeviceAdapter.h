@@ -126,6 +126,12 @@ public:
     [[nodiscard]] audio::AudioControlRequestResult trySetMetronomeEnabled(bool) noexcept override;
     [[nodiscard]] audio::AudioControlRequestResult trySetMetronomeLevel(
         audio::MetronomeLevelDb) noexcept override;
+    [[nodiscard]] audio::AudioControlRequestResult trySetInputMonitoringEnabled(
+        bool) noexcept override;
+    [[nodiscard]] audio::InputMonitoringPreparationResult
+    prepareInputMonitoring() override;
+    void cancelPreparedInputMonitoring() noexcept override;
+    [[nodiscard]] bool trySetMonitorGain(audio::MonitorGainDb) noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot projectedTransportSnapshot() noexcept override;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
@@ -145,6 +151,7 @@ public:
 
 private:
     friend class PersistenceIntegrationAccess; // Hardware-free test harness only.
+    friend class MonitoringIntegrationAccess; // Hardware-free lifecycle tests only.
     [[nodiscard]] audio::AudioFilePreparationResult decodeWav(
         const std::filesystem::path&, std::size_t, const media::MediaFingerprint*);
     void audioDeviceIOCallbackWithContext(
@@ -164,6 +171,11 @@ private:
         bool available{};
         std::string warning;
     };
+    struct MonitoringPreflightRollback {
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        audio::RealtimeAudioEngine::TemporalCheckpoint checkpoint;
+        bool callbackWasRegistered{};
+    };
 
     void closeDevice(bool publishClosedState) noexcept;
     void beginDeviceReinitialisation() noexcept;
@@ -177,6 +189,11 @@ private:
         const audio::ProcessingPlanSpecification& specification,
         std::string& errorMessage);
     [[nodiscard]] bool reprepareForCurrentDevice(std::string& errorMessage);
+    [[nodiscard]] static int activeFoundationInputChannels(
+        juce::AudioIODevice&) noexcept;
+    [[nodiscard]] bool restoreMonitoringPreflight(
+        MonitoringPreflightRollback&, std::string&) noexcept;
+    void clearMonitoringDemandForLoss() noexcept;
     [[nodiscard]] static std::optional<ExclusiveTemporaryFile> createExclusiveTemporaryFile(
         const std::filesystem::path&, std::error_code&) noexcept;
     [[nodiscard]] static bool pathHasIdentity(
@@ -199,6 +216,11 @@ private:
     audio::RealtimeAudioEngine realtimeEngine_;
     timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;
+    // Installed only after a successful quiescent Core reprepare. Polling
+    // treats both fields as a single certified device/engine configuration.
+    timeline::SampleRate certifiedDeviceSampleRate_;
+    std::size_t certifiedDeviceBufferSize_{};
+    juce::AudioIODevice* certifiedDevice_{};
     mixer::PreparedMasterMixState masterMix_;
     std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
     std::atomic<bool> suppressLifecycleNotification_{};
@@ -221,6 +243,13 @@ private:
     std::string recordingRecoveryWarning_;
     // Test-only fault seam; production retains the all-clear default.
     audio::RecordingRecoveryMarkerWriteOptions recordingRecoveryMarkerWriteOptions_;
+    // Control-side input demand. It is deliberately independent from the RT
+    // render bit: the former owns physical-route lifetime, the latter owns
+    // audio mixing.  At most the first mono/stereo foundation channels count.
+    bool monitoringInputDemand_{};
+    int monitoringInputChannels_{};
+    std::optional<MonitoringPreflightRollback> pendingMonitoringPreflight_;
+    std::string monitoringDiagnostic_;
     bool callbackRegistered_{};
     bool changeListenerRegistered_{};
 };

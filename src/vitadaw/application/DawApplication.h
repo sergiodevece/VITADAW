@@ -11,6 +11,17 @@
 
 namespace vitadaw::application {
 
+// Ephemeral UI read model. It is populated from bounded RT publications and
+// deliberately has no ProjectState or history representation.
+struct InputMonitoringReadModel {
+    bool enabled{};
+    audio::MonitorGainDb gain;
+    bool routeSupported{true};
+    bool lifecycleForcedOff{};
+    bool inputAvailable{};
+    mixer::StereoPeak inputPeak;
+};
+
 class DawApplication final : public commands::ICommandHandler {
 public:
     DawApplication(audio::IAudioEngineControl& audioEngine,
@@ -49,6 +60,13 @@ public:
     [[nodiscard]] bool loopEnabled() const noexcept { return session_.loopEnabled; }
     [[nodiscard]] bool metronomeEnabled() const noexcept { return session_.metronomeEnabled; }
     [[nodiscard]] audio::MetronomeLevelDb metronomeLevel() const noexcept { return session_.metronomeLevel; }
+    [[nodiscard]] bool inputMonitoringEnabled() const noexcept {
+        return inputMonitoringEnabled_;
+    }
+    [[nodiscard]] audio::MonitorGainDb monitorGain() const noexcept {
+        return monitorGain_;
+    }
+    [[nodiscard]] InputMonitoringReadModel inputMonitoringReadModel() const noexcept;
     [[nodiscard]] std::optional<tracks::TrackId> armedTrack() const noexcept {
         return session_.armedTrack;
     }
@@ -105,6 +123,16 @@ private:
     audio::RecordingRequest activeRecording_;
     audio::RecordingPhase recordingPhase_{audio::RecordingPhase::idle};
     std::string recordingError_;
+    // Application-only read/request model. It must never become a ProjectState
+    // or ProjectSession field because Monitoring is not document state.
+    bool inputMonitoringEnabled_{};
+    bool requestedInputMonitoringEnabled_{};
+    bool inputMonitoringRouteSupported_{true};
+    bool inputMonitoringLifecycleForcedOff_{};
+    bool inputMeterAvailable_{};
+    mixer::StereoPeak inputMeterPeak_;
+    audio::MonitorGainDb monitorGain_{};
+    audio::MonitorGainDb requestedMonitorGain_{};
 };
 
 } // namespace vitadaw::application

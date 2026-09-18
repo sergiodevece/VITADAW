@@ -39,7 +39,8 @@ public:
                          application::DawApplication& application)
         : dispatcher_(dispatcher), application_(application),
           timeline_(dispatcher, application) {
-        for (auto* label : {&statusLabel_, &transportLabel_, &meterLabel_, &resultLabel_}) {
+        for (auto* label : {&statusLabel_, &transportLabel_, &meterLabel_, &inputMeterLabel_,
+                            &resultLabel_}) {
             label->setColour(juce::Label::textColourId, juce::Colours::white);
             label->setJustificationType(juce::Justification::centredLeft);
             addAndMakeVisible(*label);
@@ -158,11 +159,26 @@ public:
             dispatch(commands::SetMetronomeLevel{{
                 static_cast<float>(metronomeLevel_.getValue())}});
         };
+        monitorButton_.setClickingTogglesState(false);
+        monitorButton_.onClick = [this] {
+            // The button is set from the confirmed read model only; this
+            // action asks Command System to toggle rather than changing audio.
+            dispatch(commands::ToggleInputMonitoring{});
+        };
+        monitorGain_.setRange(-100.0, 0.0, 0.1);
+        monitorGain_.setValue(-12.0, juce::dontSendNotification);
+        monitorGain_.setTextValueSuffix(" dB");
+        monitorGain_.onValueChange = [this] {
+            dispatch(commands::SetMonitorGain{{
+                static_cast<float>(monitorGain_.getValue())}});
+        };
         for (auto* editor : {&startBar_, &endBar_}) addAndMakeVisible(*editor);
         addAndMakeVisible(applyLoop_);
         addAndMakeVisible(loopEnabled_);
         addAndMakeVisible(metronomeEnabled_);
         addAndMakeVisible(metronomeLevel_);
+        addAndMakeVisible(monitorButton_);
+        addAndMakeVisible(monitorGain_);
         for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_}) addAndMakeVisible(*button);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_})
@@ -233,6 +249,7 @@ public:
                                          juce::dontSendNotification);
         metronomeLevel_.setValue(metronome.level.value,
                                  juce::dontSendNotification);
+        updateMonitoringControls();
         timeline_.setTransportState(state);
         updateHistoryControls();
     }
@@ -275,6 +292,7 @@ public:
         statusLabel_.setBounds(bounds.removeFromTop(26));
         transportLabel_.setBounds(bounds.removeFromTop(26));
         meterLabel_.setBounds(bounds.removeFromTop(22));
+        inputMeterLabel_.setBounds(bounds.removeFromTop(22));
         auto musicalRow = bounds.removeFromTop(28);
         tempo100_.setBounds(musicalRow.removeFromLeft(160));
         tempoChange_.setBounds(musicalRow.removeFromLeft(240));
@@ -293,6 +311,11 @@ public:
         loopRow.removeFromLeft(12);
         metronomeEnabled_.setBounds(loopRow.removeFromLeft(110));
         metronomeLevel_.setBounds(loopRow.removeFromLeft(190));
+
+        auto monitoringRow = bounds.removeFromTop(30);
+        monitorButton_.setBounds(monitoringRow.removeFromLeft(130));
+        monitoringRow.removeFromLeft(8);
+        monitorGain_.setBounds(monitoringRow.removeFromLeft(210));
 
         auto commandRow = bounds.removeFromTop(32);
         armButton_.setBounds(commandRow.removeFromLeft(112));
@@ -357,6 +380,29 @@ private:
                                   "Redo " + juce::String(redo.data(), redo.size()));
         undoButton_.setEnabled(application_.canUndo());
         redoButton_.setEnabled(application_.canRedo());
+    }
+
+    void updateMonitoringControls() {
+        const auto monitoring = application_.inputMonitoringReadModel();
+        // Do not display a requested Enable as applied while its preflight or
+        // RT publication is pending. The next timer tick uses confirmed state.
+        monitorButton_.setToggleState(monitoring.enabled, juce::dontSendNotification);
+        monitorButton_.setButtonText(monitoring.enabled ? "Monitor ON" : "Monitor OFF");
+        monitorGain_.setValue(monitoring.gain.value, juce::dontSendNotification);
+
+        if (monitoring.inputAvailable) {
+            inputPeakLeft_ = std::max(monitoring.inputPeak.left, inputPeakLeft_ * 0.82F);
+            inputPeakRight_ = std::max(monitoring.inputPeak.right, inputPeakRight_ * 0.82F);
+        } else {
+            inputPeakLeft_ *= 0.82F;
+            inputPeakRight_ *= 0.82F;
+        }
+        juce::String text{"Input peak (pre-gain): "};
+        text << juce::String(inputPeakLeft_, 3) << " / " << juce::String(inputPeakRight_, 3);
+        if (!monitoring.routeSupported) text << " | Monitor route limited";
+        else if (!monitoring.inputAvailable) text << " | Input unavailable";
+        if (monitoring.lifecycleForcedOff) text << " | Monitoring forced OFF";
+        inputMeterLabel_.setText(text, juce::dontSendNotification);
     }
 
     void chooseWav(std::optional<tracks::TrackId> track) {
@@ -456,7 +502,7 @@ private:
 
     commands::ICommandDispatcher& dispatcher_;
     application::DawApplication& application_;
-    juce::Label statusLabel_, transportLabel_, meterLabel_, resultLabel_;
+    juce::Label statusLabel_, transportLabel_, meterLabel_, inputMeterLabel_, resultLabel_;
     TimelineComponent timeline_;
     juce::TextButton importButton_{"Import WAV..."};
     juce::TextButton addMonoTrack_{"+ Mono Track"};
@@ -479,6 +525,11 @@ private:
     juce::ToggleButton metronomeEnabled_{"Metronome"};
     juce::Slider metronomeLevel_{juce::Slider::LinearHorizontal,
                                  juce::Slider::TextBoxRight};
+    juce::ToggleButton monitorButton_{"Monitor OFF"};
+    juce::Slider monitorGain_{juce::Slider::LinearHorizontal,
+                              juce::Slider::TextBoxRight};
+    float inputPeakLeft_{};
+    float inputPeakRight_{};
     audio::RecordingPhase displayedRecordingPhase_{audio::RecordingPhase::idle};
     std::unique_ptr<juce::FileChooser> fileChooser_;
 };

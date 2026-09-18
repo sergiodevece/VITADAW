@@ -143,6 +143,16 @@ public:
         timeline::ProjectFramePosition position) noexcept override {
         return result(transport::PlaybackState::stopped, position);
     }
+    audio::AudioControlRequestResult trySetInputMonitoringEnabled(
+        bool enabled) noexcept override {
+        transport.monitoringEnabled = enabled;
+        return result(transport.playback, transport.position);
+    }
+    bool trySetMonitorGain(audio::MonitorGainDb gain) noexcept override {
+        if (!gain.isValid()) return false;
+        transport.monitorGainDb = gain.value;
+        return true;
+    }
     audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override {
         return transport;
     }
@@ -458,6 +468,34 @@ void preparedDeviceLossCleansApplicationSession() {
           "cleanup clears the active recording session for a subsequent Record");
 }
 
+void monitoringCommandsRemainAvailableDuringRecording() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Monitoring"}).status ==
+              commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Monitoring.vitadaw"}).status ==
+                  commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status ==
+                  commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).status == commands::CommandStatus::accepted,
+          "monitoring-during-recording fixture starts capture");
+    const auto token = app.history().currentStateToken();
+    const auto revision = app.timelineRevision();
+    check(send(app, commands::SetMonitorGain{{-6.0F}}).status ==
+              commands::CommandStatus::accepted &&
+              send(app, commands::EnableInputMonitoring{}).status ==
+                  commands::CommandStatus::accepted &&
+              send(app, commands::DisableInputMonitoring{}).status ==
+                  commands::CommandStatus::accepted,
+          "monitoring commands remain admitted while recording is busy");
+    check(engine.capture.phase == audio::RecordingPhase::capturing &&
+              !engine.transport.monitoringEnabled && engine.transport.monitorGainDb == -6.0F &&
+              app.history().currentStateToken() == token &&
+              app.timelineRevision() == revision && !app.session().dirty(),
+          "monitoring control leaves recording lifecycle and document history unchanged");
+}
+
 void shutdownCancelsWithoutCommitting() {
     MemoryFiles files;
     RecordingEngine engine;
@@ -523,6 +561,7 @@ int main() {
     recoveryMetadataWarningDoesNotBlockRecording();
     failureAtomicityAndArmDeletion();
     preparedDeviceLossCleansApplicationSession();
+    monitoringCommandsRemainAvailableDuringRecording();
     shutdownCancelsWithoutCommitting();
     explicitRecoveryUsesTransactionalImport();
     std::cout << "Recording application tests passed\n";

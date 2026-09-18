@@ -208,6 +208,15 @@ if(VITADAW_BUILD_TESTS)
             juce::juce_audio_devices)
         add_test(NAME vitadaw_juce_recording_input_setup_policy_tests
             COMMAND vitadaw_juce_recording_input_setup_policy_tests)
+        add_executable(vitadaw_input_monitoring_device_lifecycle_tests
+            tests/InputMonitoringDeviceLifecycleTests.cpp
+            src/vitadaw/platform/juce/JuceAudioDeviceAdapter.cpp)
+        target_link_libraries(vitadaw_input_monitoring_device_lifecycle_tests PRIVATE vitadaw_core
+            juce::juce_audio_devices juce::juce_audio_formats)
+        target_compile_definitions(vitadaw_input_monitoring_device_lifecycle_tests PRIVATE
+            JUCE_USE_FLAC=0 JUCE_USE_MP3AUDIOFORMAT=0 JUCE_USE_OGGVORBIS=0 JUCE_USE_CURL=0)
+        add_test(NAME vitadaw_input_monitoring_device_lifecycle_tests
+            COMMAND vitadaw_input_monitoring_device_lifecycle_tests)
     endif()
     add_executable(vitadaw_undo_redo_tests tests/UndoRedoTests.cpp)
     target_link_libraries(vitadaw_undo_redo_tests PRIVATE vitadaw_core)
@@ -278,6 +287,10 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_realtime_audio_engine_tests tests/RealtimeAudioEngineTests.cpp)
     target_link_libraries(vitadaw_realtime_audio_engine_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_realtime_audio_engine_tests COMMAND vitadaw_realtime_audio_engine_tests)
+
+    add_executable(vitadaw_input_monitoring_tests tests/InputMonitoringTests.cpp)
+    target_link_libraries(vitadaw_input_monitoring_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_input_monitoring_tests COMMAND vitadaw_input_monitoring_tests)
 
     add_executable(vitadaw_recording_capture_tests tests/RecordingCaptureTests.cpp)
     target_link_libraries(vitadaw_recording_capture_tests PRIVATE vitadaw_core)

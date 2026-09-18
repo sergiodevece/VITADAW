@@ -45,6 +45,7 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     runtime_ = nullptr;
     plan_ = nullptr;
     blockCapacity_ = defaultProcessingBlockCapacity;
+    static_cast<void>(prepareMonitoringStaging(blockCapacity_));
     masterMix_.reset(project.masterMix.isValid()
                          ? project.masterMix
                          : mixer::PreparedMasterMixState{});
@@ -89,6 +90,7 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
     runtime_ = &runtime;
     plan_ = &plan;
     blockCapacity_ = plan.blockCapacity;
+    static_cast<void>(prepareMonitoringStaging(blockCapacity_));
     trackMixCount_ = std::min(tracks_.size(), maximumTrackCount);
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
         trackMix_[index].reset(tracks_[index].source.mix.isValid()
@@ -253,11 +255,17 @@ void RealtimeAudioEngine::deviceErrorPreservingTransport() noexcept {
     resolveCommandsThrough(closure.cancellationWatermark);
     resetProcessors();
     clearMetronomeVoices();
+    disableInputMonitoringForLifecycle();
     publishTransport();
 }
 
 void RealtimeAudioEngine::deviceInitialising() noexcept {
     transitionAwayFromOperational(DeviceProcessingState::initializing);
+    // This lifecycle entry is quiescent and certifies a newly starting device.
+    // It is not an unexpected input loss, so direct core users may enqueue a
+    // normal Enable before the first callback begins consuming commands.
+    monitoringLifecycleForcedOff_ = false;
+    monitoringLifecycleBlocked_ = false;
 }
 
 void RealtimeAudioEngine::deviceInitialisingPreservingTransport() noexcept {
@@ -307,7 +315,24 @@ void RealtimeAudioEngine::transitionAwayFromOperational(
     }
     resetProcessors();
     clearMetronomeRuntime();
+    disableInputMonitoringForLifecycle();
     publishTransport();
+}
+
+void RealtimeAudioEngine::disableInputMonitoringForLifecycle() noexcept {
+    monitoringEnabled_ = false;
+    monitoringRouteSupported_ = false;
+    monitoringLifecycleForcedOff_ = true;
+    monitoringLifecycleBlocked_ = true;
+    monitorGainSmoother_.reset(0.0F);
+}
+
+void RealtimeAudioEngine::requestInputMonitoringLifecycleOff() noexcept {
+    monitoringLifecycleOffRequested_.store(true, std::memory_order_release);
+}
+
+void RealtimeAudioEngine::notifyInputMonitoringHardwarePrepared() noexcept {
+    monitoringHardwarePrepared_.store(true, std::memory_order_release);
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestPlay() noexcept {
@@ -347,6 +372,39 @@ AudioControlRequestResult RealtimeAudioEngine::trySetMetronomeLevel(
     refreshTransportProjection();
     if (deviceState() != DeviceProcessingState::operational || !level.isValid()) return {};
     return enqueue(CommandType::setMetronomeLevel, {}, level.value);
+}
+
+AudioControlRequestResult
+RealtimeAudioEngine::trySetInputMonitoringEnabled(bool enabled) noexcept {
+    refreshTransportProjection();
+    if (deviceState() != DeviceProcessingState::operational) return {};
+    return enqueue(CommandType::setInputMonitoringEnabled, {},
+                   enabled ? 1.0F : 0.0F);
+}
+
+void RealtimeAudioEngine::restoreInputMonitoringAfterControlledReconfigure(
+    bool enabled) noexcept {
+    // This is a quiescent-only writer used after the adapter has rebuilt the
+    // device/plan. Concurrent lifecycle loss uses the mailbox consumed below.
+    monitoringEnabled_ = enabled;
+    monitoringRouteSupported_ = enabled;
+    monitoringLifecycleForcedOff_ = false;
+    monitoringLifecycleBlocked_ = false;
+    monitorGainSmoother_.reset(0.0F);
+    if (enabled) {
+        monitorGainSmoother_.setTarget(monitorGainLinear_, processingFormat_.sampleRate,
+                                       inputMonitoringSmoothingSeconds);
+    }
+    publishTransport();
+}
+
+bool RealtimeAudioEngine::trySetMonitorGain(MonitorGainDb gain) noexcept {
+    if (!gain.isValid()) return false;
+    // Command/control thread only. A single coherent payload lets the callback
+    // discard stale slider values without entering either bounded FIFO.
+    monitorGainMailbox_.store(packMonitorGain(gain, prepareMonitorGain(gain)),
+                              std::memory_order_release);
+    return true;
 }
 
 AudioControlRequestResult RealtimeAudioEngine::tryRequestPause() noexcept {
@@ -609,18 +667,13 @@ void RealtimeAudioEngine::processBlock(AudioBlockView output,
 void RealtimeAudioEngine::processBlock(ConstAudioBlockView input,
                                        AudioBlockView output,
                                        timeline::SampleRate deviceSampleRate) noexcept {
-    for (std::size_t channel = 0; channel < output.channelCount; ++channel) {
-        if (output.channels != nullptr && output.channels[channel] != nullptr) {
-            std::fill_n(output.channels[channel], output.frameCount, 0.0F);
-        }
-    }
-
     if (deviceSampleRate.isValid()) {
         // Entry into the real callback (or its faithful offline equivalent) is
         // direct evidence that an initialising device has an active consumer.
         deviceConsumerStarted();
     }
 
+    consumeInputMonitoringLifecycleRequests();
     consumeCommands();
     consumeParameterCommands(deviceSampleRate);
     clearMeters();
@@ -628,10 +681,12 @@ void RealtimeAudioEngine::processBlock(ConstAudioBlockView input,
         !projectSampleRate_.isValid() || blockCapacity_ == 0 ||
         !deviceSampleRate.isValid() ||
         processingFormat_.sampleRate != deviceSampleRate) {
+        clearOutput(output);
         publishMeters();
         publishTransport();
         return;
     }
+    consumeMonitorGain(deviceSampleRate);
 
     const auto captureState = capture_.snapshot();
     if (captureState.phase == RecordingPhase::capturing &&
@@ -640,9 +695,19 @@ void RealtimeAudioEngine::processBlock(ConstAudioBlockView input,
     } else {
         capture_.capture(input);
     }
+    // Input metering observes the same raw callback samples as Capture, before
+    // Monitor Gain, staging or any output mutation can affect interpretation.
+    measureInputPeak(input);
+    // Preserve raw Monitoring input before output is touched. Capture keeps
+    // its own independent raw path above and therefore never depends on this
+    // scratch buffer.
+    const auto monitoringInput = monitoringEnabled_ || monitorGainSmoother_.isSmoothing()
+        ? stageMonitoringInput(input) : StagedMonitoringInput{};
+    clearOutput(output);
 
     if (!clock_.isPlaying()) {
         advanceSmoothers(output.frameCount);
+        mixInputMonitoring(monitoringInput, output, deviceSampleRate);
         publishMeters();
         publishTransport();
         return;
@@ -667,8 +732,28 @@ void RealtimeAudioEngine::processBlock(ConstAudioBlockView input,
             break;
         }
     }
+    mixInputMonitoring(monitoringInput, output, deviceSampleRate);
     publishMeters();
     publishTransport();
+}
+
+void RealtimeAudioEngine::consumeInputMonitoringLifecycleRequests() noexcept {
+    // The control side never writes these RT-owned fields. A device/input loss
+    // is reduced to this bounded atomic handoff and takes effect at the start
+    // of a callback, before any command can render or capture a block.
+    if (monitoringLifecycleOffRequested_.exchange(false, std::memory_order_acq_rel)) {
+        monitoringEnabled_ = false;
+        monitoringRouteSupported_ = false;
+        monitoringLifecycleForcedOff_ = true;
+        monitoringLifecycleBlocked_ = true;
+        monitorGainSmoother_.reset(0.0F);
+    }
+    if (monitoringHardwarePrepared_.exchange(false, std::memory_order_acq_rel)) {
+        // A completed hardware preflight is the only non-loss path that may
+        // make a later Enable command effective again.
+        monitoringLifecycleForcedOff_ = false;
+        monitoringLifecycleBlocked_ = false;
+    }
 }
 
 bool RealtimeAudioEngine::enqueueParameter(ParameterCommand command) noexcept {
@@ -748,6 +833,8 @@ void RealtimeAudioEngine::clearMeters() noexcept {
     std::fill(trackPeaks_.begin(), trackPeaks_.begin() + trackMixCount_,
               mixer::StereoPeak{});
     masterPeak_ = {};
+    inputPeak_ = {};
+    inputMeterAvailable_ = false;
     std::fill(busPeaks_.begin(),
               busPeaks_.begin() + std::min(buses_.size(), maximumBusCount),
               mixer::StereoPeak{});
@@ -759,7 +846,25 @@ void RealtimeAudioEngine::publishMeters() noexcept {
         {trackPeaks_.data(), trackMixCount_},
         {meterBusIds_.data(), std::min(buses_.size(), maximumBusCount)},
         {busPeaks_.data(), std::min(buses_.size(), maximumBusCount)},
-        masterPeak_);
+        masterPeak_, inputPeak_, inputMeterAvailable_);
+}
+
+void RealtimeAudioEngine::measureInputPeak(ConstAudioBlockView input) noexcept {
+    if (input.channels == nullptr || input.channelCount == 0 ||
+        input.channels[0] == nullptr) return;
+    inputMeterAvailable_ = true;
+    for (std::size_t frame = 0; frame < input.frameCount; ++frame) {
+        inputPeak_.left = std::max(inputPeak_.left,
+                                   std::abs(input.channels[0][frame]));
+    }
+    if (input.channelCount > 1 && input.channels[1] != nullptr) {
+        for (std::size_t frame = 0; frame < input.frameCount; ++frame) {
+            inputPeak_.right = std::max(inputPeak_.right,
+                                        std::abs(input.channels[1][frame]));
+        }
+    } else {
+        inputPeak_.right = inputPeak_.left;
+    }
 }
 
 void RealtimeAudioEngine::processSubBlock(
@@ -1094,6 +1199,132 @@ void RealtimeAudioEngine::advanceSmoothers(std::size_t frameCount) noexcept {
     }
 }
 
+void RealtimeAudioEngine::clearOutput(AudioBlockView output) noexcept {
+    for (std::size_t channel = 0; channel < output.channelCount; ++channel) {
+        if (output.channels != nullptr && output.channels[channel] != nullptr) {
+            std::fill_n(output.channels[channel], output.frameCount, 0.0F);
+        }
+    }
+}
+
+bool RealtimeAudioEngine::prepareMonitoringStaging(std::size_t capacity) noexcept {
+    if (capacity == monitoringStagingCapacity_) return capacity != 0;
+    try {
+        std::array<std::vector<float>, 2> prepared;
+        prepared[0].resize(capacity);
+        prepared[1].resize(capacity);
+        monitoringInputStaging_.swap(prepared);
+        monitoringStagingCapacity_ = capacity;
+        return true;
+    } catch (...) {
+        monitoringInputStaging_ = {};
+        monitoringStagingCapacity_ = 0;
+        return false;
+    }
+}
+
+RealtimeAudioEngine::StagedMonitoringInput
+RealtimeAudioEngine::stageMonitoringInput(ConstAudioBlockView input) noexcept {
+    StagedMonitoringInput result;
+    result.limited = input.channelCount > 2;
+    // A block beyond the prepared capacity is explicitly unsupported for
+    // Monitoring: no partial mix can accidentally read output-overwritten raw
+    // input. Capture has already consumed its independent input path.
+    if (input.frameCount > monitoringStagingCapacity_) {
+        result.limited = true;
+        return result;
+    }
+    if (input.channels == nullptr || input.channelCount == 0 ||
+        input.channels[0] == nullptr) return result;
+
+    result.frameCount = input.frameCount;
+    std::copy_n(input.channels[0], result.frameCount,
+                monitoringInputStaging_[0].data());
+    result.left = monitoringInputStaging_[0].data();
+    if (input.channelCount > 1 && input.channels[1] != nullptr) {
+        std::copy_n(input.channels[1], result.frameCount,
+                    monitoringInputStaging_[1].data());
+        result.right = monitoringInputStaging_[1].data();
+    }
+    return result;
+}
+
+std::uint64_t RealtimeAudioEngine::packMonitorGain(
+    MonitorGainDb gain, float linear) noexcept {
+    return (static_cast<std::uint64_t>(
+                std::bit_cast<std::uint32_t>(gain.value)) << 32U) |
+        static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(linear));
+}
+
+void RealtimeAudioEngine::unpackMonitorGain(std::uint64_t payload,
+                                            MonitorGainDb& gain,
+                                            float& linear) noexcept {
+    gain.value = std::bit_cast<float>(static_cast<std::uint32_t>(payload >> 32U));
+    linear = std::bit_cast<float>(static_cast<std::uint32_t>(payload));
+}
+
+void RealtimeAudioEngine::consumeMonitorGain(
+    timeline::SampleRate deviceSampleRate) noexcept {
+    const auto payload = monitorGainMailbox_.load(std::memory_order_acquire);
+    if (payload == consumedMonitorGainPayload_) return;
+
+    MonitorGainDb gain;
+    float linear{};
+    unpackMonitorGain(payload, gain, linear);
+    consumedMonitorGainPayload_ = payload;
+    // The producer validates before publishing. Retain this guard so a future
+    // producer cannot inject an invalid target into the RT state.
+    if (!gain.isValid() || !std::isfinite(linear) || linear < 0.0F) return;
+    monitorGain_ = gain;
+    monitorGainLinear_ = linear;
+    if (monitoringEnabled_) {
+        monitorGainSmoother_.setTarget(monitorGainLinear_, deviceSampleRate,
+                                       inputMonitoringSmoothingSeconds);
+    }
+}
+
+void RealtimeAudioEngine::mixInputMonitoring(
+    StagedMonitoringInput input, AudioBlockView output,
+    timeline::SampleRate) noexcept {
+    const bool fading = monitorGainSmoother_.isSmoothing();
+    const bool active = monitoringEnabled_ || fading;
+    if (!active) return;
+
+    const bool hasInput0 = input.left != nullptr;
+    const bool hasInput1 = input.right != nullptr;
+    const bool hasOutput0 = output.channels != nullptr && output.channelCount > 0 &&
+                            output.channels[0] != nullptr;
+    const bool hasOutput1 = output.channels != nullptr && output.channelCount > 1 &&
+                            output.channels[1] != nullptr;
+    const bool limitedLayout = input.limited || output.channelCount > 2;
+    const bool canMix = hasInput0 && hasOutput0;
+    monitoringRouteSupported_ = canMix && !limitedLayout;
+    const auto commonFrames = std::min(input.frameCount, output.frameCount);
+
+    // Always advance the ramp, including an incomplete device block, so a
+    // missing input cannot freeze a gain transition. The first two channels are
+    // the explicitly supported foundation; extra channels are never mixed.
+    for (std::size_t frame = 0; frame < output.frameCount; ++frame) {
+        const auto gain = monitorGainSmoother_.next();
+        if (!canMix || frame >= commonFrames) continue;
+
+        const auto left = input.left[frame];
+        if (!hasInput1) {
+            output.channels[0][frame] += left * gain;
+            if (hasOutput1) output.channels[1][frame] += left * gain;
+            continue;
+        }
+
+        const auto right = input.right[frame];
+        if (hasOutput1) {
+            output.channels[0][frame] += left * gain;
+            output.channels[1][frame] += right * gain;
+        } else {
+            output.channels[0][frame] += 0.5F * (left + right) * gain;
+        }
+    }
+}
+
 void RealtimeAudioEngine::clearMetronomeVoices() noexcept {
     for (auto& voice : metronomeVoices_) voice = {};
     metronomeEventCount_ = 0;
@@ -1334,6 +1565,13 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
                     temporalContext_ ? temporalContext_->clicks.deviceSampleRate
                                      : projectSampleRate_,
                     metronomeSmoothingSeconds);
+            } else if (queued.type == CommandType::setInputMonitoringEnabled) {
+                monitoringEnabled_ = queued.value != 0.0F && !monitoringLifecycleBlocked_;
+                if (queued.value != 0.0F && monitoringEnabled_)
+                    monitoringLifecycleForcedOff_ = false;
+                monitorGainSmoother_.setTarget(
+                    monitoringEnabled_ ? monitorGainLinear_ : 0.0F,
+                    processingFormat_.sampleRate, inputMonitoringSmoothingSeconds);
             }
         }
         resolveCommandsThrough(queued.sequence);
@@ -1414,17 +1652,19 @@ void RealtimeAudioEngine::commitTransportProjection(
 }
 
 void RealtimeAudioEngine::publishTransport() noexcept {
-    transportExchange_.publish({clock_.isPlaying(), clock_.publicPosition(),
-                                clock_.duration(),
-                                lastResolvedCommandSequence_.load(
-                                    std::memory_order_acquire),
-                                clock_.playback(), loopEnabled_,
-                                metronomeEnabled_, metronomeLevel_.value,
-                                temporalContext_ ? temporalContext_->revision : 0,
-                                lifecycleGate_.generation(),
-                                clock_.boundaryFacts().beforeContentEnd,
-                                temporalContext_ && temporalContext_->loop &&
-                                    clock_.isBefore(temporalContext_->loop->clockBounds.exactEnd)});
+    RealtimeTransportSnapshot state{
+        clock_.isPlaying(), clock_.publicPosition(), clock_.duration(),
+        lastResolvedCommandSequence_.load(std::memory_order_acquire),
+        clock_.playback(), loopEnabled_, metronomeEnabled_, metronomeLevel_.value,
+        temporalContext_ ? temporalContext_->revision : 0, lifecycleGate_.generation(),
+        clock_.boundaryFacts().beforeContentEnd,
+        temporalContext_ && temporalContext_->loop &&
+            clock_.isBefore(temporalContext_->loop->clockBounds.exactEnd)};
+    state.monitoringEnabled = monitoringEnabled_;
+    state.monitorGainDb = monitorGain_.value;
+    state.monitoringRouteSupported = monitoringRouteSupported_;
+    state.monitoringLifecycleForcedOff = monitoringLifecycleForcedOff_;
+    transportExchange_.publish(state);
 }
 
 void RealtimeAudioEngine::resolveCommandsThrough(

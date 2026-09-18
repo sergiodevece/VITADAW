@@ -265,38 +265,92 @@ void JuceAudioDeviceAdapter::shutdown() noexcept {
 }
 
 void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
-    if (deviceSampleRate_.isValid() &&
-        ((preparedProject_ && preparedProject_->specification.processingSampleRate != deviceSampleRate_) ||
-         (preparedTemporalContext_ && preparedTemporalContext_->deviceSampleRate != deviceSampleRate_))) {
-        const auto callbackWasRegistered = callbackRegistered_;
-        detachAudioCallback(true);
-        const auto checkpoint = realtimeEngine_.temporalCheckpoint();
-        static_cast<void>(realtimeEngine_.restoreTemporalCheckpoint(checkpoint));
-        std::string error;
-        if (!reprepareForCurrentDevice(error)) {
-            realtimeEngine_.deviceErrorPreservingTransport();
-            stateModel_.markError(std::move(error));
-            publishState();
-            return;
-        }
-        if (callbackWasRegistered) {
-            attachAudioCallback(true);
-        }
-        refreshState();
-        return;
-    }
     const auto event = pendingLifecycleEvent_.exchange(PendingLifecycleEvent::none,
                                                         std::memory_order_acq_rel);
     if (event == PendingLifecycleEvent::error) {
+        // audioDeviceError may arrive on an unspecified JUCE thread. It only
+        // publishes the event; serialised control-side cleanup first retires
+        // the callback, proving the direct Core transition is quiescent.
+        detachAudioCallback(true);
+        clearMonitoringDemandForLoss();
+        realtimeEngine_.deviceError();
+        certifiedDeviceSampleRate_ = {};
+        certifiedDeviceBufferSize_ = 0;
+        certifiedDevice_ = nullptr;
         stateModel_.markError("Audio output device reported an error");
         publishState();
-    } else if (event == PendingLifecycleEvent::stopped) {
+        return;
+    }
+    if (event == PendingLifecycleEvent::stopped) {
+        // JUCE has stopped the callback before this notification. This is the
+        // loss (not controlled detach) path because detach uses the preserve
+        // registration guard and suppresses the event.
+        clearMonitoringDemandForLoss();
+        realtimeEngine_.deviceStopped();
+        certifiedDeviceSampleRate_ = {};
+        certifiedDeviceBufferSize_ = 0;
+        certifiedDevice_ = nullptr;
         stateModel_.markError("Audio output device stopped");
         publishState();
+        return;
+    }
+
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device != nullptr) {
+        const auto actualRate = timeline::SampleRate{device->getCurrentSampleRate()};
+        const auto actualBuffer = static_cast<std::size_t>(
+            std::max(0, device->getCurrentBufferSizeSamples()));
+        const bool configurationDiverged =
+            !actualRate.isValid() || actualBuffer == 0 ||
+            actualRate != certifiedDeviceSampleRate_ ||
+            actualBuffer != certifiedDeviceBufferSize_ ||
+            device != certifiedDevice_ ||
+            (preparedProject_ &&
+             preparedProject_->specification.processingSampleRate != actualRate) ||
+            (preparedTemporalContext_ &&
+             preparedTemporalContext_->deviceSampleRate != actualRate);
+        if (configurationDiverged) {
+            deviceSampleRate_ = actualRate;
+            const auto callbackWasRegistered = callbackRegistered_;
+            detachAudioCallback(true);
+            std::string error;
+            if (!reprepareForCurrentDevice(error)) {
+                clearMonitoringDemandForLoss();
+                realtimeEngine_.deviceErrorPreservingTransport();
+                certifiedDeviceSampleRate_ = {};
+                certifiedDeviceBufferSize_ = 0;
+                certifiedDevice_ = nullptr;
+                stateModel_.markError(std::move(error));
+                publishState();
+                return;
+            }
+            if (callbackWasRegistered) {
+                attachAudioCallback(true);
+            }
+            refreshState();
+            return;
+        }
+        if (realtimeEngine_.deviceState() == audio::DeviceProcessingState::operational &&
+            stateModel_.state().status != audio::AudioDeviceStatus::active)
+            refreshState();
     } else if (realtimeEngine_.deviceState() ==
                    audio::DeviceProcessingState::operational &&
                stateModel_.state().status != audio::AudioDeviceStatus::active) {
         refreshState();
+    }
+    // A confirmed device which no longer has the route that was opened for
+    // monitoring is an input loss, not a reason to stop otherwise-valid
+    // playback.  This check remains entirely on the control thread.
+    if (monitoringInputDemand_) {
+        if (device == nullptr || activeFoundationInputChannels(*device) == 0) {
+            clearMonitoringDemandForLoss();
+            // The output callback can still be running. It is the unique
+            // writer of effective Monitoring state and consumes this request
+            // at the start of its next block.
+            realtimeEngine_.requestInputMonitoringLifecycleOff();
+            stateModel_.markError("Audio input route for monitoring is unavailable");
+            publishState();
+        }
     }
 }
 
@@ -791,6 +845,183 @@ audio::AudioControlRequestResult JuceAudioDeviceAdapter::trySetMetronomeLevel(
     audio::MetronomeLevelDb level) noexcept {
     return realtimeEngine_.trySetMetronomeLevel(level);
 }
+audio::AudioControlRequestResult
+JuceAudioDeviceAdapter::trySetInputMonitoringEnabled(bool enabled) noexcept {
+    const auto request = realtimeEngine_.trySetInputMonitoringEnabled(enabled);
+    if (!request.accepted) return request;
+    if (enabled) {
+        // prepareInputMonitoring has made the physical setup transactional;
+        // acceptance of this bounded RT request commits that setup.
+        monitoringInputDemand_ = true;
+        pendingMonitoringPreflight_.reset();
+        monitoringDiagnostic_.clear();
+    } else {
+        // Disable is intentionally only an RT-route transition.  Do not touch
+        // AudioDeviceManager here: a Recording may still own the same input.
+        monitoringInputDemand_ = false;
+        monitoringInputChannels_ = 0;
+    }
+    return request;
+}
+
+int JuceAudioDeviceAdapter::activeFoundationInputChannels(
+    juce::AudioIODevice& device) noexcept {
+    const auto available = device.getInputChannelNames().size();
+    const auto& active = device.getActiveInputChannels();
+    int count{};
+    for (; count < 2 && count < available; ++count) {
+        if (!active[count]) break;
+    }
+    return count;
+}
+
+bool JuceAudioDeviceAdapter::restoreMonitoringPreflight(
+    MonitoringPreflightRollback& rollback, std::string& errorMessage) noexcept {
+    try {
+        detachAudioCallback(true);
+        const auto setupError = deviceManager_.setAudioDeviceSetup(rollback.setup, false);
+        auto* device = deviceManager_.getCurrentAudioDevice();
+        deviceSampleRate_ = timeline::SampleRate{
+            device != nullptr ? device->getCurrentSampleRate() : 0.0};
+        if (setupError.isNotEmpty() || !deviceSampleRate_.isValid() ||
+            !reprepareForCurrentDevice(errorMessage) ||
+            !realtimeEngine_.restoreTemporalCheckpoint(rollback.checkpoint)) {
+            if (errorMessage.empty()) {
+                errorMessage = setupError.isNotEmpty()
+                    ? setupError.toStdString()
+                    : "Previous audio configuration could not be restored";
+            }
+            return false;
+        }
+        if (rollback.callbackWasRegistered) attachAudioCallback(true);
+        refreshState();
+        return true;
+    } catch (const std::exception& error) {
+        errorMessage = error.what();
+    } catch (...) {
+        errorMessage = "Previous audio configuration could not be restored";
+    }
+    return false;
+}
+
+audio::InputMonitoringPreparationResult
+JuceAudioDeviceAdapter::prepareInputMonitoring() {
+    // Repeated Enable requests never touch an already-certified input route.
+    if (monitoringInputDemand_) {
+        realtimeEngine_.notifyInputMonitoringHardwarePrepared();
+        return {true, {}};
+    }
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr || realtimeEngine_.deviceState() !=
+                                 audio::DeviceProcessingState::operational) {
+        monitoringDiagnostic_ = "No operational audio device is available for input monitoring";
+        return {false, monitoringDiagnostic_};
+    }
+    if (const auto active = activeFoundationInputChannels(*device); active > 0) {
+        monitoringInputChannels_ = active;
+        monitoringDiagnostic_.clear();
+        realtimeEngine_.notifyInputMonitoringHardwarePrepared();
+        return {true, {}};
+    }
+
+    auto* deviceType = deviceManager_.getCurrentDeviceTypeObject();
+    if (deviceType == nullptr) {
+        monitoringDiagnostic_ = "No audio input device type is available for input monitoring";
+        return {false, monitoringDiagnostic_};
+    }
+    const auto previousSetup = deviceManager_.getAudioDeviceSetup();
+    MonitoringPreflightRollback rollback{previousSetup,
+                                          realtimeEngine_.temporalCheckpoint(),
+                                          callbackRegistered_};
+    const auto names = deviceType->getDeviceNames(true);
+    const auto defaultIndex = deviceType->getDefaultDeviceIndex(true);
+    const auto configure = [&](int requestedChannels, std::string& error) -> bool {
+        const auto candidate = detail::makeRecordingInputSetup(
+            previousSetup, names, defaultIndex, requestedChannels);
+        if (!candidate.success()) {
+            error = candidate.errorMessage;
+            return false;
+        }
+        const auto setupError = deviceManager_.setAudioDeviceSetup(candidate.setup, false);
+        if (setupError.isNotEmpty()) {
+            error = setupError.toStdString();
+            return false;
+        }
+        auto* configured = deviceManager_.getCurrentAudioDevice();
+        if (configured == nullptr ||
+            activeFoundationInputChannels(*configured) < requestedChannels) {
+            error = "The selected audio input device does not provide the requested active input channels";
+            return false;
+        }
+        deviceSampleRate_ = timeline::SampleRate{configured->getCurrentSampleRate()};
+        if (!deviceSampleRate_.isValid() || !reprepareForCurrentDevice(error)) {
+            if (error.empty()) error = "The input device has an invalid sample rate";
+            return false;
+        }
+        monitoringInputChannels_ = requestedChannels;
+        return true;
+    };
+
+    try {
+        detachAudioCallback(true);
+        std::string error;
+        // Prefer the first stereo pair; retry a mono route transactionally.
+        bool configured = configure(2, error);
+        if (!configured) configured = configure(1, error);
+        if (!configured) {
+            std::string restoreError;
+            if (!restoreMonitoringPreflight(rollback, restoreError)) {
+                realtimeEngine_.deviceErrorPreservingTransport();
+                error += "; rollback failed: " + restoreError;
+            }
+            monitoringInputChannels_ = 0;
+            monitoringDiagnostic_ = "Audio inputs could not be activated for monitoring: " + error;
+            return {false, monitoringDiagnostic_};
+        }
+        if (rollback.callbackWasRegistered) attachAudioCallback(true);
+        pendingMonitoringPreflight_ = rollback;
+        monitoringDiagnostic_.clear();
+        realtimeEngine_.notifyInputMonitoringHardwarePrepared();
+        refreshState();
+        return {true, {}};
+    } catch (const std::exception& error) {
+        std::string restoreError;
+        if (!restoreMonitoringPreflight(rollback, restoreError)) {
+            realtimeEngine_.deviceErrorPreservingTransport();
+        }
+        monitoringInputChannels_ = 0;
+        monitoringDiagnostic_ = std::string{"Audio inputs could not be activated for monitoring: "} + error.what();
+        if (!restoreError.empty()) monitoringDiagnostic_ += "; rollback failed: " + restoreError;
+        return {false, monitoringDiagnostic_};
+    } catch (...) {
+        std::string restoreError;
+        static_cast<void>(restoreMonitoringPreflight(rollback, restoreError));
+        monitoringInputChannels_ = 0;
+        monitoringDiagnostic_ = "Audio inputs could not be activated for monitoring";
+        return {false, monitoringDiagnostic_};
+    }
+}
+
+void JuceAudioDeviceAdapter::cancelPreparedInputMonitoring() noexcept {
+    if (!pendingMonitoringPreflight_) return;
+    std::string error;
+    auto rollback = std::move(*pendingMonitoringPreflight_);
+    pendingMonitoringPreflight_.reset();
+    if (!restoreMonitoringPreflight(rollback, error)) {
+        realtimeEngine_.deviceErrorPreservingTransport();
+        monitoringDiagnostic_ = "Input monitoring preflight rollback failed: " + error;
+    }
+    monitoringInputChannels_ = 0;
+}
+
+void JuceAudioDeviceAdapter::clearMonitoringDemandForLoss() noexcept {
+    monitoringInputDemand_ = false;
+    monitoringInputChannels_ = 0;
+    pendingMonitoringPreflight_.reset();
+}
+bool JuceAudioDeviceAdapter::trySetMonitorGain(audio::MonitorGainDb gain) noexcept {
+    return realtimeEngine_.trySetMonitorGain(gain);
+}
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
     return realtimeEngine_.transportSnapshot();
 }
@@ -823,8 +1054,11 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
     if (deviceType == nullptr)
         return {{}, "No audio input device type is available"};
     const auto inputDeviceNames = deviceType->getDeviceNames(true);
+    const auto requestedInputChannels = std::max(
+        channels, monitoringInputDemand_ ? std::max(1, monitoringInputChannels_) : 0);
     const auto inputSetup = detail::makeRecordingInputSetup(
-        previousSetup, inputDeviceNames, deviceType->getDefaultDeviceIndex(true), channels);
+        previousSetup, inputDeviceNames, deviceType->getDefaultDeviceIndex(true),
+        requestedInputChannels);
     if (!inputSetup.success()) return {{}, inputSetup.errorMessage};
 
     detachAudioCallback(true);
@@ -865,7 +1099,7 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
     device = deviceManager_.getCurrentAudioDevice();
     if (device == nullptr || !detail::recordingInputChannelsAreAvailableAndActive(
                                  static_cast<std::size_t>(device->getInputChannelNames().size()),
-                                 device->getActiveInputChannels(), channels)) {
+                                 device->getActiveInputChannels(), requestedInputChannels)) {
         return rollback("The selected audio input device does not provide the requested active input channels");
     }
     deviceSampleRate_ = timeline::SampleRate{
@@ -876,6 +1110,9 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
         return rollback(reprepareError.empty()
                             ? "The input device has an invalid sample rate"
                             : std::move(reprepareError));
+    }
+    if (monitoringInputDemand_) {
+        monitoringInputChannels_ = activeFoundationInputChannels(*device);
     }
 
     try {
@@ -1276,8 +1513,9 @@ void JuceAudioDeviceAdapter::audioDeviceAboutToStart(juce::AudioIODevice* device
 void JuceAudioDeviceAdapter::audioDeviceStopped() noexcept {
     if (preserveTransportDuringRegistration_.load(std::memory_order_acquire))
         realtimeEngine_.deviceInitialisingPreservingTransport();
-    else
-        realtimeEngine_.deviceStopped();
+    // An uncontrolled stop is consumed by pollDeviceLifecycle() on the
+    // serialised control side.  This callback must not mutate demand or RT
+    // state because JUCE does not give it a general control-thread contract.
     if (!suppressLifecycleNotification_.load(std::memory_order_acquire)) {
         pendingLifecycleEvent_.store(PendingLifecycleEvent::stopped,
                                      std::memory_order_release);
@@ -1285,7 +1523,8 @@ void JuceAudioDeviceAdapter::audioDeviceStopped() noexcept {
 }
 
 void JuceAudioDeviceAdapter::audioDeviceError(const juce::String&) {
-    realtimeEngine_.deviceError();
+    // This callback can run on an unspecified JUCE thread. Publish only a
+    // bounded event; all optional/demand cleanup happens in polling.
     pendingLifecycleEvent_.store(PendingLifecycleEvent::error,
                                  std::memory_order_release);
 }
@@ -1305,6 +1544,15 @@ void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
     suppressLifecycleNotification_.store(true, std::memory_order_release);
     deviceManager_.closeAudioDevice();
     suppressLifecycleNotification_.store(false, std::memory_order_release);
+    // beginDeviceReinitialisation() uses closeDevice(false) as its controlled
+    // quiescent handoff.  Preserve the demand there so a successful restart
+    // can rearm Monitoring; a real close/loss always uses the full close path.
+    if (publishClosedState) clearMonitoringDemandForLoss();
+    if (publishClosedState) {
+        certifiedDeviceSampleRate_ = {};
+        certifiedDeviceBufferSize_ = 0;
+        certifiedDevice_ = nullptr;
+    }
     realtimeEngine_.deviceUnavailable();
     if (publishClosedState) {
         realtimeEngine_.releasePreparedReferences();
@@ -1445,8 +1693,17 @@ bool JuceAudioDeviceAdapter::prepareProjectPlan(
         }
         sources.push_back(view);
     }
+    // The plan owns all callback scratch, including Monitoring's alias-safe
+    // staging.  Bind its capacity to the current device buffer while the
+    // callback is quiescent so a controlled buffer-size change never asks RT
+    // to resize storage.
+    std::size_t blockCapacity = audio::defaultProcessingBlockCapacity;
+    if (auto* device = deviceManager_.getCurrentAudioDevice(); device != nullptr &&
+        device->getCurrentBufferSizeSamples() > 0) {
+        blockCapacity = static_cast<std::size_t>(device->getCurrentBufferSizeSamples());
+    }
     auto prepared = audio::prepareProcessingPlanFromSources(
-        effectiveSpecification, sources);
+        effectiveSpecification, sources, blockCapacity);
     if (!prepared.success()) {
         errorMessage = std::move(prepared.errorMessage);
         return false;
@@ -1460,6 +1717,15 @@ bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
     std::string& errorMessage) {
     // This entire operation runs with the callback quiescent. Preparation and
     // certification do not touch the live owners, clock, policies or revision.
+    auto* currentDevice = deviceManager_.getCurrentAudioDevice();
+    if (currentDevice != nullptr) {
+        deviceSampleRate_ = timeline::SampleRate{currentDevice->getCurrentSampleRate()};
+    }
+    if (!deviceSampleRate_.isValid() ||
+        (currentDevice != nullptr && currentDevice->getCurrentBufferSizeSamples() <= 0)) {
+        errorMessage = "The current audio device configuration is invalid";
+        return false;
+    }
     const auto rate = projectSampleRate_.isValid() ? projectSampleRate_ : deviceSampleRate_;
     const auto checkpoint = realtimeEngine_.temporalCheckpoint();
     std::unique_ptr<PreparedProject> project;
@@ -1497,6 +1763,20 @@ bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
     const auto restored = realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
     jassert(restored);
     static_cast<void>(restored);
+    // Only a controlled and successful reprepare may preserve Monitoring.
+    // Device error/stopped/close paths clear the demand before reaching here.
+    realtimeEngine_.restoreInputMonitoringAfterControlledReconfigure(
+        monitoringInputDemand_);
+    if (auto* device = deviceManager_.getCurrentAudioDevice()) {
+        certifiedDeviceSampleRate_ = timeline::SampleRate{device->getCurrentSampleRate()};
+        certifiedDeviceBufferSize_ = static_cast<std::size_t>(
+            std::max(0, device->getCurrentBufferSizeSamples()));
+        certifiedDevice_ = device;
+    } else {
+        certifiedDeviceSampleRate_ = {};
+        certifiedDeviceBufferSize_ = 0;
+        certifiedDevice_ = nullptr;
+    }
     return true;
 }
 
@@ -1535,6 +1815,13 @@ bool JuceAudioDeviceAdapter::commitPreparedProject(
     projectSampleRate_ = preparedProject_->specification.projectSampleRate;
     masterMix_ = preparedProject_->specification.masterMix;
     configureRealtimeEngine();
+    // Installing a project plan deliberately reconfigures the RT engine while
+    // the callback is detached.  That reset is not a device/input loss: the
+    // already-open physical route remains valid, and Monitoring's independent
+    // control-side demand must therefore be restored after a successful plan
+    // commit (including recording finalization).
+    realtimeEngine_.restoreInputMonitoringAfterControlledReconfigure(
+        monitoringInputDemand_);
     if (preserveTransport)
         realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
     modelCommit.execute();

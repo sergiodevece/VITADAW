@@ -52,6 +52,18 @@ struct RealtimeTransportSnapshot {
     bool beforeLoopEnd{};
     // Non-RT projected view only; RT's resolution watermark remains separate.
     AudioCommandSequence projectedThroughTicket{};
+    // Ephemeral Monitoring state. It is intentionally not a ProjectState field
+    // and is published by the RT owner together with transport state. Appending
+    // it preserves positional construction of the established transport fields.
+    bool monitoringEnabled{};
+    float monitorGainDb{-12.0F};
+    // False means the callback observed a missing/limited route. This is a
+    // compact observability bit only; device diagnostics remain non-RT work.
+    bool monitoringRouteSupported{true};
+    // Set only for an unexpected lifecycle/input-route loss.  It lets the
+    // application distinguish a confirmed forced OFF from a normal Disable
+    // command without treating desired state as RT state.
+    bool monitoringLifecycleForcedOff{};
 };
 
 // Single-writer/single-reader exchange. Every operation participates in C++20's
@@ -81,6 +93,13 @@ public:
         commandGeneration_.store(state.commandGeneration, std::memory_order_seq_cst);
         beforeContentEnd_.store(state.beforeContentEnd, std::memory_order_seq_cst);
         beforeLoopEnd_.store(state.beforeLoopEnd, std::memory_order_seq_cst);
+        monitoringEnabled_.store(state.monitoringEnabled, std::memory_order_seq_cst);
+        monitorGainBits_.store(std::bit_cast<std::uint32_t>(state.monitorGainDb),
+                               std::memory_order_seq_cst);
+        monitoringRouteSupported_.store(state.monitoringRouteSupported,
+                                        std::memory_order_seq_cst);
+        monitoringLifecycleForcedOff_.store(state.monitoringLifecycleForcedOff,
+                                            std::memory_order_seq_cst);
         revision_.fetch_add(1, std::memory_order_seq_cst);
     }
 
@@ -92,7 +111,7 @@ public:
                 continue;
             }
 
-            const RealtimeTransportSnapshot result{
+            RealtimeTransportSnapshot result{
                 playback_.load(std::memory_order_seq_cst) ==
                     static_cast<std::uint8_t>(transport::PlaybackState::playing),
                 {position_.load(std::memory_order_seq_cst)},
@@ -107,6 +126,14 @@ public:
                 commandGeneration_.load(std::memory_order_seq_cst),
                 beforeContentEnd_.load(std::memory_order_seq_cst),
                 beforeLoopEnd_.load(std::memory_order_seq_cst)};
+            result.monitoringEnabled =
+                monitoringEnabled_.load(std::memory_order_seq_cst);
+            result.monitorGainDb = std::bit_cast<float>(
+                monitorGainBits_.load(std::memory_order_seq_cst));
+            result.monitoringRouteSupported =
+                monitoringRouteSupported_.load(std::memory_order_seq_cst);
+            result.monitoringLifecycleForcedOff =
+                monitoringLifecycleForcedOff_.load(std::memory_order_seq_cst);
 
             if (revision_.load(std::memory_order_seq_cst) == before) {
                 lastCoherentSnapshot_ = result;
@@ -135,6 +162,10 @@ private:
     std::atomic<std::uint64_t> commandGeneration_{};
     std::atomic<bool> beforeContentEnd_{};
     std::atomic<bool> beforeLoopEnd_{};
+    std::atomic<bool> monitoringEnabled_{};
+    std::atomic<std::uint32_t> monitorGainBits_{std::bit_cast<std::uint32_t>(-12.0F)};
+    std::atomic<bool> monitoringRouteSupported_{true};
+    std::atomic<bool> monitoringLifecycleForcedOff_{};
     // Read and written only by the single non-RT consumer.
     mutable RealtimeTransportSnapshot lastCoherentSnapshot_{};
 };

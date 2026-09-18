@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/audio/CommandLifecycleGate.h"
+#include "vitadaw/audio/InputMonitoring.h"
 #include "vitadaw/audio/IRealtimeAudioProcessor.h"
 #include "vitadaw/audio/DeviceProcessingState.h"
 #include "vitadaw/audio/PreparedProject.h"
@@ -16,10 +17,12 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 namespace vitadaw::audio {
 
@@ -91,6 +94,17 @@ public:
     [[nodiscard]] AudioControlRequestResult trySetLoopEnabled(bool) noexcept;
     [[nodiscard]] AudioControlRequestResult trySetMetronomeEnabled(bool) noexcept;
     [[nodiscard]] AudioControlRequestResult trySetMetronomeLevel(MetronomeLevelDb) noexcept;
+    [[nodiscard]] AudioControlRequestResult trySetInputMonitoringEnabled(bool) noexcept;
+    // Quiescent lifecycle-only restoration after a successful controlled
+    // device reprepare.  Unexpected loss transitions always clear this state.
+    void restoreInputMonitoringAfterControlledReconfigure(bool enabled) noexcept;
+    // Control/lifecycle threads publish only these lock-free requests.  The
+    // audio callback is the sole writer of effective Monitoring RT state.
+    void requestInputMonitoringLifecycleOff() noexcept;
+    void notifyInputMonitoringHardwarePrepared() noexcept;
+    // Single application/control-thread producer. The callback only loads the
+    // latest prepared payload and never uses the command FIFO for gain.
+    [[nodiscard]] bool trySetMonitorGain(MonitorGainDb) noexcept;
     [[nodiscard]] bool tryUpdateTrackMix(
         tracks::TrackId track, mixer::PreparedTrackMixState mix,
         PreparedAudibilityState audibility) noexcept;
@@ -135,7 +149,7 @@ private:
 
     enum class CommandType : std::uint8_t {
         play, pause, stop, seek, beginRecord, cancelRecord, setLoopEnabled,
-        setMetronomeEnabled, setMetronomeLevel
+        setMetronomeEnabled, setMetronomeLevel, setInputMonitoringEnabled
     };
     struct QueuedCommand {
         CommandType type{CommandType::stop};
@@ -191,11 +205,25 @@ private:
     void consumeCommands() noexcept;
     void consumeParameterCommands(
         timeline::SampleRate deviceSampleRate) noexcept;
+    void consumeMonitorGain(timeline::SampleRate deviceSampleRate) noexcept;
     [[nodiscard]] bool enqueueParameter(ParameterCommand command) noexcept;
     void publishTransport() noexcept;
     void publishMeters() noexcept;
     void clearMeters() noexcept;
+    void measureInputPeak(ConstAudioBlockView input) noexcept;
+    static void clearOutput(AudioBlockView output) noexcept;
     void advanceSmoothers(std::size_t frameCount) noexcept;
+    struct StagedMonitoringInput {
+        const float* left{};
+        const float* right{};
+        std::size_t frameCount{};
+        bool limited{};
+    };
+    [[nodiscard]] bool prepareMonitoringStaging(std::size_t capacity) noexcept;
+    [[nodiscard]] StagedMonitoringInput
+    stageMonitoringInput(ConstAudioBlockView input) noexcept;
+    void mixInputMonitoring(StagedMonitoringInput input, AudioBlockView output,
+                            timeline::SampleRate deviceSampleRate) noexcept;
     void distributeSends(PreparedSendRange range, StereoSample tap,
                          std::size_t frame) noexcept;
     void processSubBlock(AudioBlockView output, std::size_t outputOffset,
@@ -219,8 +247,14 @@ private:
         const processors::ProcessorProcessContext& context) noexcept;
     void resetProcessors() noexcept;
     void transitionAwayFromOperational(DeviceProcessingState state) noexcept;
+    void disableInputMonitoringForLifecycle() noexcept;
+    void consumeInputMonitoringLifecycleRequests() noexcept;
     void resolveCommandsThrough(AudioCommandSequence sequence) noexcept;
     [[nodiscard]] bool hasPreparedAudio() const noexcept;
+    [[nodiscard]] static std::uint64_t packMonitorGain(
+        MonitorGainDb gain, float linear) noexcept;
+    static void unpackMonitorGain(std::uint64_t payload, MonitorGainDb& gain,
+                                  float& linear) noexcept;
 
     timeline::SampleRate projectSampleRate_;
     timeline::ProjectFrameCount projectDuration_;
@@ -275,6 +309,8 @@ private:
     std::array<routing::BusId, maximumBusCount> meterBusIds_{};
     std::array<mixer::StereoPeak, maximumBusCount> busPeaks_{};
     mixer::StereoPeak masterPeak_;
+    mixer::StereoPeak inputPeak_;
+    bool inputMeterAvailable_{};
     RealtimeMeterExchange meterExchange_;
     RealtimeCapture capture_;
     processors::TemporalDiscontinuity processorDiscontinuity_{
@@ -283,6 +319,24 @@ private:
     bool metronomeEnabled_{};
     MetronomeLevelDb metronomeLevel_{};
     LinearSmoother metronomeLevelSmoother_;
+    bool monitoringEnabled_{};
+    MonitorGainDb monitorGain_{};
+    float monitorGainLinear_{prepareMonitorGain(monitorGain_)};
+    LinearSmoother monitorGainSmoother_;
+    // Allocated only while the callback is quiescent. Monitoring snapshots the
+    // supported raw channels before output is cleared, so the core remains
+    // correct even if a backend supplies overlapping input/output storage.
+    std::array<std::vector<float>, 2> monitoringInputStaging_;
+    std::size_t monitoringStagingCapacity_{};
+    // A packed pair prevents an RT reader from observing a dB value and a
+    // linear factor from different slider publications.
+    std::atomic<std::uint64_t> monitorGainMailbox_{};
+    std::uint64_t consumedMonitorGainPayload_{};
+    bool monitoringRouteSupported_{true};
+    bool monitoringLifecycleForcedOff_{};
+    bool monitoringLifecycleBlocked_{};
+    std::atomic<bool> monitoringLifecycleOffRequested_{};
+    std::atomic<bool> monitoringHardwarePrepared_{};
     struct MetronomeVoice { bool active{}; bool accent{}; std::size_t frame{}; };
     std::array<MetronomeVoice, metronomeVoiceCount> metronomeVoices_{};
     struct MetronomeEvent { std::size_t frame{}; bool accent{}; };

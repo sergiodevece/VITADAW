@@ -162,7 +162,11 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
     try {
         if (recordingBusy() &&
             !std::holds_alternative<Stop>(command) &&
-            !std::holds_alternative<CancelRecording>(command)) {
+            !std::holds_alternative<CancelRecording>(command) &&
+            !std::holds_alternative<EnableInputMonitoring>(command) &&
+            !std::holds_alternative<DisableInputMonitoring>(command) &&
+            !std::holds_alternative<ToggleInputMonitoring>(command) &&
+            !std::holds_alternative<SetMonitorGain>(command)) {
             return {CommandStatus::rejected,
                     "Recording is capturing or finalizing",
                     CommandError::invalidState};
@@ -429,7 +433,11 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     !std::is_same_v<T, GoToEnd> &&
                     !std::is_same_v<T, SetLoopEnabled> &&
                     !std::is_same_v<T, SetMetronomeEnabled> &&
-                    !std::is_same_v<T, SetMetronomeLevel>;
+                    !std::is_same_v<T, SetMetronomeLevel> &&
+                    !std::is_same_v<T, EnableInputMonitoring> &&
+                    !std::is_same_v<T, DisableInputMonitoring> &&
+                    !std::is_same_v<T, ToggleInputMonitoring> &&
+                    !std::is_same_v<T, SetMonitorGain>;
                 if constexpr (persistent) {
                     if (!session_.history.canCreateState())
                         return {CommandStatus::rejected, "History token capacity exceeded",
@@ -845,6 +853,56 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                 pendingAudioCommandSequence_ = request.sequence;
                 return {commands::CommandStatus::accepted,
                         "Metronome level updated"};
+            } else if constexpr (std::is_same_v<T, commands::EnableInputMonitoring> ||
+                                 std::is_same_v<T, commands::DisableInputMonitoring> ||
+                                 std::is_same_v<T, commands::ToggleInputMonitoring>) {
+                const auto enabled = [] (const auto& command, bool requested) noexcept {
+                    using MonitoringCommand = std::decay_t<decltype(command)>;
+                    if constexpr (std::is_same_v<MonitoringCommand,
+                                                 commands::EnableInputMonitoring>) {
+                        return true;
+                    } else if constexpr (std::is_same_v<MonitoringCommand,
+                                                        commands::DisableInputMonitoring>) {
+                        return false;
+                    } else {
+                        return !requested;
+                    }
+                }(value, requestedInputMonitoringEnabled_);
+                if (enabled) {
+                    const auto preparation = audioEngine_.prepareInputMonitoring();
+                    if (!preparation.success()) {
+                        return {commands::CommandStatus::rejected,
+                                preparation.errorMessage.empty()
+                                    ? "Input monitoring input is unavailable"
+                                    : preparation.errorMessage,
+                                commands::CommandError::transportUnavailable};
+                    }
+                }
+                const auto request =
+                    audioEngine_.trySetInputMonitoringEnabled(enabled);
+                if (!request.accepted) {
+                    if (enabled) audioEngine_.cancelPreparedInputMonitoring();
+                    return {commands::CommandStatus::rejected,
+                            "Input monitoring command queue is full or audio is unavailable",
+                            commands::CommandError::transportUnavailable};
+                }
+                requestedInputMonitoringEnabled_ = enabled;
+                pendingAudioCommandSequence_ = request.sequence;
+                return {commands::CommandStatus::accepted,
+                        enabled ? "Input monitoring enabled"
+                                : "Input monitoring disabled"};
+            } else if constexpr (std::is_same_v<T, commands::SetMonitorGain>) {
+                if (!value.gain.isValid())
+                    return {commands::CommandStatus::rejected,
+                            "Monitor gain must be between -100 and 0 dB",
+                            commands::CommandError::validationFailed};
+                if (!audioEngine_.trySetMonitorGain(value.gain))
+                    return {commands::CommandStatus::rejected,
+                            "Monitor gain could not be published",
+                            commands::CommandError::transportUnavailable};
+                requestedMonitorGain_ = value.gain;
+                return {commands::CommandStatus::accepted,
+                        "Monitor gain updated"};
             } else if constexpr (std::is_same_v<T, commands::Play>) {
                 const auto request = audioEngine_.tryRequestPlay();
                 if (!request.accepted) {
@@ -1572,6 +1630,21 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
 void DawApplication::synchroniseTransport() noexcept {
     synchroniseRecording();
     const auto snapshot = audioEngine_.projectedTransportSnapshot();
+    // Monitoring is an independent ephemeral read model. It must remain
+    // observable even while an unrelated transport ticket is pending.
+    inputMonitoringEnabled_ = snapshot.monitoringEnabled;
+    inputMonitoringRouteSupported_ = snapshot.monitoringRouteSupported;
+    inputMonitoringLifecycleForcedOff_ = snapshot.monitoringLifecycleForcedOff;
+    if (snapshot.monitoringLifecycleForcedOff) {
+        // A lifecycle loss is not a user Disable: discard the stale desired
+        // value so the next Toggle performs one fresh Enable preflight.
+        requestedInputMonitoringEnabled_ = false;
+    }
+    if (audio::MonitorGainDb{snapshot.monitorGainDb}.isValid())
+        monitorGain_ = {snapshot.monitorGainDb};
+    const auto meters = audioEngine_.meterSnapshot();
+    inputMeterAvailable_ = meters.inputAvailable;
+    inputMeterPeak_ = meters.input;
     if (std::max(snapshot.lastProcessedCommandSequence, snapshot.projectedThroughTicket) <
         pendingAudioCommandSequence_) {
         return;
@@ -1679,6 +1752,11 @@ const transport::TransportState& DawApplication::transport() const noexcept {
 
 mixer::MeterSnapshot DawApplication::meterSnapshot() const noexcept {
     return audioEngine_.meterSnapshot();
+}
+
+InputMonitoringReadModel DawApplication::inputMonitoringReadModel() const noexcept {
+    return {inputMonitoringEnabled_, monitorGain_, inputMonitoringRouteSupported_,
+            inputMonitoringLifecycleForcedOff_, inputMeterAvailable_, inputMeterPeak_};
 }
 
 ui::timeline::MetronomeReadModel

@@ -1,6 +1,7 @@
 #pragma once
 #include "vitadaw/musical/MusicalTime.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
+#include "vitadaw/audio/InputMonitoring.h"
 #include <type_traits>
 
 #include "vitadaw/tracks/AudioTrack.h"
@@ -114,6 +115,10 @@ struct SetLoopRangeMusical { musical::MusicalTickPosition start, end; };
 struct SetLoopEnabled { bool enabled{}; };
 struct SetMetronomeEnabled { bool enabled{}; };
 struct SetMetronomeLevel { audio::MetronomeLevelDb level; };
+struct EnableInputMonitoring {};
+struct DisableInputMonitoring {};
+struct ToggleInputMonitoring {};
+struct SetMonitorGain { audio::MonitorGainDb gain; };
 template<class T> inline constexpr bool isMusicalCommand =
     std::is_same_v<T, AddTempoChange> || std::is_same_v<T, MoveTempoChange> ||
     std::is_same_v<T, SetTempo> || std::is_same_v<T, RemoveTempoChange> ||
@@ -198,6 +203,8 @@ using Command = std::variant<AddAudioTrack, DeleteAudioTrack, ReorderAudioTrack,
                              AddTimeSignatureChange, MoveTimeSignatureChange, SetTimeSignature, RemoveTimeSignatureChange,
                              SetLoopRangeMusical, SetLoopEnabled,
                              SetMetronomeEnabled, SetMetronomeLevel,
+                             EnableInputMonitoring, DisableInputMonitoring,
+                             ToggleInputMonitoring, SetMonitorGain,
                              Play, Pause, Stop, SeekToProjectFrame, GoToStart,
                              GoToEnd, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
                              SetTrackGain, SetTrackPan, SetTrackMute,

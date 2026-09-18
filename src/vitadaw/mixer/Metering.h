@@ -38,6 +38,10 @@ struct MeterSnapshot {
     std::array<BusPeak, maximumMeteredBuses> buses{};
     std::size_t busCount{};
     StereoPeak master;
+    // Physical input observed by the audio callback before Monitor Gain or
+    // output mixing. It never creates an input-device demand of its own.
+    StereoPeak input;
+    bool inputAvailable{};
 };
 
 } // namespace vitadaw::mixer

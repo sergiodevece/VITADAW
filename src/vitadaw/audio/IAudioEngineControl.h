@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vitadaw/audio/RealtimeTransportExchange.h"
+#include "vitadaw/audio/InputMonitoring.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/audio/RecordingTypes.h"
@@ -61,6 +62,16 @@ struct RecordingFinalizationResult {
     [[nodiscard]] bool success() const noexcept {
         return prepared != nullptr && errorMessage.empty();
     }
+};
+
+// Non-RT admission result for a monitoring enable request.  The device adapter
+// owns the physical route; the realtime engine only receives the accepted
+// enable command after this preparation has succeeded.
+struct InputMonitoringPreparationResult {
+    bool ready{true};
+    std::string errorMessage;
+
+    [[nodiscard]] bool success() const noexcept { return ready; }
 };
 
 struct AudioFilePreparationResult {
@@ -233,6 +244,23 @@ public:
     [[nodiscard]] virtual AudioControlRequestResult trySetMetronomeEnabled(bool) noexcept { return {}; }
     [[nodiscard]] virtual AudioControlRequestResult trySetMetronomeLevel(
         MetronomeLevelDb) noexcept { return {}; }
+    // Monitoring control is ephemeral and deliberately separate from the
+    // project/history command path. Frequent gain publication is latest-value
+    // wins rather than a FIFO of automation events.
+    [[nodiscard]] virtual AudioControlRequestResult
+    trySetInputMonitoringEnabled(bool) noexcept { return {}; }
+    // Called on the application/control thread before a request which enables
+    // monitoring.  Default controls used by core-only tests already provide a
+    // valid synthetic input route.
+    [[nodiscard]] virtual InputMonitoringPreparationResult
+    prepareInputMonitoring() { return {}; }
+    // Rolls back only an uncommitted monitoring preflight.  It is intentionally
+    // distinct from Disable: disabling the RT route must not reconfigure input
+    // while Recording may still be using it.
+    virtual void cancelPreparedInputMonitoring() noexcept {}
+    [[nodiscard]] virtual bool trySetMonitorGain(MonitorGainDb) noexcept {
+        return false;
+    }
     [[nodiscard]] virtual RealtimeTransportSnapshot transportSnapshot() const noexcept = 0;
     [[nodiscard]] virtual RealtimeTransportSnapshot projectedTransportSnapshot() noexcept {
         return transportSnapshot();

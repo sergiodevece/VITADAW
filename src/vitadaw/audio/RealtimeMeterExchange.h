@@ -27,7 +27,8 @@ public:
                  std::span<const mixer::StereoPeak> trackPeaks,
                  std::span<const routing::BusId> busIds,
                  std::span<const mixer::StereoPeak> busPeaks,
-                 mixer::StereoPeak master) noexcept {
+                 mixer::StereoPeak master,
+                 mixer::StereoPeak input = {}, bool inputAvailable = false) noexcept {
         const auto count = std::min(
             {trackIds.size(), trackPeaks.size(),
              mixer::maximumMeteredTracks});
@@ -49,6 +50,9 @@ public:
         }
         masterLeft_.store(encode(master.left));
         masterRight_.store(encode(master.right));
+        inputLeft_.store(encode(input.left));
+        inputRight_.store(encode(input.right));
+        inputAvailable_.store(inputAvailable);
         revision_.store(startingRevision + 2);
     }
 
@@ -79,6 +83,9 @@ public:
             }
             candidate.master.left = decode(masterLeft_.load());
             candidate.master.right = decode(masterRight_.load());
+            candidate.input.left = decode(inputLeft_.load());
+            candidate.input.right = decode(inputRight_.load());
+            candidate.inputAvailable = inputAvailable_.load();
             const auto after = revision_.load();
             if (before == after && (after & 1U) == 0U) {
                 return candidate;
@@ -112,6 +119,9 @@ private:
     std::array<AtomicTrackPeak, mixer::maximumMeteredBuses> buses_{};
     std::atomic<std::uint32_t> masterLeft_{};
     std::atomic<std::uint32_t> masterRight_{};
+    std::atomic<std::uint32_t> inputLeft_{};
+    std::atomic<std::uint32_t> inputRight_{};
+    std::atomic<bool> inputAvailable_{};
 };
 
 } // namespace vitadaw::audio
