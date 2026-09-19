@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(VitaDAW VERSION 0.7.1 LANGUAGES C CXX)
+project(VitaDAW VERSION 0.7.3 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -21,9 +21,11 @@ add_library(vitadaw_core
     src/vitadaw/application/MusicalTimeCommands.cpp
     src/vitadaw/musical/MusicalTime.cpp
     src/vitadaw/audio/AudioDeviceState.cpp
+    src/vitadaw/audio/LoopbackLatency.cpp
     src/vitadaw/audio/PreparedProcessingPlan.cpp
     src/vitadaw/audio/PreparedTemporalContext.cpp
     src/vitadaw/audio/RealtimeCapture.cpp
+    src/vitadaw/audio/RecordingPlacement.cpp
     src/vitadaw/audio/RecordingRecovery.cpp
     src/vitadaw/audio/RealtimeAudioEngine.cpp
     src/vitadaw/commands/CommandDispatcher.cpp
@@ -237,6 +239,12 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_time_conversion_tests tests/TimeConversionTests.cpp)
     target_link_libraries(vitadaw_time_conversion_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_time_conversion_tests COMMAND vitadaw_time_conversion_tests)
+    add_executable(vitadaw_recording_placement_tests tests/RecordingPlacementTests.cpp)
+    target_link_libraries(vitadaw_recording_placement_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recording_placement_tests COMMAND vitadaw_recording_placement_tests)
+    add_executable(vitadaw_loopback_latency_tests tests/LoopbackLatencyTests.cpp)
+    target_link_libraries(vitadaw_loopback_latency_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_loopback_latency_tests COMMAND vitadaw_loopback_latency_tests)
 
     add_executable(vitadaw_transport_state_tests tests/TransportStateTests.cpp)
     target_link_libraries(vitadaw_transport_state_tests PRIVATE vitadaw_core)

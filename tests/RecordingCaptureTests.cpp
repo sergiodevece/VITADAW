@@ -86,8 +86,11 @@ void startStopAndIntegrity() {
     h.input(excluded);
     snapshot = h.engine.recordingSnapshot();
     check(snapshot.phase == audio::RecordingPhase::complete &&
-              snapshot.acceptedDeviceFrames.value == 5,
-          "Stop excludes the callback where it is consumed");
+              snapshot.acceptedDeviceFrames.value == 5 &&
+              h.engine.transportSnapshot().playback ==
+                  transport::PlaybackState::stopped &&
+              !h.engine.transportSnapshot().playing,
+          "Stop excludes its callback and leaves the productive transport stopped");
     const auto pcm = h.drain(1);
     check(pcm[0] == std::vector<float>({1, 2, 3, 4, 5}),
           "multiple and partial callbacks preserve sample order");

@@ -2151,7 +2151,36 @@ No se implementan direct monitoring hardware, modo Auto, compensación de
 latencia, monitor por pista, buses/routing de monitor, plugins, MIDI monitoring
 ni grabación multipista.
 
-## Evolución hasta 0.7.2
+### Device Latency, Recording Placement y Physical Loopback 0.7.3
+
+0.7.3A mantiene requested y effective buffer como conceptos separados. El
+adaptador JUCE realiza los cambios de buffer fuera de RT y certifica el resultado
+físico antes de publicarlo. Un rollback sólo se acepta si coinciden contexto y
+nombres de device, sample rate, buffer y máscaras efectivas de input/output; una
+divergencia invalida el read model y entra en estado seguro.
+
+0.7.3B congela por toma un snapshot de project/device rate, latencia de input
+reportada y Recording Offset manual. La compensación se aplica únicamente al
+`AudioClip::projectStart` durante el commit; WAV, PCM y clips históricos no se
+reescriben ni recalculan. El offset es efímero y no forma parte de ProjectState,
+historial ni persistencia.
+
+0.7.3C es una facility diagnóstica exclusiva del callback JUCE. Requiere
+Playback Stopped, Recording inactivo y Monitoring OFF; sustituye temporalmente
+el callback productivo por `RealtimeLoopbackProbe`, configura un único par
+físico, captura input raw en storage preasignado y restaura después el checkpoint
+efectivo. La MLS se genera fuera de RT y el análisis completo ocurre en control.
+La ruta no atraviesa reloj de proyecto, mixer, plugins, sends, buses, Capture
+musical, WAV, ProjectState, Undo/Redo ni persistencia.
+
+`reported RTT` existe sólo cuando input y output reportados son válidos y es su
+suma directa, sin añadir otra vez el buffer. `measured physical RTT` es la
+mediana entera de los trials válidos y `residual = measured - reported` es
+signed. El residual incluye la ruta completa output→hardware→input: no se
+atribuye unilateralmente al input, no genera Suggested Recording Offset y no
+modifica la compensación 0.7.3B.
+
+## Evolución hasta 0.7.3
 
 1. **Completado:** integrar una ventana JUCE vacía y un adaptador de dispositivo,
    manteniendo los tests del núcleo independientes de JUCE.
@@ -2262,6 +2291,17 @@ ni grabación multipista.
 39. **Completado en 0.7.2:** Input Monitoring Foundation manual con core RT,
     preflight/lifecycle JUCE, staging alias-safe, meter/UI mínima y coexistencia
     segura con Recording, incluido Monitoring activo después de Stop Recording.
+
+40. **Completado en 0.7.3A:** read model de buffer/latencias, reconfiguración
+    control-side, representación separada de requested/supported/effective y
+    rollback verificado contra la configuración física completa.
+41. **Completado en 0.7.3B:** Recording Placement Compensation por snapshot de
+    toma, offset manual efímero y commit documental sin modificar WAV ni
+    recalcular posiciones históricas.
+42. **Completado en 0.7.3C:** diagnóstico de loopback físico mediante MLS,
+    lifecycle exclusivo con restore transaccional, análisis fuera de RT y
+    aislamiento de Recording/Placement/ProjectState. La validación física
+    ampliada de Aggregate y rutas cross-interface permanece pendiente.
 
 Cada paso debe compilar, pasar pruebas y poder validarse aisladamente antes del
 siguiente.

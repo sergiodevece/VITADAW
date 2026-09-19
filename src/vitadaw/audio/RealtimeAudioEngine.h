@@ -24,6 +24,10 @@
 #include <variant>
 #include <vector>
 
+namespace vitadaw::platform::juce_adapter {
+class MonitoringIntegrationAccess;
+}
+
 namespace vitadaw::audio {
 
 // Portable N-track render used by both the JUCE callback and offline tests.
@@ -125,6 +129,18 @@ public:
     // Single application producer only. Confirmed snapshot plus bounded pure replay.
     [[nodiscard]] RealtimeTransportSnapshot projectedTransportSnapshot() noexcept;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept;
+    // Control/test observation of the currently prepared callback capacity.
+    // processBlock never derives or mutates this value.
+    [[nodiscard]] std::size_t preparedBlockCapacity() const noexcept {
+        return blockCapacity_;
+    }
+    // Quiescent-only device preparation for the empty/legacy project path.
+    [[nodiscard]] bool prepareDeviceBlockCapacity(std::size_t capacity) noexcept;
+    // This reflects non-RT staging preparation for the installed plan. A
+    // device configuration cannot be certified unless it is true.
+    [[nodiscard]] bool monitoringStagingPrepared() const noexcept {
+        return monitoringStagingPrepared_;
+    }
 
     // prepareRecordingCapture is quiescent/non-RT. Input capture itself is
     // driven by the same callback and command generation as transport.
@@ -143,6 +159,7 @@ public:
                       timeline::SampleRate deviceSampleRate) noexcept;
 
 private:
+    friend class ::vitadaw::platform::juce_adapter::MonitoringIntegrationAccess;
     static_assert(std::atomic<std::size_t>::is_always_lock_free);
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
@@ -328,6 +345,10 @@ private:
     // correct even if a backend supplies overlapping input/output storage.
     std::array<std::vector<float>, 2> monitoringInputStaging_;
     std::size_t monitoringStagingCapacity_{};
+    bool monitoringStagingPrepared_{};
+    // Hardware-free lifecycle tests can prove that an explicit reconfigure
+    // treats staging preparation as transactional. Production never sets it.
+    std::uint32_t forcedMonitoringStagingPreparationFailuresForTesting_{};
     // A packed pair prevents an RT reader from observing a dB value and a
     // linear factor from different slider publications.
     std::atomic<std::uint64_t> monitorGainMailbox_{};

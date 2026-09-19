@@ -22,6 +22,15 @@ struct InputMonitoringReadModel {
     mixer::StereoPeak inputPeak;
 };
 
+struct RecordingPlacementReadModel {
+    std::optional<timeline::DeviceFrameCount> reportedInputLatencyDeviceFrames;
+    std::optional<timeline::ProjectFrameCount> reportedInputLatencyProjectFrames;
+    timeline::ProjectFrameCount manualOffsetProjectFrames;
+    timeline::ProjectFrameCount effectiveCompensationProjectFrames;
+    std::uint64_t lastCommittedUnappliedEarlyFrames{};
+    audio::RecordingLatencyStatus latencyStatus{audio::RecordingLatencyStatus::unavailable};
+};
+
 class DawApplication final : public commands::ICommandHandler {
 public:
     DawApplication(audio::IAudioEngineControl& audioEngine,
@@ -67,6 +76,9 @@ public:
         return monitorGain_;
     }
     [[nodiscard]] InputMonitoringReadModel inputMonitoringReadModel() const noexcept;
+    [[nodiscard]] audio::DeviceLatencyReadModel deviceLatencyReadModel() const;
+    [[nodiscard]] RecordingPlacementReadModel recordingPlacementReadModel() const;
+    [[nodiscard]] audio::LoopbackLatencyReadModel loopbackLatencyReadModel() const;
     [[nodiscard]] std::optional<tracks::TrackId> armedTrack() const noexcept {
         return session_.armedTrack;
     }
@@ -133,6 +145,8 @@ private:
     mixer::StereoPeak inputMeterPeak_;
     audio::MonitorGainDb monitorGain_{};
     audio::MonitorGainDb requestedMonitorGain_{};
+    timeline::ProjectFrameCount manualRecordingOffset_{};
+    std::uint64_t lastCommittedUnappliedEarlyFrames_{};
 };
 
 } // namespace vitadaw::application

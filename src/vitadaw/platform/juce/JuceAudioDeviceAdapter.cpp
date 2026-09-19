@@ -224,6 +224,7 @@ JuceAudioDeviceAdapter::~JuceAudioDeviceAdapter() { shutdown(); }
 
 void JuceAudioDeviceAdapter::beginDeviceReinitialisation() noexcept {
     detachAudioCallback(true);
+    invalidateDeviceLatencyReadModel();
     const auto checkpoint = realtimeEngine_.temporalCheckpoint();
     closeDevice(false);
     static_cast<void>(realtimeEngine_.restoreTemporalCheckpoint(checkpoint));
@@ -260,6 +261,10 @@ bool JuceAudioDeviceAdapter::initialise() {
 
 bool JuceAudioDeviceAdapter::reinitialise() { return initialise(); }
 void JuceAudioDeviceAdapter::shutdown() noexcept {
+    if (loopbackProbe_.active()) {
+        loopbackProbe_.cancel();
+        serviceLoopbackLatencyTest();
+    }
     static_cast<void>(shutdownRecording());
     closeDevice(true);
 }
@@ -268,6 +273,7 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
     const auto event = pendingLifecycleEvent_.exchange(PendingLifecycleEvent::none,
                                                         std::memory_order_acq_rel);
     if (event == PendingLifecycleEvent::error) {
+        failLoopbackForDeviceChange(true);
         // audioDeviceError may arrive on an unspecified JUCE thread. It only
         // publishes the event; serialised control-side cleanup first retires
         // the callback, proving the direct Core transition is quiescent.
@@ -277,11 +283,13 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
         certifiedDeviceSampleRate_ = {};
         certifiedDeviceBufferSize_ = 0;
         certifiedDevice_ = nullptr;
+        invalidateDeviceLatencyReadModel("Audio output device reported an error");
         stateModel_.markError("Audio output device reported an error");
         publishState();
         return;
     }
     if (event == PendingLifecycleEvent::stopped) {
+        failLoopbackForDeviceChange(true);
         // JUCE has stopped the callback before this notification. This is the
         // loss (not controlled detach) path because detach uses the preserve
         // registration guard and suppresses the event.
@@ -290,6 +298,7 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
         certifiedDeviceSampleRate_ = {};
         certifiedDeviceBufferSize_ = 0;
         certifiedDevice_ = nullptr;
+        invalidateDeviceLatencyReadModel("Audio output device stopped");
         stateModel_.markError("Audio output device stopped");
         publishState();
         return;
@@ -300,16 +309,32 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
         const auto actualRate = timeline::SampleRate{device->getCurrentSampleRate()};
         const auto actualBuffer = static_cast<std::size_t>(
             std::max(0, device->getCurrentBufferSizeSamples()));
+        const auto loopbackSetup = deviceManager_.getAudioDeviceSetup();
+        const auto& loopbackConfiguration = loopbackLatencyReadModel_.configuration;
+        const bool loopbackConfigurationDiverged = loopbackLatencyReadModel_.busy() &&
+            (certifiedDeviceGeneration_ != loopbackConfiguration.generation ||
+             device->getActiveInputChannels().countNumberOfSetBits() != 1 ||
+             !device->getActiveInputChannels()[
+                 static_cast<int>(loopbackConfiguration.inputChannel)] ||
+             device->getActiveOutputChannels().countNumberOfSetBits() != 1 ||
+             !device->getActiveOutputChannels()[
+                 static_cast<int>(loopbackConfiguration.outputChannel)] ||
+             loopbackSetup.inputDeviceName.toStdString() !=
+                 loopbackConfiguration.inputDeviceName ||
+             loopbackSetup.outputDeviceName.toStdString() !=
+                 loopbackConfiguration.outputDeviceName);
         const bool configurationDiverged =
             !actualRate.isValid() || actualBuffer == 0 ||
             actualRate != certifiedDeviceSampleRate_ ||
             actualBuffer != certifiedDeviceBufferSize_ ||
             device != certifiedDevice_ ||
+            loopbackConfigurationDiverged ||
             (preparedProject_ &&
              preparedProject_->specification.processingSampleRate != actualRate) ||
             (preparedTemporalContext_ &&
              preparedTemporalContext_->deviceSampleRate != actualRate);
         if (configurationDiverged) {
+            failLoopbackForDeviceChange();
             deviceSampleRate_ = actualRate;
             const auto callbackWasRegistered = callbackRegistered_;
             detachAudioCallback(true);
@@ -320,6 +345,7 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
                 certifiedDeviceSampleRate_ = {};
                 certifiedDeviceBufferSize_ = 0;
                 certifiedDevice_ = nullptr;
+                invalidateDeviceLatencyReadModel(error);
                 stateModel_.markError(std::move(error));
                 publishState();
                 return;
@@ -348,6 +374,7 @@ void JuceAudioDeviceAdapter::pollDeviceLifecycle() {
             // writer of effective Monitoring state and consumes this request
             // at the start of its next block.
             realtimeEngine_.requestInputMonitoringLifecycleOff();
+            refreshDeviceLatencyReadModel();
             stateModel_.markError("Audio input route for monitoring is unavailable");
             publishState();
         }
@@ -1022,6 +1049,438 @@ void JuceAudioDeviceAdapter::clearMonitoringDemandForLoss() noexcept {
 bool JuceAudioDeviceAdapter::trySetMonitorGain(audio::MonitorGainDb gain) noexcept {
     return realtimeEngine_.trySetMonitorGain(gain);
 }
+
+audio::DeviceLatencyReadModel JuceAudioDeviceAdapter::deviceLatencyReadModel() const {
+    return deviceLatencyReadModel_;
+}
+
+audio::LoopbackLatencyReadModel JuceAudioDeviceAdapter::loopbackLatencyReadModel() const {
+    return loopbackLatencyReadModel_;
+}
+
+audio::LoopbackLatencyControlResult
+JuceAudioDeviceAdapter::startLoopbackLatencyTest(audio::LoopbackLatencyRequest request) {
+    if (loopbackProbe_.active() || loopbackLatencyReadModel_.busy())
+        return {false, "A physical loopback latency test is already running"};
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr || device != certifiedDevice_ ||
+        realtimeEngine_.deviceState() != audio::DeviceProcessingState::operational)
+        return {false, "No certified operational audio device is available"};
+    const auto transport = realtimeEngine_.projectedTransportSnapshot();
+    if (transport.playback != transport::PlaybackState::stopped)
+        return {false, "Stop Playback before running the loopback latency test"};
+    if (realtimeEngine_.recordingSnapshot().busy() || recordingWriter_)
+        return {false, "Stop Recording before running the loopback latency test"};
+    if (monitoringInputDemand_ || transport.monitoringEnabled)
+        return {false, "Disable Input Monitoring before running the loopback latency test"};
+    const auto inputNames = discoverAvailableInputChannelNames();
+    const auto outputNames = device->getOutputChannelNames();
+    if (request.inputChannel >= static_cast<std::uint32_t>(inputNames.size()) ||
+        request.outputChannel >= static_cast<std::uint32_t>(outputNames.size()))
+        return {false, "The selected physical loopback channel is unavailable"};
+    if (nextLoopbackSessionId_ == 0)
+        return {false, "Loopback session counter exhausted"};
+
+    LoopbackConfigurationCheckpoint checkpoint{
+        {deviceManager_.getAudioDeviceSetup(),
+         deviceManager_.getCurrentDeviceTypeObject(), certifiedDeviceSampleRate_,
+         certifiedDeviceBufferSize_, device->getActiveInputChannels(),
+         device->getActiveOutputChannels()},
+        realtimeEngine_.temporalCheckpoint(), callbackRegistered_};
+    audio::LoopbackLatencyReadModel initial;
+    initial.sessionId = nextLoopbackSessionId_;
+    initial.status = audio::LoopbackLatencyStatus::preparing;
+    initial.diagnostic = "Preparing physical loopback route";
+    const auto callbackWasRegistered = checkpoint.callbackWasRegistered;
+    loopbackCheckpoint_.emplace(std::move(checkpoint));
+    loopbackLatencyReadModel_ = std::move(initial);
+    loopbackDeviceLost_ = false;
+    ++nextLoopbackSessionId_;
+    detachAudioCallback(true);
+
+    const auto fail = [this](std::string message) {
+        detachAudioCallback(true);
+        if (loopbackProbe_.active()) loopbackProbe_.cancel();
+        loopbackProbe_.reset();
+        std::string restoreError;
+        if (!restoreLoopbackConfiguration(restoreError) && !restoreError.empty())
+            message += "; " + restoreError;
+        loopbackLatencyReadModel_.status = audio::LoopbackLatencyStatus::failed;
+        loopbackLatencyReadModel_.configurationStillCurrent = false;
+        loopbackLatencyReadModel_.diagnostic = message;
+        return audio::LoopbackLatencyControlResult{false, std::move(message)};
+    };
+
+    auto* deviceType = deviceManager_.getCurrentDeviceTypeObject();
+    if (deviceType == nullptr) return fail("No audio device type is available");
+    auto setup = loopbackCheckpoint_->device.setup;
+    const auto inputDevices = deviceType->getDeviceNames(true);
+    const auto outputDevices = deviceType->getDeviceNames(false);
+    if (setup.inputDeviceName.isEmpty()) {
+        const auto index = deviceType->getDefaultDeviceIndex(true);
+        if (index < 0 || index >= inputDevices.size())
+            return fail("No physical input device is available for loopback");
+        setup.inputDeviceName = inputDevices[index];
+    }
+    if (setup.outputDeviceName.isEmpty()) {
+        const auto index = deviceType->getDefaultDeviceIndex(false);
+        if (index < 0 || index >= outputDevices.size())
+            return fail("No physical output device is available for loopback");
+        setup.outputDeviceName = outputDevices[index];
+    }
+    setup.inputChannels.clear();
+    setup.inputChannels.setBit(static_cast<int>(request.inputChannel));
+    setup.useDefaultInputChannels = false;
+    setup.outputChannels.clear();
+    setup.outputChannels.setBit(static_cast<int>(request.outputChannel));
+    setup.useDefaultOutputChannels = false;
+    const auto setupError = deviceManager_.setAudioDeviceSetup(setup, false);
+    if (setupError.isNotEmpty())
+        return fail("Physical loopback route could not be configured: " +
+                    setupError.toStdString());
+    device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr ||
+        !device->getActiveInputChannels()[static_cast<int>(request.inputChannel)] ||
+        !device->getActiveOutputChannels()[static_cast<int>(request.outputChannel)])
+        return fail("The selected physical loopback route was not activated");
+
+    deviceSampleRate_ = timeline::SampleRate{device->getCurrentSampleRate()};
+    std::string preparationError;
+    if (!deviceSampleRate_.isValid() || !reprepareForCurrentDevice(preparationError))
+        return fail(preparationError.empty()
+                        ? "Physical loopback route could not prepare Core"
+                        : std::move(preparationError));
+    refreshDeviceLatencyReadModel();
+
+    audio::LoopbackLatencyConfiguration configuration;
+    configuration.generation = certifiedDeviceGeneration_;
+    configuration.deviceName = device->getName().toStdString();
+    const auto effectiveSetup = deviceManager_.getAudioDeviceSetup();
+    configuration.inputDeviceName = effectiveSetup.inputDeviceName.toStdString();
+    configuration.outputDeviceName = effectiveSetup.outputDeviceName.toStdString();
+    configuration.inputChannel = request.inputChannel;
+    configuration.outputChannel = request.outputChannel;
+    configuration.activeInputChannels.push_back(request.inputChannel);
+    configuration.activeOutputChannels.push_back(request.outputChannel);
+    configuration.inputCallbackOrdinal = 0;
+    configuration.outputCallbackOrdinal = 0;
+    configuration.inputChannelName = inputNames[static_cast<int>(request.inputChannel)].toStdString();
+    configuration.outputChannelName = outputNames[static_cast<int>(request.outputChannel)].toStdString();
+    configuration.sampleRateHz = certifiedDeviceSampleRate_.hertz();
+    configuration.bufferSizeFrames = static_cast<std::uint32_t>(certifiedDeviceBufferSize_);
+    configuration.reportedInputFrames = deviceLatencyReadModel_.inputLatencyFrames;
+    configuration.reportedOutputFrames = deviceLatencyReadModel_.outputLatencyFrames;
+    if (configuration.reportedInputFrames && configuration.reportedOutputFrames) {
+        configuration.reportedRoundTripFrames =
+            static_cast<std::uint64_t>(*configuration.reportedInputFrames) +
+            static_cast<std::uint64_t>(*configuration.reportedOutputFrames);
+    }
+    if (!loopbackProbe_.prepare({configuration.sampleRateHz,
+                                 certifiedDeviceBufferSize_,
+                                 configuration.inputCallbackOrdinal,
+                                 configuration.outputCallbackOrdinal}))
+        return fail("Physical loopback buffers could not be prepared");
+    loopbackLatencyReadModel_.configuration = std::move(configuration);
+    loopbackLatencyReadModel_.status = audio::LoopbackLatencyStatus::running;
+    loopbackLatencyReadModel_.configurationStillCurrent = true;
+    loopbackLatencyReadModel_.diagnostic = "Connect the selected output to the selected input; measuring";
+    try {
+        if (callbackWasRegistered) attachAudioCallback(true);
+    } catch (...) {
+        return fail("Audio callback could not start the physical loopback test");
+    }
+    refreshState();
+    return {true, {}};
+}
+
+bool JuceAudioDeviceAdapter::cancelLoopbackLatencyTest() noexcept {
+    if (!loopbackProbe_.active()) return false;
+    loopbackProbe_.cancel();
+    return true;
+}
+
+void JuceAudioDeviceAdapter::serviceLoopbackLatencyTest() noexcept {
+    if (!loopbackLatencyReadModel_.busy() || loopbackProbe_.active()) return;
+    const auto terminal = loopbackProbe_.status();
+    detachAudioCallback(true);
+    audio::LoopbackLatencyReadModel result = std::move(loopbackLatencyReadModel_);
+    try {
+        if (terminal == audio::RealtimeLoopbackProbeStatus::captured) {
+            result.status = audio::LoopbackLatencyStatus::analysing;
+            result = audio::analyseLoopbackLatency(
+                loopbackProbe_.capturedSamples(), loopbackProbe_.stimulus(),
+                loopbackProbe_.emittedFrames(), loopbackProbe_.searchWindowFrames(),
+                loopbackProbe_.preRollFrames(), std::move(result));
+        } else if (terminal == audio::RealtimeLoopbackProbeStatus::cancelled) {
+            result.status = audio::LoopbackLatencyStatus::cancelled;
+            result.diagnostic = "Physical loopback latency test cancelled";
+        } else if (terminal == audio::RealtimeLoopbackProbeStatus::configurationChanged) {
+            result.status = audio::LoopbackLatencyStatus::invalidated;
+            result.diagnostic = "Audio device configuration changed during the loopback test";
+        } else if (terminal == audio::RealtimeLoopbackProbeStatus::inputClipped) {
+            result.status = audio::LoopbackLatencyStatus::failed;
+            result.diagnostic = "Physical loopback input clipped";
+            for (auto& trial : result.trials) {
+                trial.quality = audio::LoopbackTrialQuality::clipped;
+                trial.peak = loopbackProbe_.terminalPeak();
+                trial.clipped = true;
+            }
+        } else {
+            result.status = audio::LoopbackLatencyStatus::failed;
+            result.diagnostic = terminal == audio::RealtimeLoopbackProbeStatus::capacityExceeded
+                ? "Loopback callback exceeded its prepared capacity"
+                : "Audio device failed during the loopback test";
+        }
+    } catch (...) {
+        result.status = audio::LoopbackLatencyStatus::failed;
+        result.diagnostic = "Physical loopback analysis failed";
+    }
+    std::string restoreError;
+    const auto deviceWasLost = loopbackDeviceLost_;
+    bool restored{};
+    if (deviceWasLost) {
+        loopbackCheckpoint_.reset();
+    } else {
+        restored = restoreLoopbackConfiguration(restoreError);
+    }
+    if (!restored && !deviceWasLost) {
+        result.status = audio::LoopbackLatencyStatus::failed;
+        if (!result.diagnostic.empty()) result.diagnostic += "; ";
+        result.diagnostic += restoreError.empty()
+            ? "previous audio configuration could not be restored" : restoreError;
+    }
+    result.configurationStillCurrent = false;
+    loopbackLatencyReadModel_ = std::move(result);
+    loopbackProbe_.reset();
+    loopbackDeviceLost_ = false;
+}
+
+bool JuceAudioDeviceAdapter::restoreLoopbackConfiguration(
+    std::string& errorMessage) noexcept {
+    if (!loopbackCheckpoint_) return true;
+    auto checkpoint = std::move(*loopbackCheckpoint_);
+    loopbackCheckpoint_.reset();
+    detachAudioCallback(true);
+
+    // AudioDeviceManager mutates its private default-channel counts whenever an
+    // explicit setup is applied. The loopback route is deliberately explicit
+    // and mono, so replaying a checkpoint with useDefaultOutputChannels=true
+    // can otherwise reopen one output instead of the previously effective
+    // stereo mask. Restore the effective checkpoint, not JUCE's mutable default
+    // policy.
+    auto restoreSetup = checkpoint.device.setup;
+    restoreSetup.inputChannels = checkpoint.device.activeInputChannels;
+    restoreSetup.outputChannels = checkpoint.device.activeOutputChannels;
+    restoreSetup.useDefaultInputChannels = false;
+    restoreSetup.useDefaultOutputChannels = false;
+    const auto setupError = deviceManager_.setAudioDeviceSetup(restoreSetup, false);
+    auto* restored = deviceManager_.getCurrentAudioDevice();
+    deviceSampleRate_ = timeline::SampleRate{
+        restored != nullptr ? restored->getCurrentSampleRate() : 0.0};
+    const auto restoredSetup = deviceManager_.getAudioDeviceSetup();
+    std::string preparationError;
+    bool exact = true;
+    if (setupError.isNotEmpty()) {
+        errorMessage = "Loopback rollback failed: " + setupError.toStdString();
+        exact = false;
+    } else if (restored == nullptr) {
+        errorMessage = "Loopback rollback failed: restored audio device is unavailable";
+        exact = false;
+    } else if (!restored->isOpen() || !restored->isPlaying()) {
+        errorMessage = "Loopback rollback failed: restored audio device is not operational";
+        exact = false;
+    } else if (deviceManager_.getCurrentDeviceTypeObject() != checkpoint.device.deviceType) {
+        errorMessage = "Loopback rollback failed: restored device context differs from checkpoint";
+        exact = false;
+    } else if (restoredSetup.inputDeviceName != checkpoint.device.setup.inputDeviceName) {
+        errorMessage = "Loopback rollback failed: restored input device differs from checkpoint";
+        exact = false;
+    } else if (restoredSetup.outputDeviceName != checkpoint.device.setup.outputDeviceName) {
+        errorMessage = "Loopback rollback failed: restored output device differs from checkpoint";
+        exact = false;
+    } else if (deviceSampleRate_ != checkpoint.device.sampleRate) {
+        errorMessage = "Loopback rollback failed: restored sample rate differs from checkpoint";
+        exact = false;
+    } else if (restored->getCurrentBufferSizeSamples() <= 0 ||
+               static_cast<std::size_t>(restored->getCurrentBufferSizeSamples()) !=
+                   checkpoint.device.bufferSize) {
+        errorMessage = "Loopback rollback failed: restored buffer differs from checkpoint";
+        exact = false;
+    } else if (restored->getActiveInputChannels() !=
+               checkpoint.device.activeInputChannels) {
+        errorMessage = "Loopback rollback failed: restored input mask differs from checkpoint";
+        exact = false;
+    } else if (restored->getActiveOutputChannels() !=
+               checkpoint.device.activeOutputChannels) {
+        errorMessage = "Loopback rollback failed: restored output mask differs from checkpoint";
+        exact = false;
+    }
+    if (exact && !reprepareForCurrentDevice(preparationError)) {
+        errorMessage = "Loopback rollback failed: " +
+            (preparationError.empty() ? std::string{"Core could not be reprepared"}
+                                      : preparationError);
+        exact = false;
+    }
+    if (exact && !realtimeEngine_.restoreTemporalCheckpoint(checkpoint.temporal)) {
+        errorMessage = "Loopback rollback failed: temporal checkpoint could not be restored";
+        exact = false;
+    }
+    if (exact && checkpoint.callbackWasRegistered) {
+        try {
+            attachAudioCallback(true);
+        } catch (...) {
+            exact = false;
+            errorMessage = "Loopback rollback failed: previous callback could not be restored";
+        }
+    }
+    if (exact && checkpoint.callbackWasRegistered &&
+        (!callbackRegistered_ || restored == nullptr || !restored->isPlaying() ||
+         realtimeEngine_.deviceState() != audio::DeviceProcessingState::operational ||
+         certifiedDevice_ != restored)) {
+        errorMessage = "Loopback rollback failed: restored callback/Core state is not operational";
+        exact = false;
+    }
+    if (exact) {
+        refreshState();
+        return true;
+    }
+    clearMonitoringDemandForLoss();
+    realtimeEngine_.deviceErrorPreservingTransport();
+    certifiedDeviceSampleRate_ = {};
+    certifiedDeviceBufferSize_ = 0;
+    certifiedDevice_ = nullptr;
+    if (errorMessage.empty()) errorMessage = "Loopback rollback failed";
+    invalidateDeviceLatencyReadModel(errorMessage);
+    stateModel_.markError(errorMessage);
+    publishState();
+    return false;
+}
+
+void JuceAudioDeviceAdapter::failLoopbackForDeviceChange(bool deviceLost) noexcept {
+    if (loopbackProbe_.active()) {
+        loopbackDeviceLost_ = loopbackDeviceLost_ || deviceLost;
+        if (deviceLost) loopbackProbe_.failDevice();
+        else loopbackProbe_.invalidateConfiguration();
+    }
+}
+
+audio::AudioDeviceBufferChangeResult
+JuceAudioDeviceAdapter::setAudioBufferSize(std::size_t desiredFrames) {
+    const auto fail = [this](std::string message) {
+        deviceLatencyReadModel_.lastBufferChangeError = message;
+        return audio::AudioDeviceBufferChangeResult{false, std::move(message)};
+    };
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr || realtimeEngine_.deviceState() !=
+                                 audio::DeviceProcessingState::operational)
+        return fail("No operational audio device is available");
+    if (desiredFrames == 0 || desiredFrames >
+                                  static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return fail("Audio buffer size is invalid");
+
+    const auto available = device->getAvailableBufferSizes();
+    const auto requested = static_cast<int>(desiredFrames);
+    if (available.isEmpty() || !available.contains(requested))
+        return fail("The selected audio buffer size is not supported by this device");
+    const auto currentRate = timeline::SampleRate{device->getCurrentSampleRate()};
+    const auto currentBuffer = device->getCurrentBufferSizeSamples();
+    if (!currentRate.isValid() || currentBuffer <= 0 || device != certifiedDevice_ ||
+        currentRate != certifiedDeviceSampleRate_ ||
+        static_cast<std::size_t>(currentBuffer) != certifiedDeviceBufferSize_)
+        return fail("Audio device configuration is changing; try again when it is stable");
+
+    const DeviceConfigurationCheckpoint configurationCheckpoint{
+        deviceManager_.getAudioDeviceSetup(), deviceManager_.getCurrentDeviceTypeObject(),
+        certifiedDeviceSampleRate_,
+        certifiedDeviceBufferSize_, device->getActiveInputChannels(),
+        device->getActiveOutputChannels()};
+    const auto checkpoint = realtimeEngine_.temporalCheckpoint();
+    const auto callbackWasRegistered = callbackRegistered_;
+    detachAudioCallback(true);
+
+    const auto rollback = [this, &configurationCheckpoint, checkpoint,
+                           callbackWasRegistered](std::string message) {
+        const auto restoreError = deviceManager_.setAudioDeviceSetup(
+            configurationCheckpoint.setup, false);
+        auto* restored = deviceManager_.getCurrentAudioDevice();
+        deviceSampleRate_ = timeline::SampleRate{
+            restored != nullptr ? restored->getCurrentSampleRate() : 0.0};
+        const auto restoredSetup = deviceManager_.getAudioDeviceSetup();
+        std::string preparationError;
+        const bool restoredConfiguration = restoreError.isEmpty() && restored != nullptr &&
+            restored->getCurrentBufferSizeSamples() > 0 &&
+            static_cast<std::size_t>(restored->getCurrentBufferSizeSamples()) ==
+                configurationCheckpoint.bufferSize &&
+            deviceSampleRate_ == configurationCheckpoint.sampleRate &&
+            restored->getActiveInputChannels() ==
+                configurationCheckpoint.activeInputChannels &&
+            restored->getActiveOutputChannels() ==
+                configurationCheckpoint.activeOutputChannels &&
+            deviceManager_.getCurrentDeviceTypeObject() == configurationCheckpoint.deviceType &&
+            restoredSetup.inputDeviceName == configurationCheckpoint.setup.inputDeviceName &&
+            restoredSetup.outputDeviceName == configurationCheckpoint.setup.outputDeviceName &&
+            reprepareForCurrentDevice(preparationError) &&
+            realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
+        if (restoredConfiguration && callbackWasRegistered) {
+            try {
+                attachAudioCallback(true);
+            } catch (...) {
+                message += "; previous audio callback could not be restored";
+                clearMonitoringDemandForLoss();
+                realtimeEngine_.deviceErrorPreservingTransport();
+                certifiedDeviceSampleRate_ = {};
+                certifiedDeviceBufferSize_ = 0;
+                certifiedDevice_ = nullptr;
+                invalidateDeviceLatencyReadModel(message);
+                stateModel_.markError(message);
+                publishState();
+                return audio::AudioDeviceBufferChangeResult{false, std::move(message)};
+            }
+        }
+        if (restoredConfiguration) {
+            refreshState();
+            deviceLatencyReadModel_.lastBufferChangeError = message;
+            return audio::AudioDeviceBufferChangeResult{false, std::move(message)};
+        }
+        if (!preparationError.empty()) message += "; rollback failed: " + preparationError;
+        else if (restoreError.isNotEmpty()) message += "; rollback failed: " + restoreError.toStdString();
+        else message += "; rollback failed";
+        clearMonitoringDemandForLoss();
+        realtimeEngine_.deviceErrorPreservingTransport();
+        certifiedDeviceSampleRate_ = {};
+        certifiedDeviceBufferSize_ = 0;
+        certifiedDevice_ = nullptr;
+        invalidateDeviceLatencyReadModel(message);
+        stateModel_.markError(message);
+        publishState();
+        return audio::AudioDeviceBufferChangeResult{false, std::move(message)};
+    };
+
+    auto candidate = configurationCheckpoint.setup;
+    candidate.bufferSize = requested;
+    const auto setupError = deviceManager_.setAudioDeviceSetup(candidate, false);
+    if (setupError.isNotEmpty())
+        return rollback("Audio buffer could not be configured: " + setupError.toStdString());
+    device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr || device->getCurrentBufferSizeSamples() <= 0)
+        return rollback("Audio device did not report a valid buffer size");
+    deviceSampleRate_ = timeline::SampleRate{device->getCurrentSampleRate()};
+    std::string reprepareError;
+    if (!deviceSampleRate_.isValid() || !reprepareForCurrentDevice(reprepareError)) {
+        return rollback(reprepareError.empty()
+                            ? "Audio buffer configuration could not prepare Core"
+                            : std::move(reprepareError));
+    }
+    try {
+        if (callbackWasRegistered) attachAudioCallback(true);
+    } catch (const std::exception& error) {
+        return rollback(std::string{"Audio callback could not be restored: "} + error.what());
+    } catch (...) {
+        return rollback("Audio callback could not be restored");
+    }
+    refreshState();
+    return {true, {}};
+}
 audio::RealtimeTransportSnapshot JuceAudioDeviceAdapter::transportSnapshot() const noexcept {
     return realtimeEngine_.transportSnapshot();
 }
@@ -1038,6 +1497,10 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
         !request.projectFile.is_absolute()) {
         return {{}, "Save the project to an absolute path before recording"};
     }
+    const auto placementProjectRate = request.projectSampleRate.isValid()
+        ? request.projectSampleRate : projectSampleRate_;
+    if (!placementProjectRate.isValid())
+        return {{}, "Recording placement requires a valid project sample rate"};
     if (recordingWriter_ || realtimeEngine_.recordingSnapshot().busy())
         return {{}, "Another recording is already prepared or active"};
     const auto channels = static_cast<int>(media::channelCount(request.layout));
@@ -1114,6 +1577,39 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
     if (monitoringInputDemand_) {
         monitoringInputChannels_ = activeFoundationInputChannels(*device);
     }
+
+    // This is the sole device-latency query for a take. It happens after the
+    // successful device/Core certification and before beginRecord is exposed
+    // to RT, then travels with the request without callback-side device access.
+    audio::RecordingPlacementSnapshot placement;
+    placement.projectSampleRate = placementProjectRate;
+    placement.deviceSampleRate = deviceSampleRate_;
+    placement.manualOffsetProjectFrames = request.manualOffsetProjectFrames;
+    placement.deviceBufferFrames = static_cast<std::uint32_t>(
+        std::max(0, device->getCurrentBufferSizeSamples()));
+    const auto inputLatency = !device->getActiveInputChannels().isZero()
+        ? device->getInputLatencyInSamples() : -1;
+    if (inputLatency >= 0) {
+        placement.reportedInputLatencyDeviceFrames = {
+            static_cast<std::uint64_t>(inputLatency)};
+        const auto converted = audio::convertRecordingLatencyToProjectFrames(
+            *placement.reportedInputLatencyDeviceFrames, deviceSampleRate_,
+            placementProjectRate);
+        if (converted) {
+            placement.latencyStatus = audio::RecordingLatencyStatus::reported;
+            placement.reportedInputLatencyProjectFrames = *converted;
+        } else {
+            placement.latencyStatus = audio::RecordingLatencyStatus::invalid;
+        }
+    } else {
+        placement.latencyStatus = audio::RecordingLatencyStatus::unavailable;
+    }
+    const auto effective = audio::computeEffectiveRecordingCompensation(
+        placement.latencyStatus, placement.reportedInputLatencyProjectFrames,
+        placement.manualOffsetProjectFrames);
+    if (!effective)
+        return rollback("Recording offset cannot be represented safely");
+    placement.effectiveCompensationProjectFrames = *effective;
 
     try {
         constexpr double captureSeconds = 2.0;
@@ -1206,7 +1702,7 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
         recordingWriterFailed_ = false;
         recordingWriterError_.clear();
         const audio::RecordingRequest prepared{
-            nextRecordingSession_++, request.track, request.layout};
+            nextRecordingSession_++, request.track, request.layout, placement};
         if (callbackWasRegistered) attachAudioCallback(true);
         refreshState();
         return {prepared, {}, recordingRecoveryWarning_};
@@ -1485,12 +1981,17 @@ void JuceAudioDeviceAdapter::audioDeviceIOCallbackWithContext(
     const float* const* input, int inputChannels,
     float* const* output, int outputChannels, int frames,
     const juce::AudioIODeviceCallbackContext&) noexcept {
-    realtimeEngine_.processBlock(
-        {input, static_cast<std::size_t>(std::max(0, inputChannels)),
-         static_cast<std::size_t>(std::max(0, frames))},
-        {output, static_cast<std::size_t>(std::max(0, outputChannels)),
-         static_cast<std::size_t>(std::max(0, frames))},
-        deviceSampleRate_);
+    const audio::ConstAudioBlockView inputBlock{
+        input, static_cast<std::size_t>(std::max(0, inputChannels)),
+        static_cast<std::size_t>(std::max(0, frames))};
+    const audio::AudioBlockView outputBlock{
+        output, static_cast<std::size_t>(std::max(0, outputChannels)),
+        static_cast<std::size_t>(std::max(0, frames))};
+    if (loopbackProbe_.active()) {
+        loopbackProbe_.processBlock(inputBlock, outputBlock);
+        return;
+    }
+    realtimeEngine_.processBlock(inputBlock, outputBlock, deviceSampleRate_);
 }
 
 void JuceAudioDeviceAdapter::audioDeviceAboutToStart(juce::AudioIODevice* device) noexcept {
@@ -1552,6 +2053,7 @@ void JuceAudioDeviceAdapter::closeDevice(bool publishClosedState) noexcept {
         certifiedDeviceSampleRate_ = {};
         certifiedDeviceBufferSize_ = 0;
         certifiedDevice_ = nullptr;
+        invalidateDeviceLatencyReadModel();
     }
     realtimeEngine_.deviceUnavailable();
     if (publishClosedState) {
@@ -1573,7 +2075,13 @@ void JuceAudioDeviceAdapter::refreshState() {
     if (device == nullptr || !callbackRegistered_ || !device->isPlaying() ||
         realtimeEngine_.deviceState() !=
             audio::DeviceProcessingState::operational) {
-        stateModel_.markError("No operational audio output device");
+        const auto previous = stateModel_.state();
+        const auto diagnostic = previous.status == audio::AudioDeviceStatus::error &&
+                !previous.errorMessage.empty()
+            ? previous.errorMessage
+            : std::string{"No operational audio output device"};
+        stateModel_.markError(diagnostic);
+        invalidateDeviceLatencyReadModel(diagnostic);
         publishState();
         return;
     }
@@ -1582,12 +2090,127 @@ void JuceAudioDeviceAdapter::refreshState() {
     info.sampleRate = device->getCurrentSampleRate();
     info.bufferSizeFrames =
         static_cast<std::uint32_t>(device->getCurrentBufferSizeSamples());
-    info.availableInputChannels =
-        static_cast<std::uint32_t>(device->getInputChannelNames().size());
     info.availableOutputChannels =
         static_cast<std::uint32_t>(device->getOutputChannelNames().size());
+    refreshDeviceLatencyReadModel();
+    info.availableInputChannels = static_cast<std::uint32_t>(
+        deviceLatencyReadModel_.inputChannelNames.size());
     stateModel_.markActive(std::move(info));
     publishState();
+}
+
+void JuceAudioDeviceAdapter::invalidateDeviceLatencyReadModel(std::string errorMessage) {
+    deviceLatencyReadModel_ = {};
+    deviceLatencyReadModel_.lastBufferChangeError = std::move(errorMessage);
+}
+
+void JuceAudioDeviceAdapter::refreshDeviceLatencyReadModel() {
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr || device != certifiedDevice_ || !device->isOpen()) {
+        invalidateDeviceLatencyReadModel();
+        return;
+    }
+    const auto sampleRate = device->getCurrentSampleRate();
+    const auto buffer = device->getCurrentBufferSizeSamples();
+    if (!std::isfinite(sampleRate) || sampleRate <= 0.0 || buffer <= 0 ||
+        timeline::SampleRate{sampleRate} != certifiedDeviceSampleRate_ ||
+        static_cast<std::size_t>(buffer) != certifiedDeviceBufferSize_) {
+        invalidateDeviceLatencyReadModel();
+        return;
+    }
+
+    audio::DeviceLatencyReadModel model;
+    model.configurationAvailable = true;
+    model.confirmedBufferSizeFrames = static_cast<std::uint32_t>(buffer);
+    model.sampleRateHz = sampleRate;
+    const auto inputNames = discoverAvailableInputChannelNames();
+    const auto outputNames = device->getOutputChannelNames();
+    model.inputChannelNames.reserve(static_cast<std::size_t>(inputNames.size()));
+    model.outputChannelNames.reserve(static_cast<std::size_t>(outputNames.size()));
+    for (const auto& name : inputNames)
+        model.inputChannelNames.push_back(name.toStdString());
+    for (const auto& name : outputNames)
+        model.outputChannelNames.push_back(name.toStdString());
+    const auto sizes = device->getAvailableBufferSizes();
+    for (const auto size : sizes) {
+        if (size > 0 && static_cast<std::uint64_t>(size) <=
+                            std::numeric_limits<std::uint32_t>::max())
+            model.supportedBufferSizeFrames.push_back(static_cast<std::uint32_t>(size));
+    }
+    std::sort(model.supportedBufferSizeFrames.begin(),
+              model.supportedBufferSizeFrames.end());
+    model.supportedBufferSizeFrames.erase(
+        std::unique(model.supportedBufferSizeFrames.begin(),
+                    model.supportedBufferSizeFrames.end()),
+        model.supportedBufferSizeFrames.end());
+
+    const auto milliseconds = [sampleRate](std::uint32_t frames)
+        -> std::optional<double> {
+        const auto result = static_cast<double>(frames) / sampleRate * 1000.0;
+        return std::isfinite(result) ? std::optional<double>{result} : std::nullopt;
+    };
+    if (!device->getActiveInputChannels().isZero()) {
+        const auto latency = device->getInputLatencyInSamples();
+        if (latency >= 0) {
+            model.inputLatencyFrames = static_cast<std::uint32_t>(latency);
+            model.inputLatencyMilliseconds = milliseconds(*model.inputLatencyFrames);
+        }
+    }
+    if (!device->getActiveOutputChannels().isZero()) {
+        const auto latency = device->getOutputLatencyInSamples();
+        if (latency >= 0) {
+            model.outputLatencyFrames = static_cast<std::uint32_t>(latency);
+            model.outputLatencyMilliseconds = milliseconds(*model.outputLatencyFrames);
+        }
+    }
+    if (model.inputLatencyFrames && model.outputLatencyFrames) {
+        const auto total = static_cast<std::uint64_t>(*model.inputLatencyFrames) +
+                           static_cast<std::uint64_t>(*model.outputLatencyFrames);
+        const auto estimate = static_cast<double>(total) / sampleRate * 1000.0;
+        if (std::isfinite(estimate))
+            model.estimatedMonitoringLatencyMilliseconds = estimate;
+    }
+    deviceLatencyReadModel_ = std::move(model);
+}
+
+juce::StringArray
+JuceAudioDeviceAdapter::discoverAvailableInputChannelNames() {
+    auto* current = deviceManager_.getCurrentAudioDevice();
+    if (current == nullptr) return {};
+    auto names = current->getInputChannelNames();
+    if (!names.isEmpty()) return names;
+
+    // An output-only AudioDeviceManager setup may expose no input channels on
+    // its current device object even though the selected device type has a
+    // physical input device. Probe capability without opening it or changing
+    // the productive setup; Monitoring remains a separate manual demand.
+    auto* type = deviceManager_.getCurrentDeviceTypeObject();
+    if (type == nullptr) return {};
+    const auto inputDevices = type->getDeviceNames(true);
+    if (inputDevices.isEmpty()) return {};
+    const auto setup = deviceManager_.getAudioDeviceSetup();
+    auto inputDeviceName = setup.inputDeviceName;
+    if (inputDeviceName.isEmpty() || !inputDevices.contains(inputDeviceName)) {
+        const auto index = type->getDefaultDeviceIndex(true);
+        if (index < 0 || index >= inputDevices.size()) return {};
+        inputDeviceName = inputDevices[index];
+    }
+    const auto outputDevices = type->getDeviceNames(false);
+    auto outputDeviceName = setup.outputDeviceName;
+    if (outputDeviceName.isEmpty() || !outputDevices.contains(outputDeviceName)) {
+        const auto index = type->getDefaultDeviceIndex(false);
+        if (index >= 0 && index < outputDevices.size())
+            outputDeviceName = outputDevices[index];
+    }
+    try {
+        std::unique_ptr<juce::AudioIODevice> capability{
+            type->createDevice(outputDeviceName, inputDeviceName)};
+        if (capability != nullptr)
+            names = capability->getInputChannelNames();
+    } catch (...) {
+        return {};
+    }
+    return names;
 }
 
 void JuceAudioDeviceAdapter::publishState() {
@@ -1633,6 +2256,13 @@ void JuceAudioDeviceAdapter::attachAudioCallback(bool preserveTransport) {
 void JuceAudioDeviceAdapter::configureRealtimeEngine() noexcept {
     if (preparedProject_ == nullptr || preparedProject_->processing == nullptr) {
         realtimeEngine_.configure({projectSampleRate_, {}, {}, {}, false});
+        if (auto* device = deviceManager_.getCurrentAudioDevice(); device != nullptr &&
+            device->getCurrentBufferSizeSamples() > 0 &&
+            !realtimeEngine_.prepareDeviceBlockCapacity(
+                static_cast<std::size_t>(device->getCurrentBufferSizeSamples()))) {
+            realtimeEngine_.deviceError();
+            return;
+        }
         if (deviceSampleRate_.isValid() && !realtimeEngine_.prepareLegacyDeviceRate(deviceSampleRate_))
             realtimeEngine_.deviceError();
         static_cast<void>(realtimeEngine_.configureTemporalContext(
@@ -1760,6 +2390,10 @@ bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
     preparedTemporalContext_.swap(temporal);
     projectSampleRate_ = rate;
     configureRealtimeEngine();
+    if (!realtimeEngine_.monitoringStagingPrepared()) {
+        errorMessage = "Monitoring staging could not be prepared for the audio device buffer";
+        return false;
+    }
     const auto restored = realtimeEngine_.restoreTemporalCheckpoint(checkpoint);
     jassert(restored);
     static_cast<void>(restored);
@@ -1772,6 +2406,8 @@ bool JuceAudioDeviceAdapter::reprepareForCurrentDevice(
         certifiedDeviceBufferSize_ = static_cast<std::size_t>(
             std::max(0, device->getCurrentBufferSizeSamples()));
         certifiedDevice_ = device;
+        ++certifiedDeviceGeneration_;
+        if (certifiedDeviceGeneration_ == 0) ++certifiedDeviceGeneration_;
     } else {
         certifiedDeviceSampleRate_ = {};
         certifiedDeviceBufferSize_ = 0;

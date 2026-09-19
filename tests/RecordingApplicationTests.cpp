@@ -1,10 +1,13 @@
 #include "vitadaw/application/DawApplication.h"
 #include "vitadaw/commands/CommandDispatcher.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 
 namespace {
@@ -76,6 +79,10 @@ public:
     bool deferFirstCallback{};
     bool recoveryMetadataAvailable{true};
     std::string recoveryWarning;
+    std::optional<std::uint64_t> reportedInputLatency{0};
+    timeline::SampleRate recordingDeviceRate{44100.0};
+    std::uint32_t recordingBufferFrames{256};
+    audio::DeviceLatencyReadModel latencyReadModel;
     unsigned commits{};
     unsigned discards{};
 
@@ -159,12 +166,36 @@ public:
     audio::RealtimeTransportSnapshot projectedTransportSnapshot() noexcept override {
         return transport;
     }
+    audio::DeviceLatencyReadModel deviceLatencyReadModel() const override {
+        return latencyReadModel;
+    }
     mixer::MeterSnapshot meterSnapshot() const noexcept override { return {}; }
 
     audio::RecordingPreflightResult prepareRecording(
         const audio::RecordingPreflightRequest& request) override {
         preparedLayout = request.layout;
-        preparedRequest = {nextSession++, request.track, request.layout};
+        preparedRequest = {nextSession++, request.track, request.layout, {}};
+        preparedRequest.placement.projectSampleRate = request.projectSampleRate;
+        preparedRequest.placement.deviceSampleRate = recordingDeviceRate;
+        preparedRequest.placement.deviceBufferFrames = recordingBufferFrames;
+        preparedRequest.placement.manualOffsetProjectFrames = request.manualOffsetProjectFrames;
+        if (reportedInputLatency) {
+            preparedRequest.placement.reportedInputLatencyDeviceFrames = {*reportedInputLatency};
+            const auto converted = audio::convertRecordingLatencyToProjectFrames(
+                *preparedRequest.placement.reportedInputLatencyDeviceFrames,
+                recordingDeviceRate, request.projectSampleRate);
+            if (converted) {
+                preparedRequest.placement.latencyStatus = audio::RecordingLatencyStatus::reported;
+                preparedRequest.placement.reportedInputLatencyProjectFrames = *converted;
+            } else {
+                preparedRequest.placement.latencyStatus = audio::RecordingLatencyStatus::invalid;
+            }
+        }
+        preparedRequest.placement.effectiveCompensationProjectFrames =
+            audio::computeEffectiveRecordingCompensation(
+                preparedRequest.placement.latencyStatus,
+                preparedRequest.placement.reportedInputLatencyProjectFrames,
+                request.manualOffsetProjectFrames).value_or(timeline::ProjectFrameCount{});
         return {preparedRequest, {}, recoveryWarning};
     }
     audio::AudioControlRequestResult tryRequestRecord(
@@ -179,6 +210,7 @@ public:
         capture.projectStart = transport.position;
         capture.acceptedDeviceFrames = {441};
         capture.deviceSampleRate = timeline::SampleRate{44100.0};
+        capture.placement = request.placement;
         if (deferFirstCallback) {
             capture.phase = audio::RecordingPhase::prepared;
             capture.acceptedDeviceFrames = {};
@@ -334,7 +366,7 @@ void recordingTransactionAndHistory() {
     for (const auto& forbidden : std::vector<commands::Command>{
              commands::Pause{}, commands::SeekToProjectFrame{{1}},
              commands::AddAudioTrack{"Blocked"}, commands::Undo{},
-             commands::SaveProject{}, commands::Record{}}) {
+             commands::SaveProject{}}) {
         check(send(app, forbidden).error == commands::CommandError::invalidState,
               "forbidden capture operation rejected");
     }
@@ -379,6 +411,67 @@ void recordingTransactionAndHistory() {
               app.project().sources().size() == 1 &&
               app.project().tracks()[0].clips.size() == 1,
           "recorded source survives Save/Load round trip");
+}
+
+void recordToggleAndExplicitStopNeverLeavePlaybackRunning() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Record transport"}).status ==
+              commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Record transport.vitadaw"}).status ==
+              commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status ==
+              commands::CommandStatus::accepted,
+          "record-transport fixture established");
+
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              app.recordingPhase() == audio::RecordingPhase::capturing,
+          "Stopped to Record starts the first take");
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              app.transport().playback == transport::PlaybackState::stopped &&
+              engine.transport.playback == transport::PlaybackState::stopped,
+          "second Record is a Command-System Stop and never an implicit Play");
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::complete &&
+              app.transport().playback == transport::PlaybackState::stopped &&
+              app.project().tracks()[0].clips.size() == 1,
+          "record-toggle finalizes WAV/commit with transport stopped");
+
+    check(send(app, commands::Play{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).error ==
+                  commands::CommandError::transportMustBeStopped,
+          "Playing to Record remains rejected by the existing stopped-only policy");
+    check(send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "playing-policy fixture returns to Stopped");
+
+    check(send(app, commands::EnableInputMonitoring{}).status ==
+              commands::CommandStatus::accepted,
+          "Monitoring ON fixture enabled manually");
+    app.synchroniseTransport();
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).status == commands::CommandStatus::accepted,
+          "Record toggle remains available with Monitoring ON");
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::complete &&
+              app.transport().playback == transport::PlaybackState::stopped &&
+              app.inputMonitoringEnabled() &&
+              app.project().tracks()[0].clips.size() == 2,
+          "Monitoring ON remains independent and second recording commits stopped");
+
+    check(send(app, commands::DisableInputMonitoring{}).status ==
+              commands::CommandStatus::accepted,
+          "Monitoring OFF fixture disabled manually");
+    app.synchroniseTransport();
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "explicit Stop remains the authoritative recording terminal command");
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::complete &&
+              app.transport().playback == transport::PlaybackState::stopped &&
+              !app.inputMonitoringEnabled() &&
+              app.project().tracks()[0].clips.size() == 3,
+          "Monitoring OFF and explicit Stop finalize without implicit Play");
 }
 
 void failureAtomicityAndArmDeletion() {
@@ -496,6 +589,168 @@ void monitoringCommandsRemainAvailableDuringRecording() {
           "monitoring control leaves recording lifecycle and document history unchanged");
 }
 
+void placementIsFrozenAndRedoDoesNotRecalculate() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    engine.reportedInputLatency = 256;
+    engine.recordingDeviceRate = timeline::SampleRate{44100.0};
+    engine.recordingBufferFrames = 256;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Placement"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Placement.vitadaw"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SeekToProjectFrame{{1000}}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetRecordingOffset{-16}).status == commands::CommandStatus::accepted,
+          "placement fixture is established");
+    check(send(app, commands::SetRecordingOffset{-96001}).status == commands::CommandStatus::rejected &&
+              app.recordingPlacementReadModel().manualOffsetProjectFrames.value == -16,
+          "out-of-range manual offset is rejected without changing the prior value");
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "placement recording completes");
+    app.synchroniseTransport();
+    const auto first = app.project().tracks()[0].clips[0];
+    check(first.projectStart.value == 705,
+          "44.1 device input latency converts to 279 project frames and combines with manual offset");
+    check(send(app, commands::Undo{}).status == commands::CommandStatus::accepted,
+          "placement recording undo succeeds");
+    engine.reportedInputLatency = 0;
+    engine.recordingDeviceRate = timeline::SampleRate{48000.0};
+    check(send(app, commands::SetRecordingOffset{96}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Redo{}).status == commands::CommandStatus::accepted &&
+              app.project().tracks()[0].clips[0].projectStart == first.projectStart,
+          "redo restores the committed placement after latency and offset changes");
+    check(send(app, commands::SaveProject{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::LoadProject{"/virtual/Placement.vitadaw", true}).status == commands::CommandStatus::accepted &&
+              app.project().tracks()[0].clips[0].projectStart == first.projectStart,
+          "save/load preserves compensated clip start without recalculation");
+    // A later device/buffer configuration is captured only by its own preflight;
+    // the already-published take remains documentary state, not a live latency view.
+    engine.reportedInputLatency = 512;
+    engine.recordingDeviceRate = timeline::SampleRate{44100.0};
+    engine.recordingBufferFrames = 512;
+    check(send(app, commands::SeekToProjectFrame{{1000}}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetRecordingOffset{-16}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "second take accepts the later input-latency/buffer snapshot");
+    app.synchroniseTransport();
+    const auto second = app.project().tracks()[0].clips.front();
+    check(first.projectStart.value == 705 && second.projectStart.value == 427 &&
+              engine.preparedRequest.placement.deviceBufferFrames == 512,
+          "new input latency affects only the later take while the first remains fixed");
+    check(send(app, commands::SeekToProjectFrame{{1000}}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetMonitorGain{{-3.0F}}).status == commands::CommandStatus::accepted &&
+              send(app, commands::EnableInputMonitoring{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "monitoring-on comparison take completes");
+    app.synchroniseTransport();
+    const auto& clips = app.project().tracks()[0].clips;
+    const auto monitored = std::find_if(clips.begin(), clips.end(),
+        [second](const auto& clip) {
+            return clip.id != second.id && clip.projectStart == second.projectStart;
+        });
+    check(monitored != clips.end() && monitored->duration == second.duration &&
+              app.project().findSource(monitored->source)->media ==
+                  app.project().findSource(second.source)->media,
+          "Monitoring and monitor gain do not alter documentary placement or clip end");
+}
+
+void recordingPlacementReadModelTracksUnavailableManualOffset() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    const auto verify = [&](std::int64_t manual, std::int64_t effective) {
+        check(send(app, commands::SetRecordingOffset{manual}).status ==
+                  commands::CommandStatus::accepted &&
+                  app.recordingPlacementReadModel().latencyStatus ==
+                      audio::RecordingLatencyStatus::unavailable &&
+                  app.recordingPlacementReadModel().effectiveCompensationProjectFrames.value ==
+                      effective,
+              "unavailable latency read model retains the manual placement contribution");
+    };
+    verify(0, 0);
+    verify(-16, 16);
+    verify(16, -16);
+    engine.latencyReadModel.configurationAvailable = true;
+    engine.latencyReadModel.sampleRateHz = 48000.0;
+    engine.latencyReadModel.inputLatencyFrames = 256;
+    check(app.recordingPlacementReadModel().latencyStatus ==
+              audio::RecordingLatencyStatus::reported &&
+              app.recordingPlacementReadModel().effectiveCompensationProjectFrames.value == 240,
+          "reported latency combines with the current manual offset through the shared formula");
+}
+
+void recordingOffsetBoundsAndClampDiagnosticRemainEphemeral() {
+    const auto verifyBounds = [](timeline::SampleRate rate) {
+        MemoryFiles files;
+        RecordingEngine engine;
+        application::DawApplication app{engine, rate, files};
+        const auto limit = static_cast<std::int64_t>(std::llround(rate.hertz() * 2.0));
+        const auto token = app.history().currentStateToken();
+        check(send(app, commands::SetRecordingOffset{-limit}).status ==
+                  commands::CommandStatus::accepted &&
+                  send(app, commands::SetRecordingOffset{limit}).status ==
+                  commands::CommandStatus::accepted &&
+                  send(app, commands::SetRecordingOffset{limit + 1}).status ==
+                  commands::CommandStatus::rejected &&
+                  send(app, commands::SetRecordingOffset{-limit - 1}).status ==
+                  commands::CommandStatus::rejected &&
+                  app.recordingPlacementReadModel().manualOffsetProjectFrames.value == limit &&
+                  app.history().currentStateToken() == token && !app.session().dirty(),
+              "exact project-rate-derived manual bounds are accepted and out-of-range values are ephemeral rejects");
+    };
+    verifyBounds(timeline::SampleRate{44100.0});
+    verifyBounds(timeline::SampleRate{96000.0});
+
+    MemoryFiles files;
+    RecordingEngine engine;
+    engine.reportedInputLatency = 256;
+    engine.recordingDeviceRate = timeline::SampleRate{48000.0};
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Clamp"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Clamp.vitadaw"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SeekToProjectFrame{{255}}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "one-frame clamp fixture records");
+    app.synchroniseTransport();
+    check(app.project().tracks()[0].clips[0].projectStart.value == 0 &&
+              app.recordingPlacementReadModel().lastCommittedUnappliedEarlyFrames == 1,
+          "one-frame clamp is committed at frame zero with its diagnostic");
+    check(send(app, commands::Undo{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Redo{}).status == commands::CommandStatus::accepted &&
+              app.recordingPlacementReadModel().lastCommittedUnappliedEarlyFrames == 1,
+          "undo/redo restores the committed clip without recalculating or altering clamp diagnostics");
+}
+
+void exclusiveEndPlacementFailureRetainsValidMediaAtomically() {
+    MemoryFiles files;
+    RecordingEngine engine;
+    engine.cleanupFails = true;
+    application::DawApplication app{engine, timeline::SampleRate{48000.0}, files};
+    check(send(app, commands::AddAudioTrack{"Upper bound"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SaveProjectAs{"/virtual/Upper.vitadaw"}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SetTrackRecordArmed{{1}, true}).status == commands::CommandStatus::accepted &&
+              send(app, commands::SeekToProjectFrame{timeline::maximumSupportedProjectFrame()}).status ==
+                  commands::CommandStatus::accepted,
+          "exclusive-end overflow fixture is established");
+    const auto token = app.history().currentStateToken();
+    check(send(app, commands::Record{}).status == commands::CommandStatus::accepted &&
+              send(app, commands::Stop{}).status == commands::CommandStatus::accepted,
+          "exclusive-end overflow reaches finalization with valid media");
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::failed && app.project().sources().empty() &&
+              app.project().tracks()[0].clips.empty() && app.history().currentStateToken() == token &&
+              !app.session().dirty() && engine.discards == 1 &&
+              app.recordingError().find("retained for recovery") != std::string::npos,
+          "exclusive-end overflow aborts only the documentary commit and retains valid media safely");
+}
+
 void shutdownCancelsWithoutCommitting() {
     MemoryFiles files;
     RecordingEngine engine;
@@ -558,10 +813,15 @@ void explicitRecoveryUsesTransactionalImport() {
 
 int main() {
     recordingTransactionAndHistory();
+    recordToggleAndExplicitStopNeverLeavePlaybackRunning();
     recoveryMetadataWarningDoesNotBlockRecording();
     failureAtomicityAndArmDeletion();
     preparedDeviceLossCleansApplicationSession();
     monitoringCommandsRemainAvailableDuringRecording();
+    placementIsFrozenAndRedoDoesNotRecalculate();
+    recordingPlacementReadModelTracksUnavailableManualOffset();
+    recordingOffsetBoundsAndClampDiagnosticRemainEphemeral();
+    exclusiveEndPlacementFailureRetainsValidMediaAtomically();
     shutdownCancelsWithoutCommitting();
     explicitRecoveryUsesTransactionalImport();
     std::cout << "Recording application tests passed\n";

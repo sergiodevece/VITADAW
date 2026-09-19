@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,6 +14,39 @@
 namespace vitadaw::audio {
 
 using RecordingSessionId = std::uint64_t;
+
+// Placement is documentary only: it accompanies a take until finalization and
+// never participates in callback-side PCM capture or WAV writing.
+enum class RecordingLatencyStatus : std::uint8_t { reported, unavailable, invalid };
+
+struct RecordingPlacementSnapshot {
+    timeline::SampleRate projectSampleRate;
+    timeline::SampleRate deviceSampleRate;
+    std::optional<timeline::DeviceFrameCount> reportedInputLatencyDeviceFrames;
+    timeline::ProjectFrameCount reportedInputLatencyProjectFrames;
+    timeline::ProjectFrameCount manualOffsetProjectFrames;
+    timeline::ProjectFrameCount effectiveCompensationProjectFrames;
+    std::uint32_t deviceBufferFrames{};
+    RecordingLatencyStatus latencyStatus{RecordingLatencyStatus::unavailable};
+};
+
+struct RecordingPlacementResult {
+    timeline::ProjectFramePosition start;
+    std::uint64_t unappliedEarlyFrames{};
+    bool upperBoundExceeded{};
+};
+
+[[nodiscard]] std::optional<timeline::ProjectFrameCount>
+convertRecordingLatencyToProjectFrames(timeline::DeviceFrameCount,
+                                       timeline::SampleRate deviceRate,
+                                       timeline::SampleRate projectRate) noexcept;
+[[nodiscard]] std::optional<timeline::ProjectFrameCount>
+computeEffectiveRecordingCompensation(RecordingLatencyStatus,
+                                      timeline::ProjectFrameCount automatic,
+                                      timeline::ProjectFrameCount manual) noexcept;
+[[nodiscard]] RecordingPlacementResult computeRecordingPlacement(
+    timeline::ProjectFramePosition capturedStart,
+    const RecordingPlacementSnapshot&) noexcept;
 
 enum class RecordingPhase : std::uint8_t {
     idle,
@@ -64,6 +98,7 @@ struct RecordingRequest {
     RecordingSessionId session{};
     tracks::TrackId track;
     media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
+    RecordingPlacementSnapshot placement;
 };
 
 struct RecordingSnapshot {
@@ -75,6 +110,7 @@ struct RecordingSnapshot {
     timeline::ProjectFramePosition projectStart;
     timeline::SourceFrameCount acceptedDeviceFrames;
     timeline::SampleRate deviceSampleRate;
+    RecordingPlacementSnapshot placement;
 
     [[nodiscard]] bool busy() const noexcept {
         return phase == RecordingPhase::prepared ||
@@ -90,6 +126,8 @@ struct RecordingPreflightRequest {
     tracks::TrackId track;
     media::AudioChannelLayout layout{media::AudioChannelLayout::mono};
     std::filesystem::path projectFile;
+    timeline::SampleRate projectSampleRate;
+    timeline::ProjectFrameCount manualOffsetProjectFrames;
 };
 
 struct RecordingPreflightResult {

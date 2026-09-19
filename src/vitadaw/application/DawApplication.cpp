@@ -4,6 +4,7 @@
 #include <exception>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iomanip>
 #include <new>
 #include <optional>
@@ -160,13 +161,22 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
     using namespace commands;
     // Serialized application-thread entry point; RT never reads the history.
     try {
+        const auto loopback = audioEngine_.loopbackLatencyReadModel();
+        if (loopback.busy() &&
+            !std::holds_alternative<CancelLoopbackLatencyTest>(command)) {
+            return {CommandStatus::rejected,
+                    "Physical loopback latency test is running",
+                    CommandError::invalidState};
+        }
         if (recordingBusy() &&
             !std::holds_alternative<Stop>(command) &&
+            !std::holds_alternative<Record>(command) &&
             !std::holds_alternative<CancelRecording>(command) &&
             !std::holds_alternative<EnableInputMonitoring>(command) &&
             !std::holds_alternative<DisableInputMonitoring>(command) &&
             !std::holds_alternative<ToggleInputMonitoring>(command) &&
-            !std::holds_alternative<SetMonitorGain>(command)) {
+            !std::holds_alternative<SetMonitorGain>(command) &&
+            !std::holds_alternative<SetRecordingOffset>(command)) {
             return {CommandStatus::rejected,
                     "Recording is capturing or finalizing",
                     CommandError::invalidState};
@@ -188,6 +198,30 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     session_.armedTrack.reset();
                 return {CommandStatus::accepted, "Track disarmed"};
             } else if constexpr (std::is_same_v<T, Record>) {
+                // Record is the serialized toggle authority. A second Record
+                // request terminalizes capture through the same RT Stop command
+                // as the transport control; it must never become an implicit
+                // Play request after the take has finished.
+                if (recordingBusy()) {
+                    if (recordingPhase_ == audio::RecordingPhase::finalizing)
+                        return {CommandStatus::rejected,
+                                "Recording is finalizing",
+                                CommandError::invalidState};
+                    if (transport_.playback == transport::PlaybackState::stopped)
+                        return {CommandStatus::accepted,
+                                "Recording stop already scheduled"};
+                    const auto request = audioEngine_.tryRequestStop();
+                    if (!request.accepted) {
+                        return {CommandStatus::rejected,
+                                "Recording could not be stopped",
+                                CommandError::transportUnavailable};
+                    }
+                    pendingAudioCommandSequence_ = request.sequence;
+                    transport_.playback = request.projectedPlayback;
+                    transport_.position = request.projectedPosition;
+                    return {CommandStatus::accepted,
+                            "Recording stop scheduled"};
+                }
                 if (transport_.playback != transport::PlaybackState::stopped)
                     return {CommandStatus::rejected, "Record requires Stopped",
                             CommandError::transportMustBeStopped};
@@ -207,7 +241,8 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                             CommandError::trackNotFound};
                 }
                 auto preparation = audioEngine_.prepareRecording(
-                    {*session_.armedTrack, track->layout, session_.projectFilePath});
+                    {*session_.armedTrack, track->layout, session_.projectFilePath,
+                     session_.project.sampleRate(), manualRecordingOffset_});
                 if (!preparation.success()) {
                     recordingPhase_ = audio::RecordingPhase::failed;
                     recordingError_ = std::move(preparation.errorMessage);
@@ -437,7 +472,10 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
                     !std::is_same_v<T, EnableInputMonitoring> &&
                     !std::is_same_v<T, DisableInputMonitoring> &&
                     !std::is_same_v<T, ToggleInputMonitoring> &&
-                    !std::is_same_v<T, SetMonitorGain>;
+                    !std::is_same_v<T, SetMonitorGain> &&
+                    !std::is_same_v<T, SetRecordingOffset> &&
+                    !std::is_same_v<T, StartLoopbackLatencyTest> &&
+                    !std::is_same_v<T, CancelLoopbackLatencyTest>;
                 if constexpr (persistent) {
                     if (!session_.history.canCreateState())
                         return {CommandStatus::rejected, "History token capacity exceeded",
@@ -903,6 +941,64 @@ commands::CommandResult DawApplication::execute(const commands::Command& command
                 requestedMonitorGain_ = value.gain;
                 return {commands::CommandStatus::accepted,
                         "Monitor gain updated"};
+            } else if constexpr (std::is_same_v<T, commands::SetAudioBufferSize>) {
+                if (value.frames == 0)
+                    return {commands::CommandStatus::rejected,
+                            "Audio buffer size must be positive",
+                            commands::CommandError::validationFailed};
+                const auto result = audioEngine_.setAudioBufferSize(value.frames);
+                if (!result.success)
+                    return {commands::CommandStatus::rejected,
+                            result.errorMessage.empty()
+                                ? "Audio buffer change was rejected"
+                                : result.errorMessage,
+                            commands::CommandError::transportUnavailable};
+                return {commands::CommandStatus::accepted,
+                        "Audio buffer configuration updated"};
+            } else if constexpr (std::is_same_v<T, commands::SetRecordingOffset>) {
+                const auto rate = session_.project.sampleRate();
+                const auto maximum = rate.isValid()
+                    ? static_cast<std::int64_t>(std::llround(rate.hertz() * 2.0)) : 0;
+                if (maximum <= 0 || value.projectFrames < -maximum ||
+                    value.projectFrames > maximum) {
+                    return {commands::CommandStatus::rejected,
+                            "Recording offset must be between -2.0 and +2.0 seconds",
+                            commands::CommandError::validationFailed};
+                }
+                manualRecordingOffset_ = {value.projectFrames};
+                return {commands::CommandStatus::accepted, "Recording offset updated"};
+            } else if constexpr (std::is_same_v<T, commands::StartLoopbackLatencyTest>) {
+                const auto projected = audioEngine_.projectedTransportSnapshot();
+                if (projected.playback != transport::PlaybackState::stopped)
+                    return {commands::CommandStatus::rejected,
+                            "Stop Playback before running the loopback latency test",
+                            commands::CommandError::transportMustBeStopped};
+                if (recordingBusy())
+                    return {commands::CommandStatus::rejected,
+                            "Stop Recording before running the loopback latency test",
+                            commands::CommandError::invalidState};
+                if (inputMonitoringEnabled_ || requestedInputMonitoringEnabled_ ||
+                    projected.monitoringEnabled)
+                    return {commands::CommandStatus::rejected,
+                            "Disable Input Monitoring before running the loopback latency test",
+                            commands::CommandError::invalidState};
+                const auto result = audioEngine_.startLoopbackLatencyTest(
+                    {value.inputChannel, value.outputChannel});
+                if (!result.success)
+                    return {commands::CommandStatus::rejected,
+                            result.errorMessage.empty()
+                                ? "Physical loopback latency test could not start"
+                                : result.errorMessage,
+                            commands::CommandError::preparationFailed};
+                return {commands::CommandStatus::accepted,
+                        "Physical loopback latency test started"};
+            } else if constexpr (std::is_same_v<T, commands::CancelLoopbackLatencyTest>) {
+                if (!audioEngine_.cancelLoopbackLatencyTest())
+                    return {commands::CommandStatus::rejected,
+                            "No loopback latency test is running",
+                            commands::CommandError::invalidState};
+                return {commands::CommandStatus::accepted,
+                        "Physical loopback latency test cancellation requested"};
             } else if constexpr (std::is_same_v<T, commands::Play>) {
                 const auto request = audioEngine_.tryRequestPlay();
                 if (!request.accepted) {
@@ -1357,13 +1453,19 @@ commands::CommandResult DawApplication::commitRecordedAudio(
             CommandError::preparationFailed);
     }
 
+    const auto placement = audio::computeRecordingPlacement(
+        finalized.capture.projectStart, finalized.capture.placement);
+    if (placement.upperBoundExceeded) {
+        return rejectAndClean("Recording placement exceeds the supported project-frame range",
+                              CommandError::invalidState);
+    }
     auto candidate = session_.project;
     project::ProjectState::ImportedAudio imported;
     try {
         imported = candidate.importAudioToTrack(
             finalized.capture.track, finalized.prepared->media,
             metadata.sourceFrameCount, metadata.sourceSampleRate,
-            finalized.capture.layout, finalized.capture.projectStart);
+            finalized.capture.layout, placement.start);
     } catch (...) {
         return rejectAndClean("Recorded project material could not be staged",
                               CommandError::preparationFailed);
@@ -1422,6 +1524,7 @@ commands::CommandResult DawApplication::commitRecordedAudio(
         return rejectAndClean("Recorded processing plan could not be committed",
                               CommandError::commitFailed);
     }
+    lastCommittedUnappliedEarlyFrames_ = placement.unappliedEarlyFrames;
     audioEngine_.confirmRecordingCommit();
     return {CommandStatus::accepted, "Recording committed", CommandError::none,
             {}, {imported.clip}};
@@ -1628,6 +1731,7 @@ audio::PreparedAudibilityState DawApplication::resolveAudibility(
 }
 
 void DawApplication::synchroniseTransport() noexcept {
+    audioEngine_.serviceLoopbackLatencyTest();
     synchroniseRecording();
     const auto snapshot = audioEngine_.projectedTransportSnapshot();
     // Monitoring is an independent ephemeral read model. It must remain
@@ -1757,6 +1861,46 @@ mixer::MeterSnapshot DawApplication::meterSnapshot() const noexcept {
 InputMonitoringReadModel DawApplication::inputMonitoringReadModel() const noexcept {
     return {inputMonitoringEnabled_, monitorGain_, inputMonitoringRouteSupported_,
             inputMonitoringLifecycleForcedOff_, inputMeterAvailable_, inputMeterPeak_};
+}
+
+audio::DeviceLatencyReadModel DawApplication::deviceLatencyReadModel() const {
+    return audioEngine_.deviceLatencyReadModel();
+}
+
+RecordingPlacementReadModel DawApplication::recordingPlacementReadModel() const {
+    RecordingPlacementReadModel result;
+    result.manualOffsetProjectFrames = manualRecordingOffset_;
+    result.lastCommittedUnappliedEarlyFrames = lastCommittedUnappliedEarlyFrames_;
+    const auto applyEffective = [&result, this](audio::RecordingLatencyStatus status,
+                                                 timeline::ProjectFrameCount automatic) {
+        const auto effective = audio::computeEffectiveRecordingCompensation(
+            status, automatic, manualRecordingOffset_);
+        result.effectiveCompensationProjectFrames = effective.value_or(
+            timeline::ProjectFrameCount{});
+    };
+    const auto device = audioEngine_.deviceLatencyReadModel();
+    if (!device.configurationAvailable || !device.inputLatencyFrames ||
+        !timeline::SampleRate{device.sampleRateHz}.isValid()) {
+        applyEffective(audio::RecordingLatencyStatus::unavailable, {});
+        return result;
+    }
+    result.reportedInputLatencyDeviceFrames = {device.inputLatencyFrames.value()};
+    const auto converted = audio::convertRecordingLatencyToProjectFrames(
+        *result.reportedInputLatencyDeviceFrames, timeline::SampleRate{device.sampleRateHz},
+        session_.project.sampleRate());
+    if (!converted) {
+        result.latencyStatus = audio::RecordingLatencyStatus::invalid;
+        applyEffective(result.latencyStatus, {});
+        return result;
+    }
+    result.latencyStatus = audio::RecordingLatencyStatus::reported;
+    result.reportedInputLatencyProjectFrames = converted;
+    applyEffective(result.latencyStatus, *converted);
+    return result;
+}
+
+audio::LoopbackLatencyReadModel DawApplication::loopbackLatencyReadModel() const {
+    return audioEngine_.loopbackLatencyReadModel();
 }
 
 ui::timeline::MetronomeReadModel

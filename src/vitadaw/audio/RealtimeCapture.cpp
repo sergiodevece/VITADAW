@@ -23,6 +23,7 @@ bool RealtimeCapture::prepare(std::size_t frameCapacity) {
     track_ = {};
     projectStart_ = {};
     deviceSampleRate_ = {};
+    placement_ = {};
     status_.store(encode(RecordingPhase::idle, RecordingFailure::none),
                   std::memory_order_release);
     return true;
@@ -37,6 +38,7 @@ void RealtimeCapture::reset() noexcept {
     track_ = {};
     projectStart_ = {};
     deviceSampleRate_ = {};
+    placement_ = {};
     status_.store(encode(RecordingPhase::idle, RecordingFailure::none),
                   std::memory_order_release);
 }
@@ -50,6 +52,7 @@ bool RealtimeCapture::prepareRequest(const RecordingRequest& request) noexcept {
     layout_ = request.layout;
     projectStart_ = {};
     deviceSampleRate_ = {};
+    placement_ = request.placement;
     status_.store(encode(RecordingPhase::prepared, RecordingFailure::none),
                   std::memory_order_release);
     return true;
@@ -63,6 +66,7 @@ void RealtimeCapture::clearPreparedRequest() noexcept {
     track_ = {};
     projectStart_ = {};
     deviceSampleRate_ = {};
+    placement_ = {};
 }
 
 bool RealtimeCapture::begin(const RecordingRequest& request,
@@ -193,6 +197,7 @@ RecordingSnapshot RealtimeCapture::snapshot() const noexcept {
     result.acceptedDeviceFrames = {
         acceptedFrames_.load(std::memory_order_acquire)};
     result.deviceSampleRate = deviceSampleRate_;
+    result.placement = placement_;
     return result;
 }
 

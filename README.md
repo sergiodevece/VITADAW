@@ -1,4 +1,4 @@
-# VitaDAW 0.7.2 — Input Monitoring Foundation
+# VitaDAW 0.7.3 — Device Latency, Recording Placement & Physical Loopback Validation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana mínima, inicializa y observa
@@ -393,6 +393,46 @@ plugins, sends/inserts, buses de monitor, routing avanzado, grabación multipist
 punch/loop recording, MIDI monitoring ni talkback. Detalles de diseño y
 validación: [`docs/design-input-monitoring-0.7.2.md`](docs/design-input-monitoring-0.7.2.md)
 y [`docs/validation-0.7.2.md`](docs/validation-0.7.2.md).
+
+## 0.7.3 - Device Latency, Recording Placement & Physical Loopback Validation
+
+VitaDAW 0.7.3A expone el buffer efectivo y las latencias de input/output que
+reporta el backend, y permite cambiar entre tamaños soportados mediante una
+transacción control-side. Requested y effective permanecen separados; un valor
+efectivo no se presenta falsamente como soportado. La transacción conserva el
+intent de Monitoring cuando tiene éxito y, si falla, sólo declara rollback
+correcto tras verificar device/contexto, sample rate, buffer y máscaras I/O.
+
+0.7.3B aplica Recording Placement Compensation al inicio documental del clip,
+sin modificar WAV ni PCM. Cada toma congela la latencia de input reportada,
+convierte device frames a project frames y combina ese valor con el Recording
+Offset manual efímero. Undo/Redo y Save/Load reutilizan la posición ya
+comprometida: no recalculan clips históricos al cambiar el dispositivo.
+
+0.7.3C añade Physical Loopback Latency Validation como diagnóstico efímero y
+exclusivo. Con Playback detenido, Recording inactivo y Monitoring OFF, configura
+temporalmente un par físico output→input, emite una MLS bipolar determinista de
+1023 muestras a `-24 dBFS`, captura en device frames y analiza fuera de RT cinco
+trials mediante correlación matched. Publica Reported Input, Reported Output,
+Reported RTT, Measured Physical RTT, residual signed, min/max/jitter y calidad;
+después restaura y verifica la configuración efectiva anterior.
+
+El residual es `measured RTT - reported RTT` y es exclusivamente diagnóstico.
+La medida incluye output, conversión/ruta física e input, por lo que 0.7.3 no la
+convierte en `Suggested Recording Offset`, no modifica el offset manual y no
+auto-calibra Recording Placement. Loopback no atraviesa mixer, plugins, buses,
+ProjectState, WAV/Capture musical, historial ni persistencia.
+
+El detector MLS se validó físicamente con una Universal Audio Volt 176 en
+macOS/CoreAudio a 48 kHz, Output 1 MONITOR L → Input 1, Direct Monitor OFF y
+Monitoring de VitaDAW OFF: 25/25 trials válidos en buffers 64, 128, 256, 512 y
+1024, residual estable de `+108` device frames (`+2.25 ms`) y jitter de cero.
+La validación ampliada con Aggregate Devices, rutas cross-interface, múltiples
+I/O e interfaces adicionales queda pendiente y no bloquea esta foundation.
+
+El smoke también confirmó que un segundo comando Record terminaliza la toma en
+Stopped sin Play implícito, y que las capacidades físicas de input permanecen
+enumeradas con Monitoring OFF. Detalles: [`docs/validation-0.7.3.md`](docs/validation-0.7.3.md).
 
 ## Tecnología propuesta
 
@@ -816,6 +856,10 @@ La arquitectura y las reglas de tiempo real se describen en
   suavizado, preflight/lifecycle de dispositivo, staging alias-safe, meter de
   input y UI mínima; coexistencia segura de Recording + Monitoring, incluido
   Monitoring activo tras Stop Recording, validada también en smoke físico.
+- **0.7.3 — Device Latency, Recording Placement & Physical Loopback Validation:**
+  buffer y latencias reportadas con reconfiguración transaccional, placement por
+  toma sin tocar WAV, y medición RTT física diagnóstica mediante MLS; validación
+  Volt 176 en cinco buffers y fixes de Record-toggle/capacidad de input.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
@@ -853,4 +897,5 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.6.6.md`](docs/validation-0.6.6.md) y
 [`docs/validation-0.7.0.md`](docs/validation-0.7.0.md) y
 [`docs/validation-0.7.1.md`](docs/validation-0.7.1.md) y
-[`docs/validation-0.7.2.md`](docs/validation-0.7.2.md).
+[`docs/validation-0.7.2.md`](docs/validation-0.7.2.md) y
+[`docs/validation-0.7.3.md`](docs/validation-0.7.3.md).

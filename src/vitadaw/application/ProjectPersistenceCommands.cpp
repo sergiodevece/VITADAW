@@ -149,6 +149,7 @@ PersistenceResult DawApplication::loadProject(std::filesystem::path path, bool d
         c.app->preparedLoopView_.swap(*c.loopView);
         ++c.app->musicalRevision_;
         c.app->audibility_ = c.audibility;
+        c.app->lastCommittedUnappliedEarlyFrames_ = 0;
         c.app->transport_.stopAndRewind();
         c.app->transport_.setDuration(c.app->session_.project.duration());
     }};

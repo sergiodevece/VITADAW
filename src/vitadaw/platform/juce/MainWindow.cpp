@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -29,6 +30,54 @@ juce::String positionText(timeline::Seconds position) {
            juce::String(seconds).paddedLeft('0', 2) + "." +
            juce::String(milliseconds).paddedLeft('0', 3);
 }
+
+juce::String latencyText(const char* name, std::optional<std::uint32_t> frames,
+                         std::optional<double> milliseconds, bool estimated = false) {
+    juce::String text{name};
+    text << ": ";
+    if (!frames || !milliseconds) return text + "Unknown";
+    if (estimated) text << "~";
+    text << static_cast<int>(*frames) << " samples / "
+         << juce::String(*milliseconds, 2) << " ms";
+    if (estimated) text << " (Estimated)";
+    else text << " (Reported)";
+    return text;
+}
+
+juce::String loopbackFramesText(std::optional<std::uint64_t> frames,
+                                double sampleRate) {
+    if (!frames) return "Unknown";
+    juce::String text{static_cast<juce::int64>(*frames)};
+    text << " frames";
+    if (std::isfinite(sampleRate) && sampleRate > 0.0)
+        text << " / " << juce::String(static_cast<double>(*frames) / sampleRate * 1000.0, 3)
+             << " ms";
+    return text;
+}
+
+juce::String loopbackSignedFramesText(std::optional<std::int64_t> frames,
+                                      double sampleRate) {
+    if (!frames) return "Unknown";
+    juce::String text;
+    if (*frames >= 0) text << "+";
+    text << static_cast<juce::int64>(*frames) << " frames";
+    if (std::isfinite(sampleRate) && sampleRate > 0.0)
+        text << " / " << juce::String(static_cast<double>(*frames) / sampleRate * 1000.0, 3)
+             << " ms";
+    return text;
+}
+
+juce::String loopbackPeakText(float peak) {
+    if (!std::isfinite(peak) || peak < 0.0F) return "Invalid";
+    if (peak == 0.0F) return "-inf dBFS";
+    return juce::String(20.0 * std::log10(static_cast<double>(peak)), 1) + " dBFS";
+}
+
+juce::String loopbackSnrText(double snr) {
+    if (std::isinf(snr) && snr > 0.0) return "inf dB";
+    if (!std::isfinite(snr)) return "Unknown";
+    return juce::String(snr, 1) + " dB";
+}
 } // namespace
 
 class AudioStatusComponent final : public juce::Component {
@@ -45,6 +94,23 @@ public:
             label->setJustificationType(juce::Justification::centredLeft);
             addAndMakeVisible(*label);
         }
+        for (auto* label : {&inputLatencyLabel_, &outputLatencyLabel_,
+                            &monitoringLatencyLabel_, &recordingPlacementLabel_,
+                            &loopbackInstructionLabel_, &loopbackResultLabel_,
+                            &loopbackDetailLabel_, &loopbackTrialsLabel_}) {
+            label->setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+            label->setJustificationType(juce::Justification::centredLeft);
+            addAndMakeVisible(*label);
+        }
+        loopbackTrialsLabel_.setJustificationType(juce::Justification::topLeft);
+        loopbackTrialsLabel_.setFont(juce::FontOptions{11.5F});
+        audioBuffer_.onChange = [this] {
+            const auto index = audioBuffer_.getSelectedItemIndex();
+            if (index < 0 || static_cast<std::size_t>(index) >= displayedBufferSizes_.size()) return;
+            dispatch(commands::SetAudioBufferSize{
+                displayedBufferSizes_[static_cast<std::size_t>(index)]});
+        };
+        addAndMakeVisible(audioBuffer_);
 
         timeline_.commandCompleted = [this](const commands::CommandResult& result) {
             showResult(result);
@@ -172,6 +238,28 @@ public:
             dispatch(commands::SetMonitorGain{{
                 static_cast<float>(monitorGain_.getValue())}});
         };
+        recordingOffset_.setTextValueSuffix(" frames");
+        recordingOffset_.onValueChange = [this] {
+            dispatch(commands::SetRecordingOffset{
+                static_cast<std::int64_t>(std::llround(recordingOffset_.getValue()))});
+        };
+        loopbackRun_.onClick = [this] {
+            if (loopbackInput_.getSelectedId() <= 0 ||
+                loopbackOutput_.getSelectedId() <= 0) {
+                showResult({commands::CommandStatus::rejected,
+                            "Select one physical output and one physical input"});
+                return;
+            }
+            dispatch(commands::StartLoopbackLatencyTest{
+                static_cast<std::uint32_t>(loopbackInput_.getSelectedId() - 1),
+                static_cast<std::uint32_t>(loopbackOutput_.getSelectedId() - 1)});
+        };
+        loopbackCancel_.onClick = [this] {
+            dispatch(commands::CancelLoopbackLatencyTest{});
+        };
+        loopbackInstructionLabel_.setText(
+            "Loopback: physically connect the selected Output to Input; Monitoring must be OFF.",
+            juce::dontSendNotification);
         for (auto* editor : {&startBar_, &endBar_}) addAndMakeVisible(*editor);
         addAndMakeVisible(applyLoop_);
         addAndMakeVisible(loopEnabled_);
@@ -179,6 +267,15 @@ public:
         addAndMakeVisible(metronomeLevel_);
         addAndMakeVisible(monitorButton_);
         addAndMakeVisible(monitorGain_);
+        addAndMakeVisible(recordingOffset_);
+        addAndMakeVisible(recordingPlacementLabel_);
+        addAndMakeVisible(loopbackInstructionLabel_);
+        addAndMakeVisible(loopbackInput_);
+        addAndMakeVisible(loopbackOutput_);
+        addAndMakeVisible(loopbackRun_);
+        addAndMakeVisible(loopbackCancel_);
+        addAndMakeVisible(loopbackResultLabel_);
+        addAndMakeVisible(loopbackDetailLabel_);
         for (auto* button : {&tempo100_, &tempoChange_, &signatureChange_}) addAndMakeVisible(*button);
         for (auto* button : {&playButton_, &pauseButton_, &stopButton_, &undoButton_, &redoButton_,
                              &saveButton_, &saveAsButton_, &loadProjectButton_})
@@ -212,13 +309,17 @@ public:
             button->setEnabled(state.playback == transport::PlaybackState::stopped);
         const auto stopped = state.playback == transport::PlaybackState::stopped;
         const auto recordingPhase = application_.recordingPhase();
-        const auto recordingBusy = recordingPhase == audio::RecordingPhase::capturing ||
+        const auto recordingCanStop = recordingPhase == audio::RecordingPhase::prepared ||
+                                      recordingPhase == audio::RecordingPhase::capturing;
+        const auto recordingBusy = recordingCanStop ||
                                    recordingPhase == audio::RecordingPhase::finalizing;
         const auto selected = timeline_.selectedTrackId();
         const auto armed = application_.armedTrack();
         armButton_.setButtonText(armed && selected == armed ? "Disarm Track" : "Arm Track");
         armButton_.setEnabled(stopped && !recordingBusy && selected.has_value());
-        recordButton_.setEnabled(stopped && !recordingBusy && armed.has_value());
+        recordButton_.setButtonText(recordingCanStop ? "Stop Record" : "Record");
+        recordButton_.setEnabled(recordingCanStop ||
+                                 (!recordingBusy && stopped && armed.has_value()));
         recordButton_.setColour(juce::TextButton::buttonColourId,
                                 recordingBusy ? juce::Colours::darkred
                                               : juce::Colour{0xff9d2028});
@@ -250,6 +351,8 @@ public:
         metronomeLevel_.setValue(metronome.level.value,
                                  juce::dontSendNotification);
         updateMonitoringControls();
+        updateDeviceLatencyControls();
+        updateLoopbackControls(state.playback);
         timeline_.setTransportState(state);
         updateHistoryControls();
     }
@@ -293,6 +396,11 @@ public:
         transportLabel_.setBounds(bounds.removeFromTop(26));
         meterLabel_.setBounds(bounds.removeFromTop(22));
         inputMeterLabel_.setBounds(bounds.removeFromTop(22));
+        auto deviceRow = bounds.removeFromTop(28);
+        audioBuffer_.setBounds(deviceRow.removeFromLeft(210));
+        inputLatencyLabel_.setBounds(deviceRow.removeFromLeft(235));
+        outputLatencyLabel_.setBounds(deviceRow.removeFromLeft(245));
+        monitoringLatencyLabel_.setBounds(deviceRow);
         auto musicalRow = bounds.removeFromTop(28);
         tempo100_.setBounds(musicalRow.removeFromLeft(160));
         tempoChange_.setBounds(musicalRow.removeFromLeft(240));
@@ -316,6 +424,21 @@ public:
         monitorButton_.setBounds(monitoringRow.removeFromLeft(130));
         monitoringRow.removeFromLeft(8);
         monitorGain_.setBounds(monitoringRow.removeFromLeft(210));
+        recordingOffset_.setBounds(monitoringRow.removeFromLeft(230));
+        recordingPlacementLabel_.setBounds(bounds.removeFromTop(24));
+
+        loopbackInstructionLabel_.setBounds(bounds.removeFromTop(22));
+        auto loopbackRow = bounds.removeFromTop(30);
+        loopbackOutput_.setBounds(loopbackRow.removeFromLeft(235));
+        loopbackRow.removeFromLeft(6);
+        loopbackInput_.setBounds(loopbackRow.removeFromLeft(235));
+        loopbackRow.removeFromLeft(6);
+        loopbackRun_.setBounds(loopbackRow.removeFromLeft(94));
+        loopbackRow.removeFromLeft(6);
+        loopbackCancel_.setBounds(loopbackRow.removeFromLeft(82));
+        loopbackResultLabel_.setBounds(bounds.removeFromTop(24));
+        loopbackDetailLabel_.setBounds(bounds.removeFromTop(24));
+        loopbackTrialsLabel_.setBounds(bounds.removeFromTop(88));
 
         auto commandRow = bounds.removeFromTop(32);
         armButton_.setBounds(commandRow.removeFromLeft(112));
@@ -403,6 +526,187 @@ private:
         else if (!monitoring.inputAvailable) text << " | Input unavailable";
         if (monitoring.lifecycleForcedOff) text << " | Monitoring forced OFF";
         inputMeterLabel_.setText(text, juce::dontSendNotification);
+    }
+
+    void updateDeviceLatencyControls() {
+        const auto device = application_.deviceLatencyReadModel();
+        if (device.inputChannelNames != displayedInputChannels_) {
+            const auto selected = loopbackInput_.getSelectedId();
+            displayedInputChannels_ = device.inputChannelNames;
+            loopbackInput_.clear(juce::dontSendNotification);
+            for (std::size_t index = 0; index < displayedInputChannels_.size(); ++index)
+                loopbackInput_.addItem("Input " + juce::String(static_cast<int>(index + 1U)) +
+                                           ": " + juce::String(displayedInputChannels_[index]),
+                                       static_cast<int>(index + 1U));
+            if (!displayedInputChannels_.empty())
+                loopbackInput_.setSelectedId(
+                    selected > 0 && selected <= loopbackInput_.getNumItems() ? selected : 1,
+                    juce::dontSendNotification);
+        }
+        if (device.outputChannelNames != displayedOutputChannels_) {
+            const auto selected = loopbackOutput_.getSelectedId();
+            displayedOutputChannels_ = device.outputChannelNames;
+            loopbackOutput_.clear(juce::dontSendNotification);
+            for (std::size_t index = 0; index < displayedOutputChannels_.size(); ++index)
+                loopbackOutput_.addItem("Output " + juce::String(static_cast<int>(index + 1U)) +
+                                            ": " + juce::String(displayedOutputChannels_[index]),
+                                        static_cast<int>(index + 1U));
+            if (!displayedOutputChannels_.empty())
+                loopbackOutput_.setSelectedId(
+                    selected > 0 && selected <= loopbackOutput_.getNumItems() ? selected : 1,
+                    juce::dontSendNotification);
+        }
+        if (device.supportedBufferSizeFrames != displayedBufferSizes_) {
+            displayedBufferSizes_ = device.supportedBufferSizeFrames;
+            audioBuffer_.clear(juce::dontSendNotification);
+            for (const auto size : displayedBufferSizes_)
+                audioBuffer_.addItem("Audio Buffer: " + juce::String(size) + " samples",
+                                     static_cast<int>(audioBuffer_.getNumItems()) + 1);
+        }
+        auto selected = -1;
+        for (std::size_t index = 0; index < displayedBufferSizes_.size(); ++index) {
+            if (displayedBufferSizes_[index] == device.confirmedBufferSizeFrames) {
+                selected = static_cast<int>(index) + 1;
+                break;
+            }
+        }
+        audioBuffer_.setSelectedId(selected, juce::dontSendNotification);
+        const auto recordingPhase = application_.recordingPhase();
+        const auto recordingBusy = recordingPhase == audio::RecordingPhase::prepared ||
+                                   recordingPhase == audio::RecordingPhase::capturing ||
+                                   recordingPhase == audio::RecordingPhase::finalizing;
+        audioBuffer_.setEnabled(device.configurationAvailable &&
+                                !displayedBufferSizes_.empty() && !recordingBusy);
+        if (!device.configurationAvailable) {
+            audioBuffer_.setText("Audio Buffer: Unknown", juce::dontSendNotification);
+        } else if (selected <= 0) {
+            // A backend may negotiate an effective size that it does not list
+            // as directly selectable. Keep the two concepts distinct while
+            // making the certified physical value visible and leaving the
+            // reported choices available for the next request.
+            audioBuffer_.setText("Audio Buffer: " +
+                                     juce::String(device.confirmedBufferSizeFrames) + " samples",
+                                 juce::dontSendNotification);
+        }
+
+        inputLatencyLabel_.setText(latencyText("Input Latency", device.inputLatencyFrames,
+                                                device.inputLatencyMilliseconds),
+                                   juce::dontSendNotification);
+        outputLatencyLabel_.setText(latencyText("Output Latency", device.outputLatencyFrames,
+                                                 device.outputLatencyMilliseconds),
+                                    juce::dontSendNotification);
+        std::optional<std::uint32_t> estimatedFrames;
+        if (device.inputLatencyFrames && device.outputLatencyFrames) {
+            const auto total = static_cast<std::uint64_t>(*device.inputLatencyFrames) +
+                               static_cast<std::uint64_t>(*device.outputLatencyFrames);
+            if (total <= std::numeric_limits<std::uint32_t>::max())
+                estimatedFrames = static_cast<std::uint32_t>(total);
+        }
+        monitoringLatencyLabel_.setText(
+            latencyText("Monitoring Latency", estimatedFrames,
+                        device.estimatedMonitoringLatencyMilliseconds, true),
+                                    juce::dontSendNotification);
+        const auto placement = application_.recordingPlacementReadModel();
+        const auto maximum = static_cast<double>(application_.project().sampleRate().hertz() * 2.0);
+        recordingOffset_.setRange(-maximum, maximum, 1.0);
+        recordingOffset_.setValue(static_cast<double>(placement.manualOffsetProjectFrames.value),
+                                  juce::dontSendNotification);
+        juce::String placementText{"Recording Offset: "};
+        placementText << placement.manualOffsetProjectFrames.value << " frames | Effective Compensation: "
+                      << placement.effectiveCompensationProjectFrames.value << " project frames";
+        if (placement.reportedInputLatencyDeviceFrames) {
+            placementText << " | Reported Input: "
+                          << static_cast<juce::int64>(placement.reportedInputLatencyDeviceFrames->value)
+                          << " device frames";
+        } else {
+            placementText << " | Reported Input: Unknown";
+        }
+        if (placement.lastCommittedUnappliedEarlyFrames != 0) {
+            placementText << " | Last placement clamped at frame 0: "
+                          << static_cast<juce::int64>(placement.lastCommittedUnappliedEarlyFrames)
+                          << " frames unapplied";
+        }
+        recordingPlacementLabel_.setText(placementText, juce::dontSendNotification);
+    }
+
+    void updateLoopbackControls(transport::PlaybackState playback) {
+        const auto loopback = application_.loopbackLatencyReadModel();
+        const auto monitoring = application_.inputMonitoringReadModel();
+        const auto recording = application_.recordingPhase();
+        const auto recordingBusy = recording == audio::RecordingPhase::prepared ||
+                                   recording == audio::RecordingPhase::capturing ||
+                                   recording == audio::RecordingPhase::finalizing;
+        const auto device = application_.deviceLatencyReadModel();
+        const auto ready = !loopback.busy() && device.configurationAvailable &&
+                           playback == transport::PlaybackState::stopped && !recordingBusy &&
+                           !monitoring.enabled && loopbackInput_.getSelectedId() > 0 &&
+                           loopbackOutput_.getSelectedId() > 0;
+        loopbackInput_.setEnabled(!loopback.busy() && device.configurationAvailable);
+        loopbackOutput_.setEnabled(!loopback.busy() && device.configurationAvailable);
+        loopbackRun_.setEnabled(ready);
+        loopbackCancel_.setEnabled(loopback.busy());
+        audioBuffer_.setEnabled(audioBuffer_.isEnabled() && !loopback.busy());
+        monitorButton_.setEnabled(!loopback.busy());
+        monitorGain_.setEnabled(!loopback.busy());
+        recordingOffset_.setEnabled(!loopback.busy());
+
+        const auto& configuration = loopback.configuration;
+        juce::String summary{"Loopback Status: "};
+        summary << audio::loopbackStatusName(loopback.status)
+                << " | Quality: " << static_cast<int>(loopback.validTrials) << "/"
+                << static_cast<int>(audio::loopbackTrialCount) << " valid"
+                << " | Buffer: " << static_cast<int>(configuration.bufferSizeFrames)
+                << " | Rate: " << juce::String(configuration.sampleRateHz, 0) << " Hz";
+        if (loopback.sessionId != 0)
+            summary << " | Route: Out " << static_cast<int>(configuration.outputChannel + 1U)
+                    << " -> In " << static_cast<int>(configuration.inputChannel + 1U);
+        if (!loopback.diagnostic.empty()) summary << " | " << loopback.diagnostic;
+        loopbackResultLabel_.setText(summary, juce::dontSendNotification);
+
+        const auto as64 = [](std::optional<std::uint32_t> value)
+            -> std::optional<std::uint64_t> {
+            return value ? std::optional<std::uint64_t>{*value} : std::nullopt;
+        };
+        juce::String detail{"Reported Input Latency: "};
+        detail << loopbackFramesText(as64(configuration.reportedInputFrames),
+                                     configuration.sampleRateHz)
+               << " | Reported Output Latency: "
+               << loopbackFramesText(as64(configuration.reportedOutputFrames),
+                                     configuration.sampleRateHz)
+               << " | Reported RTT: "
+               << loopbackFramesText(configuration.reportedRoundTripFrames,
+                                     configuration.sampleRateHz)
+               << " | Measured Physical RTT: "
+               << loopbackFramesText(loopback.measuredRoundTripFrames,
+                                     configuration.sampleRateHz)
+               << " | Residual (Measured - Reported): "
+               << loopbackSignedFramesText(loopback.residualFrames,
+                                           configuration.sampleRateHz)
+               << " | Min/Max/Jitter: "
+               << loopbackFramesText(loopback.minimumFrames, configuration.sampleRateHz)
+               << " / " << loopbackFramesText(loopback.maximumFrames,
+                                               configuration.sampleRateHz)
+               << " / " << loopbackFramesText(loopback.jitterFrames,
+                                               configuration.sampleRateHz);
+        loopbackDetailLabel_.setText(detail, juce::dontSendNotification);
+
+        juce::String trials;
+        for (std::size_t index = 0; index < loopback.trials.size(); ++index) {
+            const auto& trial = loopback.trials[index];
+            if (index != 0) trials << "\n";
+            trials << "T" << static_cast<int>(index + 1U) << " "
+                   << audio::loopbackQualityName(trial.quality)
+                   << " | peak " << loopbackPeakText(trial.peak)
+                   << " | score " << juce::String(trial.correlation, 3)
+                   << " | second " << juce::String(trial.secondCorrelation, 3)
+                   << " | ratio " << juce::String(trial.ambiguityRatio, 3)
+                   << " | SNR " << loopbackSnrText(trial.signalToNoiseDb)
+                   << " | polarity " << (trial.polarityInverted ? "inverted" : "normal")
+                   << " | delay " << loopbackFramesText(trial.measuredFrames,
+                                                          configuration.sampleRateHz)
+                   << " | clipped " << (trial.clipped ? "yes" : "no");
+        }
+        loopbackTrialsLabel_.setText(trials, juce::dontSendNotification);
     }
 
     void chooseWav(std::optional<tracks::TrackId> track) {
@@ -503,6 +807,9 @@ private:
     commands::ICommandDispatcher& dispatcher_;
     application::DawApplication& application_;
     juce::Label statusLabel_, transportLabel_, meterLabel_, inputMeterLabel_, resultLabel_;
+    juce::Label inputLatencyLabel_, outputLatencyLabel_, monitoringLatencyLabel_, recordingPlacementLabel_;
+    juce::Label loopbackInstructionLabel_, loopbackResultLabel_, loopbackDetailLabel_,
+        loopbackTrialsLabel_;
     TimelineComponent timeline_;
     juce::TextButton importButton_{"Import WAV..."};
     juce::TextButton addMonoTrack_{"+ Mono Track"};
@@ -528,6 +835,13 @@ private:
     juce::ToggleButton monitorButton_{"Monitor OFF"};
     juce::Slider monitorGain_{juce::Slider::LinearHorizontal,
                               juce::Slider::TextBoxRight};
+    juce::Slider recordingOffset_{juce::Slider::LinearHorizontal,
+                                  juce::Slider::TextBoxRight};
+    juce::ComboBox audioBuffer_;
+    juce::ComboBox loopbackInput_, loopbackOutput_;
+    juce::TextButton loopbackRun_{"Run Test"}, loopbackCancel_{"Cancel"};
+    std::vector<std::uint32_t> displayedBufferSizes_;
+    std::vector<std::string> displayedInputChannels_, displayedOutputChannels_;
     float inputPeakLeft_{};
     float inputPeakRight_{};
     audio::RecordingPhase displayedRecordingPhase_{audio::RecordingPhase::idle};

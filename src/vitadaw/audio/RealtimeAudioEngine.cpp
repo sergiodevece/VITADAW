@@ -45,7 +45,7 @@ void RealtimeAudioEngine::configure(PreparedProjectView project) noexcept {
     runtime_ = nullptr;
     plan_ = nullptr;
     blockCapacity_ = defaultProcessingBlockCapacity;
-    static_cast<void>(prepareMonitoringStaging(blockCapacity_));
+    monitoringStagingPrepared_ = prepareMonitoringStaging(blockCapacity_);
     masterMix_.reset(project.masterMix.isValid()
                          ? project.masterMix
                          : mixer::PreparedMasterMixState{});
@@ -90,7 +90,7 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
     runtime_ = &runtime;
     plan_ = &plan;
     blockCapacity_ = plan.blockCapacity;
-    static_cast<void>(prepareMonitoringStaging(blockCapacity_));
+    monitoringStagingPrepared_ = prepareMonitoringStaging(blockCapacity_);
     trackMixCount_ = std::min(tracks_.size(), maximumTrackCount);
     for (std::size_t index = 0; index < trackMixCount_; ++index) {
         trackMix_[index].reset(tracks_[index].source.mix.isValid()
@@ -127,6 +127,19 @@ void RealtimeAudioEngine::configure(const PreparedProcessingPlan& plan,
     clearMeters();
     publishMeters();
     publishTransport();
+}
+
+bool RealtimeAudioEngine::prepareDeviceBlockCapacity(std::size_t capacity) noexcept {
+    if (capacity == 0) {
+        monitoringStagingPrepared_ = false;
+        return false;
+    }
+    const auto previousCapacity = blockCapacity_;
+    blockCapacity_ = capacity;
+    monitoringStagingPrepared_ = prepareMonitoringStaging(capacity);
+    if (monitoringStagingPrepared_) return true;
+    blockCapacity_ = previousCapacity;
+    return false;
 }
 
 bool RealtimeAudioEngine::canConfigureTemporalContext(
@@ -1208,6 +1221,12 @@ void RealtimeAudioEngine::clearOutput(AudioBlockView output) noexcept {
 }
 
 bool RealtimeAudioEngine::prepareMonitoringStaging(std::size_t capacity) noexcept {
+    if (forcedMonitoringStagingPreparationFailuresForTesting_ != 0) {
+        --forcedMonitoringStagingPreparationFailuresForTesting_;
+        monitoringInputStaging_ = {};
+        monitoringStagingCapacity_ = 0;
+        return false;
+    }
     if (capacity == monitoringStagingCapacity_) return capacity != 0;
     try {
         std::array<std::vector<float>, 2> prepared;

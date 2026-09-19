@@ -132,6 +132,14 @@ public:
     prepareInputMonitoring() override;
     void cancelPreparedInputMonitoring() noexcept override;
     [[nodiscard]] bool trySetMonitorGain(audio::MonitorGainDb) noexcept override;
+    [[nodiscard]] audio::AudioDeviceBufferChangeResult setAudioBufferSize(
+        std::size_t) override;
+    [[nodiscard]] audio::DeviceLatencyReadModel deviceLatencyReadModel() const override;
+    [[nodiscard]] audio::LoopbackLatencyControlResult startLoopbackLatencyTest(
+        audio::LoopbackLatencyRequest) override;
+    [[nodiscard]] bool cancelLoopbackLatencyTest() noexcept override;
+    void serviceLoopbackLatencyTest() noexcept override;
+    [[nodiscard]] audio::LoopbackLatencyReadModel loopbackLatencyReadModel() const override;
     [[nodiscard]] audio::RealtimeTransportSnapshot transportSnapshot() const noexcept override;
     [[nodiscard]] audio::RealtimeTransportSnapshot projectedTransportSnapshot() noexcept override;
     [[nodiscard]] mixer::MeterSnapshot meterSnapshot() const noexcept override;
@@ -176,10 +184,31 @@ private:
         audio::RealtimeAudioEngine::TemporalCheckpoint checkpoint;
         bool callbackWasRegistered{};
     };
+    // Effective device facts that must survive a rejected buffer transaction.
+    // Setup names identify the selected JUCE device context; masks/rate/buffer
+    // are read from the opened device rather than trusted from the request.
+    struct DeviceConfigurationCheckpoint {
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        juce::AudioIODeviceType* deviceType{};
+        timeline::SampleRate sampleRate;
+        std::size_t bufferSize{};
+        juce::BigInteger activeInputChannels;
+        juce::BigInteger activeOutputChannels;
+    };
+    struct LoopbackConfigurationCheckpoint {
+        DeviceConfigurationCheckpoint device;
+        audio::RealtimeAudioEngine::TemporalCheckpoint temporal;
+        bool callbackWasRegistered{};
+    };
 
     void closeDevice(bool publishClosedState) noexcept;
     void beginDeviceReinitialisation() noexcept;
     void refreshState();
+    void refreshDeviceLatencyReadModel();
+    [[nodiscard]] juce::StringArray discoverAvailableInputChannelNames();
+    void invalidateDeviceLatencyReadModel(std::string errorMessage = {});
+    [[nodiscard]] bool restoreLoopbackConfiguration(std::string&) noexcept;
+    void failLoopbackForDeviceChange(bool deviceLost = false) noexcept;
     void publishState();
     void detachAudioCallback(bool preserveTransport = false) noexcept;
     void attachAudioCallback(bool preserveTransport = false);
@@ -210,10 +239,13 @@ private:
 
     juce::AudioDeviceManager deviceManager_;
     audio::AudioDeviceStateModel stateModel_;
+    audio::DeviceLatencyReadModel deviceLatencyReadModel_;
+    audio::LoopbackLatencyReadModel loopbackLatencyReadModel_;
     StateChangedCallback stateChangedCallback_;
     std::unique_ptr<PreparedProject> preparedProject_;
     std::unique_ptr<audio::PreparedTemporalContext> preparedTemporalContext_;
     audio::RealtimeAudioEngine realtimeEngine_;
+    audio::RealtimeLoopbackProbe loopbackProbe_;
     timeline::SampleRate projectSampleRate_;
     timeline::SampleRate deviceSampleRate_;
     // Installed only after a successful quiescent Core reprepare. Polling
@@ -221,6 +253,10 @@ private:
     timeline::SampleRate certifiedDeviceSampleRate_;
     std::size_t certifiedDeviceBufferSize_{};
     juce::AudioIODevice* certifiedDevice_{};
+    std::uint64_t certifiedDeviceGeneration_{};
+    std::uint64_t nextLoopbackSessionId_{1};
+    std::optional<LoopbackConfigurationCheckpoint> loopbackCheckpoint_;
+    bool loopbackDeviceLost_{};
     mixer::PreparedMasterMixState masterMix_;
     std::atomic<PendingLifecycleEvent> pendingLifecycleEvent_{};
     std::atomic<bool> suppressLifecycleNotification_{};

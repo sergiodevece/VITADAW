@@ -1,7 +1,9 @@
 #pragma once
 
 #include "vitadaw/audio/RealtimeTransportExchange.h"
+#include "vitadaw/audio/AudioDeviceState.h"
 #include "vitadaw/audio/InputMonitoring.h"
+#include "vitadaw/audio/LoopbackLatency.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/audio/RecordingTypes.h"
@@ -147,6 +149,24 @@ struct AudioFileCommitAction {
 class IAudioEngineControl {
 public:
     virtual ~IAudioEngineControl() = default;
+    // Device configuration is a synchronous control-side transaction. It must
+    // never be routed through the bounded RT command queue.
+    [[nodiscard]] virtual AudioDeviceBufferChangeResult setAudioBufferSize(
+        std::size_t) {
+        return {false, "Audio buffer control is not supported"};
+    }
+    [[nodiscard]] virtual DeviceLatencyReadModel deviceLatencyReadModel() const {
+        return {};
+    }
+    [[nodiscard]] virtual LoopbackLatencyControlResult startLoopbackLatencyTest(
+        LoopbackLatencyRequest) {
+        return {false, "Physical loopback validation is not supported"};
+    }
+    [[nodiscard]] virtual bool cancelLoopbackLatencyTest() noexcept { return false; }
+    virtual void serviceLoopbackLatencyTest() noexcept {}
+    [[nodiscard]] virtual LoopbackLatencyReadModel loopbackLatencyReadModel() const {
+        return {};
+    }
     [[nodiscard]] virtual std::size_t preparedAudioBytes() const noexcept { return 0; }
     // Complete document adoption. Deliberately separate from within-project imports:
     // IDs in this vector never resolve through the active project's source cache.

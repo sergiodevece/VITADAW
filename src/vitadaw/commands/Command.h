@@ -119,6 +119,13 @@ struct EnableInputMonitoring {};
 struct DisableInputMonitoring {};
 struct ToggleInputMonitoring {};
 struct SetMonitorGain { audio::MonitorGainDb gain; };
+struct SetAudioBufferSize { std::uint32_t frames{}; };
+struct SetRecordingOffset { std::int64_t projectFrames{}; };
+struct StartLoopbackLatencyTest {
+    std::uint32_t inputChannel{};
+    std::uint32_t outputChannel{};
+};
+struct CancelLoopbackLatencyTest {};
 template<class T> inline constexpr bool isMusicalCommand =
     std::is_same_v<T, AddTempoChange> || std::is_same_v<T, MoveTempoChange> ||
     std::is_same_v<T, SetTempo> || std::is_same_v<T, RemoveTempoChange> ||
@@ -204,7 +211,9 @@ using Command = std::variant<AddAudioTrack, DeleteAudioTrack, ReorderAudioTrack,
                              SetLoopRangeMusical, SetLoopEnabled,
                              SetMetronomeEnabled, SetMetronomeLevel,
                              EnableInputMonitoring, DisableInputMonitoring,
-                             ToggleInputMonitoring, SetMonitorGain,
+                             ToggleInputMonitoring, SetMonitorGain, SetAudioBufferSize,
+                             SetRecordingOffset, StartLoopbackLatencyTest,
+                             CancelLoopbackLatencyTest,
                              Play, Pause, Stop, SeekToProjectFrame, GoToStart,
                              GoToEnd, Undo, Redo, SaveProject, SaveProjectAs, LoadProject,
                              SetTrackGain, SetTrackPan, SetTrackMute,

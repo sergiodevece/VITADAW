@@ -82,6 +82,7 @@ private:
     media::AudioChannelLayout layout_{media::AudioChannelLayout::mono};
     timeline::ProjectFramePosition projectStart_;
     timeline::SampleRate deviceSampleRate_;
+    RecordingPlacementSnapshot placement_;
 };
 
 } // namespace vitadaw::audio
