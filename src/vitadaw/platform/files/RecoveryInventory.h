@@ -22,8 +22,10 @@ namespace vitadaw::platform::files {
 [[nodiscard]] audio::RecoveryInventory scanRecoveryInventory(
     std::span<const std::filesystem::path> authorizedRoots);
 
-// Revalidates the pathname/identity pair from a discovery snapshot. It is a
-// guard for a future mutating operation, not an authorization by itself.
+// Revalidates only the pathname/identity binding from a discovery snapshot; it
+// is not a complete contents or metadata snapshot. A future mutating operation
+// must additionally revalidate containment, applicable evidence/type, and its
+// required content or metadata immediately before acting.
 [[nodiscard]] bool matchesRecoveryCandidateSnapshot(
     const audio::RecoveryCandidate&) noexcept;
 

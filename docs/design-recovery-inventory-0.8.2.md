@@ -11,11 +11,25 @@ the candidate's logical identity. Discovery is not authorization for a later
 mutation: any future adopt/delete operation must reacquire and verify identity
 immediately before it acts.
 
+The snapshot binding is limited to pathname and stable file identity. In-place
+content or metadata changes on the same object are not a claim of complete
+snapshot equivalence. Therefore 0.8.2B or any future mutating phase must, just
+before acting, reopen and revalidate identity, containment, applicable
+provenance/type evidence, and the content or metadata required by its specific
+operation.
+
 The scanner only walks roots supplied by the caller, rejects a symlink root,
 does not recurse through symlink entries, and records partial scan failures as
 diagnostics. Each WAV probe is tied to a read-only, no-follow descriptor and
 the pathname identity is checked again afterwards; media payloads are never
 loaded into the inventory. The structural header probe is bounded to 64 KiB.
+
+Recording-recovery markers follow the same descriptor-bound no-follow policy:
+their size is checked before reading, then their bytes are parsed through the
+portable version-1 parser. Markers are metadata-only and are bounded to 8 KiB,
+12 fields, and 1 KiB per line/field. Oversized, malformed, unreadable, or
+symlink/reparse markers produce a per-entry diagnostic and do not stop the
+rest of a root scan.
 
 ## Containment contract and follow-up
 

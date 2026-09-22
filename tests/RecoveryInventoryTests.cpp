@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -32,9 +33,9 @@ void write32(std::array<std::byte, 44>& bytes, std::size_t offset, std::uint32_t
         bytes[offset + index] = static_cast<std::byte>((value >> (index * 8U)) & 0xffU);
 }
 
-void writeValidWav(const std::filesystem::path& path, std::uint32_t channels = 1) {
+void writeValidWav(const std::filesystem::path& path, std::uint32_t channels = 1,
+                   std::uint32_t sampleRate = 48000, std::uint32_t byteRate = 0) {
     constexpr std::uint32_t frames = 4;
-    constexpr std::uint32_t sampleRate = 48000;
     constexpr std::uint32_t bits = 32;
     const auto blockAlign = channels * (bits / 8U);
     const auto dataBytes = frames * blockAlign;
@@ -51,7 +52,7 @@ void writeValidWav(const std::filesystem::path& path, std::uint32_t channels = 1
     write16(header, 20, 3); // IEEE float32
     write16(header, 22, static_cast<std::uint16_t>(channels));
     write32(header, 24, sampleRate);
-    write32(header, 28, sampleRate * blockAlign);
+    write32(header, 28, byteRate == 0U ? sampleRate * blockAlign : byteRate);
     write16(header, 32, static_cast<std::uint16_t>(blockAlign));
     write16(header, 34, static_cast<std::uint16_t>(bits));
     put(36, "data");
@@ -79,6 +80,25 @@ audio::RecordingRecoveryMarker marker(std::string session, std::string temporary
     value.deviceSampleRate = timeline::SampleRate{48000};
     value.acceptedFrames = {4};
     return value;
+}
+
+std::filesystem::path markerPath(const std::filesystem::path& root, std::string_view session) {
+    return root / (".vitadaw-recording-" + std::string{session} + "-temporary.recovery");
+}
+
+void writeMarkerBytes(const std::filesystem::path& path, std::string_view bytes) {
+    std::ofstream output(path, std::ios::binary);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    check(output.good(), "marker fixture written");
+}
+
+bool hasDiagnostic(const audio::RecoveryInventory& inventory, const std::filesystem::path& path,
+                   std::string_view text) {
+    return std::any_of(inventory.diagnostics.begin(), inventory.diagnostics.end(),
+        [&](const auto& diagnostic) {
+            return diagnostic.path == std::filesystem::absolute(path).lexically_normal() &&
+                   diagnostic.message.find(text) != std::string::npos;
+        });
 }
 
 const audio::RecoveryCandidate* find(const audio::RecoveryInventory& inventory,
@@ -244,6 +264,83 @@ void scanIsBoundedAndReadOnly(const std::filesystem::path& root) {
 #endif
 }
 
+void markerReadsAreBoundedAndNoFollow(const std::filesystem::path& root) {
+    const auto validMedia = root / ".Recording bounded-valid.part.wav";
+    writeValidWav(validMedia);
+    std::string markerError;
+    check(audio::writeRecordingRecoveryMarker(root,
+              marker("bounded-valid", validMedia.filename().string()), markerError),
+          "valid bounded marker written");
+    const auto validMarker = markerPath(root, "bounded-valid");
+    check(audio::readRecordingRecoveryMarker(validMarker).has_value(),
+          "historical reader accepts an existing valid marker through the shared parser");
+
+    const auto tooLarge = markerPath(root, "too-large");
+    writeMarkerBytes(tooLarge,
+                     std::string(audio::maximumRecordingRecoveryMarkerBytes + 1U, 'x'));
+    const auto tooLongLine = markerPath(root, "too-long-line");
+    writeMarkerBytes(tooLongLine, "session=" +
+        std::string(audio::maximumRecordingRecoveryMarkerLineBytes, 'x') + "\n");
+    const auto tooManyFields = markerPath(root, "too-many-fields");
+    std::string fields;
+    for (std::size_t index{}; index <= audio::maximumRecordingRecoveryMarkerFields; ++index)
+        fields += "version=1\n";
+    writeMarkerBytes(tooManyFields, fields);
+    const auto corrupt = markerPath(root, "corrupt");
+    writeMarkerBytes(corrupt, "this is not a marker\n");
+
+    const auto symlinkTargetMedia = root / ".Recording symlink-target.part.wav";
+    writeValidWav(symlinkTargetMedia);
+    const auto outsideMarker = root.parent_path() / "vitadaw-recovery-inventory-outside-marker";
+    writeMarkerBytes(outsideMarker,
+        "version=1\nsession=symlink-marker\nclass=temporary\ntemporary=" +
+        symlinkTargetMedia.filename().string() +
+        "\npublished=\nchannels=1\nsampleRate=48000\nframes=4\n");
+    const auto symlinkMarker = markerPath(root, "symlink");
+    std::error_code linkError;
+    std::filesystem::create_symlink(outsideMarker, symlinkMarker, linkError);
+
+    const std::array roots{root};
+    const auto inventory = platform::files::scanRecoveryInventory(roots);
+    const auto* valid = find(inventory, validMedia);
+    check(valid && valid->classification == audio::RecoveryCandidateClass::recognizedPotentiallyRecoverable,
+          "a valid neighboring marker remains discoverable after invalid marker entries");
+    check(hasDiagnostic(inventory, tooLarge, "bounded metadata size"),
+          "oversized marker produces a bounded-size diagnostic");
+    check(hasDiagnostic(inventory, tooLongLine, "overlong metadata line"),
+          "overlong marker line produces a diagnostic");
+    check(hasDiagnostic(inventory, tooManyFields, "too many metadata fields"),
+          "excess marker fields produce a diagnostic");
+    check(hasDiagnostic(inventory, corrupt, "malformed or incomplete"),
+          "corrupt marker produces a diagnostic");
+    if (!linkError) {
+        check(hasDiagnostic(inventory, symlinkMarker, "symlink was not followed"),
+              "marker symlink is rejected by the descriptor-bound reader");
+        const auto* target = find(inventory, symlinkTargetMedia);
+        check(target && target->classification == audio::RecoveryCandidateClass::provenanceUnknown,
+              "content behind a marker symlink is not consumed as recording evidence");
+    }
+    std::filesystem::remove(outsideMarker, linkError);
+}
+
+void wavByteRateOverflowIsRejected(const std::filesystem::path& root) {
+    const auto legitimate = root / "byte-rate-legitimate.wav";
+    writeValidWav(legitimate, 2);
+    const auto overflow = root / "byte-rate-overflow.wav";
+    const auto overflowingRate = std::numeric_limits<std::uint32_t>::max();
+    const auto wrappedByteRate = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(overflowingRate) * 8U);
+    writeValidWav(overflow, 2, overflowingRate, wrappedByteRate);
+    const std::array roots{root};
+    const auto inventory = platform::files::scanRecoveryInventory(roots);
+    const auto* valid = find(inventory, legitimate);
+    check(valid && valid->wavValidation == audio::RecoveryWavValidation::structurallyValid,
+          "representable WAV byte rate remains valid");
+    const auto* malicious = find(inventory, overflow);
+    check(malicious && malicious->wavValidation == audio::RecoveryWavValidation::invalidHeader,
+          "WAV byte-rate arithmetic overflow is rejected structurally");
+}
+
 } // namespace
 
 int main() {
@@ -257,6 +354,8 @@ int main() {
     scanClassifiesKnownAndUnknownArtifacts(root);
     snapshotAndContainmentAreSafe(root);
     scanIsBoundedAndReadOnly(root);
+    markerReadsAreBoundedAndNoFollow(root);
+    wavByteRateOverflowIsRejected(root);
     std::filesystem::remove_all(root, error);
     check(!error, "inventory fixture root removed");
     std::cout << "Recovery inventory tests passed\n";

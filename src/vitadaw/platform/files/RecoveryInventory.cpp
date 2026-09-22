@@ -65,6 +65,11 @@ struct WavCheck {
     std::string diagnostic;
 };
 
+struct MarkerCheck {
+    std::optional<audio::RecordingRecoveryMarker> marker;
+    std::string diagnostic;
+};
+
 [[nodiscard]] bool isWithinRoot(const std::filesystem::path& path,
                                 const std::filesystem::path& root) noexcept {
     const auto relative = path.lexically_relative(root);
@@ -202,6 +207,42 @@ struct WavCheck {
     return true;
 }
 
+[[nodiscard]] const char* markerParseDiagnostic(
+    audio::RecordingRecoveryMarkerParseStatus status) noexcept {
+    switch (status) {
+    case audio::RecordingRecoveryMarkerParseStatus::valid:
+        return {};
+    case audio::RecordingRecoveryMarkerParseStatus::invalidFormat:
+        return "recording recovery marker is malformed or incomplete";
+    case audio::RecordingRecoveryMarkerParseStatus::exceedsTotalLimit:
+        return "recording recovery marker exceeds the bounded metadata size";
+    case audio::RecordingRecoveryMarkerParseStatus::exceedsLineLimit:
+        return "recording recovery marker contains an overlong metadata line";
+    case audio::RecordingRecoveryMarkerParseStatus::exceedsFieldLimit:
+        return "recording recovery marker contains too many metadata fields";
+    }
+    return "recording recovery marker is invalid";
+}
+
+// The descriptor binds both the inspected identity and the bytes parsed below.
+// The enumerated pathname is never reopened to read marker content.
+[[nodiscard]] MarkerCheck readMarkerNoFollow(const std::filesystem::path& path) {
+    std::string diagnostic;
+    const auto opened = openReadOnlyFile(path, diagnostic);
+    if (!opened) return {{}, std::move(diagnostic)};
+    if (opened->snapshot.sizeBytes > audio::maximumRecordingRecoveryMarkerBytes)
+        return {{}, "recording recovery marker exceeds the bounded metadata size"};
+
+    std::array<char, audio::maximumRecordingRecoveryMarkerBytes> bytes{};
+    const auto count = static_cast<std::size_t>(opened->snapshot.sizeBytes);
+    if (!readExact(opened->descriptor, 0, bytes.data(), count))
+        return {{}, "could not read recording recovery marker through its opened descriptor"};
+    const auto parsed = audio::parseRecordingRecoveryMarker(
+        std::string_view{bytes.data(), count});
+    if (!parsed.marker) return {{}, markerParseDiagnostic(parsed.status)};
+    return {std::move(parsed.marker), {}};
+}
+
 [[nodiscard]] WavCheck validateWavHeader(int descriptor,
                                          std::uintmax_t sizeBytes) {
     if (sizeBytes < 12U) return {audio::RecoveryWavValidation::truncated,
@@ -252,10 +293,13 @@ struct WavCheck {
             const auto byteRate = littleEndian32({format[8], format[9], format[10], format[11]});
             const auto blockAlign = littleEndian16(format.data() + 12);
             const auto bits = littleEndian16(format.data() + 14);
+            const auto expectedByteRate = static_cast<std::uint64_t>(sampleRate) *
+                                          static_cast<std::uint64_t>(blockAlign);
             if ((formatCode != 1U && formatCode != 3U) || (channels != 1U && channels != 2U) ||
                 sampleRate == 0U || bits == 0U || bits % 8U != 0U ||
                 blockAlign != channels * (bits / 8U) ||
-                byteRate != sampleRate * static_cast<std::uint32_t>(blockAlign))
+                expectedByteRate > std::numeric_limits<std::uint32_t>::max() ||
+                byteRate != static_cast<std::uint32_t>(expectedByteRate))
                 return {audio::RecoveryWavValidation::invalidHeader,
                         "WAV basic format fields are inconsistent"};
             formatSeen = true;
@@ -434,12 +478,12 @@ audio::RecoveryInventory scanRecoveryInventory(
                 "WAV-like file has no demonstrable VitaDAW recovery provenance"));
         }
         for (const auto& markerPath : markerFiles) {
-            const auto marker = audio::readRecordingRecoveryMarker(markerPath);
-            if (!marker) {
-                result.diagnostics.push_back({root, markerPath,
-                    "recording recovery marker is malformed or incomplete"});
+            const auto markerCheck = readMarkerNoFollow(markerPath);
+            if (!markerCheck.marker) {
+                result.diagnostics.push_back({root, markerPath, markerCheck.diagnostic});
                 continue;
             }
+            const auto& marker = markerCheck.marker;
             const auto directory = markerPath.parent_path();
             const auto temporary = marker->temporaryName.empty()
                 ? std::filesystem::path{} : directory / marker->temporaryName;

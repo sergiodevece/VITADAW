@@ -8,10 +8,12 @@
 
 namespace vitadaw::audio {
 
-// This is a discovery snapshot, never an ownership or mutation capability.
-// A later adopt/delete operation must re-read the path and verify this identity
-// immediately before acting, with an operation-appropriate containment policy;
-// discovery alone is not authorization to mutate.
+// This is an identity/path discovery snapshot, never an ownership or mutation
+// capability. It does not prove that the same filesystem object has unchanged
+// contents or metadata. A later adopt/delete operation must reopen and
+// revalidate identity, containment, the evidence/type, and the content or
+// metadata required by that specific operation immediately before acting.
+// Discovery alone is not authorization to mutate.
 struct RecoveryFileIdentity {
     std::uint64_t device{};
     std::uint64_t inode{};

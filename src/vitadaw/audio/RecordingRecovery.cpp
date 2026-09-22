@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -44,22 +45,33 @@ std::optional<RecordingRecoveryClass> parseClass(std::string_view value) noexcep
     if (value == "ambiguous") return RecordingRecoveryClass::ambiguous;
     return std::nullopt;
 }
+} // namespace
 
-std::optional<RecordingRecoveryMarker> parse(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    std::string line;
+RecordingRecoveryMarkerParseResult parseRecordingRecoveryMarker(std::string_view bytes) {
+    if (bytes.size() > maximumRecordingRecoveryMarkerBytes)
+        return {{}, RecordingRecoveryMarkerParseStatus::exceedsTotalLimit};
     RecordingRecoveryMarker marker;
     bool version{}, session{}, classification{};
-    while (std::getline(input, line)) {
+    std::size_t fieldCount{};
+    std::size_t offset{};
+    while (offset < bytes.size()) {
+        const auto end = bytes.find('\n', offset);
+        const auto lineEnd = end == std::string_view::npos ? bytes.size() : end;
+        const auto line = bytes.substr(offset, lineEnd - offset);
+        if (line.size() > maximumRecordingRecoveryMarkerLineBytes)
+            return {{}, RecordingRecoveryMarkerParseStatus::exceedsLineLimit};
+        if (++fieldCount > maximumRecordingRecoveryMarkerFields)
+            return {{}, RecordingRecoveryMarkerParseStatus::exceedsFieldLimit};
         const auto equal = line.find('=');
-        if (equal == std::string::npos) return std::nullopt;
-        const auto key = std::string_view{line}.substr(0, equal);
-        const auto value = std::string_view{line}.substr(equal + 1);
+        if (equal == std::string_view::npos)
+            return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
+        const auto key = line.substr(0, equal);
+        const auto value = line.substr(equal + 1);
         if (key == "version") version = value == "1";
         else if (key == "session") { marker.sessionId = value; session = !value.empty(); }
         else if (key == "class") {
             const auto parsed = parseClass(value);
-            if (!parsed) return std::nullopt;
+            if (!parsed) return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
             marker.classification = *parsed;
             classification = true;
         } else if (key == "temporary") marker.temporaryName = value;
@@ -67,27 +79,29 @@ std::optional<RecordingRecoveryMarker> parse(const std::filesystem::path& path) 
         else if (key == "channels") {
             if (value == "1") marker.layout = media::AudioChannelLayout::mono;
             else if (value == "2") marker.layout = media::AudioChannelLayout::stereo;
-            else return std::nullopt;
+            else return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
         } else if (key == "sampleRate") {
             try { marker.deviceSampleRate = timeline::SampleRate{std::stod(std::string{value})}; }
-            catch (...) { return std::nullopt; }
+            catch (...) { return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat}; }
         } else if (key == "frames") {
             try { marker.acceptedFrames = {std::stoull(std::string{value})}; }
-            catch (...) { return std::nullopt; }
+            catch (...) { return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat}; }
         } else if (key == "sha256") {
-            if (value.size() != 64) return std::nullopt;
+            if (value.size() != 64) return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
             marker.fingerprint = media::MediaFingerprint{std::string{value}, 0};
         } else if (key == "bytes") {
-            if (!marker.fingerprint) return std::nullopt;
+            if (!marker.fingerprint) return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
             try { marker.fingerprint->fileSizeBytes = std::stoull(std::string{value}); }
-            catch (...) { return std::nullopt; }
-        } else return std::nullopt;
+            catch (...) { return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat}; }
+        } else return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
+        if (end == std::string_view::npos) break;
+        offset = end + 1U;
     }
-    if (!input.eof() || !version || !session || !classification ||
+    if (!version || !session || !classification ||
         (!marker.temporaryName.empty() && marker.temporaryName.has_parent_path()) ||
-        (!marker.publishedName.empty() && marker.publishedName.has_parent_path())) return std::nullopt;
-    return marker;
-}
+        (!marker.publishedName.empty() && marker.publishedName.has_parent_path()))
+        return {{}, RecordingRecoveryMarkerParseStatus::invalidFormat};
+    return {std::move(marker), RecordingRecoveryMarkerParseStatus::valid};
 }
 
 bool isRecordingRecoveryMarkerPath(const std::filesystem::path& path) noexcept {
@@ -98,7 +112,13 @@ bool isRecordingRecoveryMarkerPath(const std::filesystem::path& path) noexcept {
 std::optional<RecordingRecoveryMarker> readRecordingRecoveryMarker(
     const std::filesystem::path& path) {
     if (!isRecordingRecoveryMarkerPath(path)) return std::nullopt;
-    return parse(path);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return std::nullopt;
+    std::array<char, maximumRecordingRecoveryMarkerBytes + 1U> bytes{};
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (input.bad()) return std::nullopt;
+    return parseRecordingRecoveryMarker(
+        std::string_view{bytes.data(), static_cast<std::size_t>(input.gcount())}).marker;
 }
 
 std::string makeRecordingRecoverySessionId() {
