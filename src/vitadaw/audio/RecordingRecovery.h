@@ -39,6 +39,12 @@ struct RecordingRecoveryMarkerWriteOptions {
                                                  const RecordingRecoveryMarker&,
                                                  std::string& errorMessage,
                                                  RecordingRecoveryMarkerWriteOptions = {});
+// Reads and validates the existing marker format without changing it. Callers
+// that enumerate directories must independently reject symlinks before using
+// this parser; a marker is discovery evidence, not filesystem ownership.
+[[nodiscard]] std::optional<RecordingRecoveryMarker> readRecordingRecoveryMarker(
+    const std::filesystem::path& path);
+[[nodiscard]] bool isRecordingRecoveryMarkerPath(const std::filesystem::path&) noexcept;
 [[nodiscard]] std::vector<RecordingRecoveryArtifact> scanRecordingRecoveryMarkers(
     const std::filesystem::path& directory,
     const std::function<bool(const std::filesystem::path&)>& readableWav);

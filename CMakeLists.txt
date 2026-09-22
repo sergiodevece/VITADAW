@@ -35,6 +35,7 @@ add_library(vitadaw_core
     src/vitadaw/project/ProjectDocumentData.cpp
     src/vitadaw/persistence/ProjectPersistence.cpp
     src/vitadaw/platform/files/ProjectFileIO.cpp
+    src/vitadaw/platform/files/RecoveryInventory.cpp
     src/vitadaw/platform/files/RecordingMediaIO.cpp
     src/vitadaw/processors/GainProcessor.cpp
     src/vitadaw/routing/RoutingState.cpp
@@ -322,6 +323,10 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_recording_recovery_tests tests/RecordingRecoveryTests.cpp)
     target_link_libraries(vitadaw_recording_recovery_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_recording_recovery_tests COMMAND vitadaw_recording_recovery_tests)
+
+    add_executable(vitadaw_recovery_inventory_tests tests/RecoveryInventoryTests.cpp)
+    target_link_libraries(vitadaw_recovery_inventory_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recovery_inventory_tests COMMAND vitadaw_recovery_inventory_tests)
 
     add_executable(vitadaw_recording_media_io_tests tests/RecordingMediaIOTests.cpp)
     target_link_libraries(vitadaw_recording_media_io_tests PRIVATE vitadaw_core)

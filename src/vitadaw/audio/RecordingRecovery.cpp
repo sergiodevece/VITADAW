@@ -90,6 +90,17 @@ std::optional<RecordingRecoveryMarker> parse(const std::filesystem::path& path) 
 }
 }
 
+bool isRecordingRecoveryMarkerPath(const std::filesystem::path& path) noexcept {
+    const auto filename = path.filename().string();
+    return filename.starts_with(prefix) && filename.ends_with(suffix);
+}
+
+std::optional<RecordingRecoveryMarker> readRecordingRecoveryMarker(
+    const std::filesystem::path& path) {
+    if (!isRecordingRecoveryMarkerPath(path)) return std::nullopt;
+    return parse(path);
+}
+
 std::string makeRecordingRecoverySessionId() {
     static std::atomic<std::uint64_t> sequence{};
     const auto now = static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now()
@@ -221,9 +232,8 @@ std::vector<RecordingRecoveryArtifact> scanRecordingRecoveryMarkers(
     std::error_code error;
     for (std::filesystem::directory_iterator it{directory, error}, end; !error && it != end;
          it.increment(error)) {
-        const auto filename = it->path().filename().string();
-        if (!filename.starts_with(prefix) || !filename.ends_with(suffix)) continue;
-        const auto marker = parse(it->path());
+        if (!isRecordingRecoveryMarkerPath(it->path())) continue;
+        const auto marker = readRecordingRecoveryMarker(it->path());
         if (!marker) continue;
         const auto selected = (marker->classification == RecordingRecoveryClass::publishedFinal ||
                                marker->classification == RecordingRecoveryClass::closedUncommitted) &&
