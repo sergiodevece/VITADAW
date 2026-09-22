@@ -71,6 +71,9 @@ public:
     [[nodiscard]] audio::AudioFilePreparationResult prepareVerifiedWav(
         const std::filesystem::path&, const media::MediaFingerprint&, std::size_t) override;
     [[nodiscard]] std::size_t preparedAudioBytes() const noexcept override { return preparedBytes(); }
+    [[nodiscard]] audio::OfflineRenderResult renderOffline(
+        const audio::OfflineRenderRequest&,
+        audio::OfflineRenderCallbacks = {}) override;
     [[nodiscard]] audio::StructuralPlanPreparationResult prepareProjectReplacement(
         const audio::ProcessingPlanSpecification&, std::vector<audio::PreparedSourceAudio>) override;
     [[nodiscard]] audio::StructuralPlanPreparationResult prepareProcessingPlan(

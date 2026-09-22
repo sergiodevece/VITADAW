@@ -4,6 +4,7 @@
 #include "vitadaw/audio/AudioDeviceState.h"
 #include "vitadaw/audio/InputMonitoring.h"
 #include "vitadaw/audio/LoopbackLatency.h"
+#include "vitadaw/audio/OfflineRenderer.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/audio/RecordingTypes.h"
@@ -168,6 +169,18 @@ public:
         return {};
     }
     [[nodiscard]] virtual std::size_t preparedAudioBytes() const noexcept { return 0; }
+    // Synchronous render of the currently prepared project. Implementations
+    // must not require or mutate a physical device, the installed realtime
+    // engine, or application transport state. Resource retention guarantees
+    // PCM lifetime only: project/media/plan mutation and adapter
+    // reconfiguration must not overlap the call until a future explicit
+    // concurrency contract defines otherwise.
+    [[nodiscard]] virtual OfflineRenderResult renderOffline(
+        const OfflineRenderRequest&,
+        OfflineRenderCallbacks = {}) {
+        return {OfflineRenderStatus::preparationFailed, {}, {},
+                "Offline rendering is not supported"};
+    }
     // Complete document adoption. Deliberately separate from within-project imports:
     // IDs in this vector never resolve through the active project's source cache.
     [[nodiscard]] virtual StructuralPlanPreparationResult prepareProjectReplacement(

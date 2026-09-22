@@ -79,6 +79,14 @@ public:
     [[nodiscard]] audio::DeviceLatencyReadModel deviceLatencyReadModel() const;
     [[nodiscard]] RecordingPlacementReadModel recordingPlacementReadModel() const;
     [[nodiscard]] audio::LoopbackLatencyReadModel loopbackLatencyReadModel() const;
+    // Non-UI 0.8 foundation entry point. The audio backend snapshots the
+    // currently committed prepared project and renders it independently of
+    // this application's transport and device lifecycle.
+    [[nodiscard]] audio::OfflineRenderResult renderOffline(
+        const audio::OfflineRenderRequest& request,
+        audio::OfflineRenderCallbacks callbacks = {}) {
+        return audioEngine_.renderOffline(request, callbacks);
+    }
     [[nodiscard]] std::optional<tracks::TrackId> armedTrack() const noexcept {
         return session_.armedTrack;
     }

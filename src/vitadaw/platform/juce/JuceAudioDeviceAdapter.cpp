@@ -673,6 +673,58 @@ JuceAudioDeviceAdapter::prepareProcessingPlan(
     }
 }
 
+audio::OfflineRenderResult JuceAudioDeviceAdapter::renderOffline(
+    const audio::OfflineRenderRequest& request,
+    audio::OfflineRenderCallbacks callbacks) {
+    try {
+        audio::ProcessingPlanSpecification specification;
+        std::vector<PreparedProject::TrackResource> resourceSnapshot;
+        if (preparedProject_ != nullptr) {
+            specification = preparedProject_->specification;
+            resourceSnapshot = preparedProject_->resources;
+        } else {
+            specification.projectSampleRate = projectSampleRate_;
+            specification.masterMix = masterMix_;
+        }
+
+        std::vector<audio::PreparedSourceView> sources;
+        sources.reserve(specification.sources.size());
+        for (const auto& sourceSpecification : specification.sources) {
+            const auto found = std::find_if(
+                resourceSnapshot.begin(), resourceSnapshot.end(),
+                [id = sourceSpecification.id](const auto& resource) {
+                    return resource.id == id;
+                });
+            if (found == resourceSnapshot.end() || found->audio == nullptr) {
+                return {audio::OfflineRenderStatus::preparationFailed, {}, {},
+                        "Project source has no prepared PCM resource"};
+            }
+            audio::PreparedSourceView view;
+            view.id = sourceSpecification.id;
+            view.channelCount = static_cast<std::uint32_t>(
+                found->audio->samples.getNumChannels());
+            view.frameCount = {static_cast<std::uint64_t>(
+                found->audio->samples.getNumSamples())};
+            view.sampleRate = found->audio->sourceSampleRate;
+            view.layout = sourceSpecification.layout;
+            for (std::size_t channel = 0; channel < view.channelCount;
+                 ++channel) {
+                view.channels[channel] = found->audio->samples.getReadPointer(
+                    static_cast<int>(channel));
+            }
+            sources.push_back(view);
+        }
+        return audio::renderOffline(std::move(specification), sources,
+                                    request, callbacks);
+    } catch (const std::bad_alloc&) {
+        return {audio::OfflineRenderStatus::preparationFailed, {}, {},
+                "Not enough memory to snapshot the project for offline rendering"};
+    } catch (...) {
+        return {audio::OfflineRenderStatus::preparationFailed, {}, {},
+                "Project snapshot could not be prepared for offline rendering"};
+    }
+}
+
 audio::StructuralPlanPreparationResult
 JuceAudioDeviceAdapter::prepareProcessingPlanWithAudio(
     const audio::ProcessingPlanSpecification& specification,

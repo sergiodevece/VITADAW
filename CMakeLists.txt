@@ -22,6 +22,7 @@ add_library(vitadaw_core
     src/vitadaw/musical/MusicalTime.cpp
     src/vitadaw/audio/AudioDeviceState.cpp
     src/vitadaw/audio/LoopbackLatency.cpp
+    src/vitadaw/audio/OfflineRenderer.cpp
     src/vitadaw/audio/PreparedProcessingPlan.cpp
     src/vitadaw/audio/PreparedTemporalContext.cpp
     src/vitadaw/audio/RealtimeCapture.cpp
@@ -253,6 +254,10 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_n_track_playback_tests tests/NTrackPlaybackTests.cpp)
     target_link_libraries(vitadaw_n_track_playback_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_n_track_playback_tests COMMAND vitadaw_n_track_playback_tests)
+
+    add_executable(vitadaw_offline_renderer_tests tests/OfflineRendererTests.cpp)
+    target_link_libraries(vitadaw_offline_renderer_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_offline_renderer_tests COMMAND vitadaw_offline_renderer_tests)
 
     add_executable(vitadaw_mixer_core_tests tests/MixerCoreTests.cpp)
     target_link_libraries(vitadaw_mixer_core_tests PRIVATE vitadaw_core)
