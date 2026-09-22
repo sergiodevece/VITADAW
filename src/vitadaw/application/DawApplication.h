@@ -87,6 +87,13 @@ public:
         audio::OfflineRenderCallbacks callbacks = {}) {
         return audioEngine_.renderOffline(request, callbacks);
     }
+    // Non-UI 0.8.1A export entry point. This is an independent synchronous
+    // control-side operation and never changes project/history/transport state.
+    [[nodiscard]] audio::WavExportResult exportWav(
+        const audio::WavExportRequest& request,
+        audio::OfflineRenderCallbacks callbacks = {}) {
+        return audioEngine_.exportWav(request, callbacks);
+    }
     [[nodiscard]] std::optional<tracks::TrackId> armedTrack() const noexcept {
         return session_.armedTrack;
     }

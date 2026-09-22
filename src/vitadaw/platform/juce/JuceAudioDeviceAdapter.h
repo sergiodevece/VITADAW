@@ -74,6 +74,9 @@ public:
     [[nodiscard]] audio::OfflineRenderResult renderOffline(
         const audio::OfflineRenderRequest&,
         audio::OfflineRenderCallbacks = {}) override;
+    [[nodiscard]] audio::WavExportResult exportWav(
+        const audio::WavExportRequest&,
+        audio::OfflineRenderCallbacks = {}) override;
     [[nodiscard]] audio::StructuralPlanPreparationResult prepareProjectReplacement(
         const audio::ProcessingPlanSpecification&, std::vector<audio::PreparedSourceAudio>) override;
     [[nodiscard]] audio::StructuralPlanPreparationResult prepareProcessingPlan(
@@ -163,6 +166,7 @@ public:
 private:
     friend class PersistenceIntegrationAccess; // Hardware-free test harness only.
     friend class MonitoringIntegrationAccess; // Hardware-free lifecycle tests only.
+    friend class AudioExportIntegrationAccess; // Hardware-free export tests only.
     [[nodiscard]] audio::AudioFilePreparationResult decodeWav(
         const std::filesystem::path&, std::size_t, const media::MediaFingerprint*);
     void audioDeviceIOCallbackWithContext(
@@ -178,6 +182,16 @@ private:
     struct PreparedProject;
     struct PreparedJuceAudioFile;
     struct PreparedJuceProcessingPlan;
+    struct OfflineRenderSnapshot;
+    struct WavExportFaultInjection {
+        bool failInitialisation{};
+        bool failWrite{};
+        bool failFinalization{};
+        bool failFileSync{};
+        bool failFileClose{};
+        bool failPublication{};
+        bool failDirectorySync{};
+    };
     struct RecoveryMetadataStatus {
         bool available{};
         std::string warning;
@@ -221,6 +235,8 @@ private:
         const audio::ProcessingPlanSpecification& specification,
         std::string& errorMessage);
     [[nodiscard]] bool reprepareForCurrentDevice(std::string& errorMessage);
+    [[nodiscard]] bool captureOfflineRenderSnapshot(
+        OfflineRenderSnapshot&, std::string&) const;
     [[nodiscard]] static int activeFoundationInputChannels(
         juce::AudioIODevice&) noexcept;
     [[nodiscard]] bool restoreMonitoringPreflight(
@@ -274,6 +290,7 @@ private:
     std::optional<FileIdentity> recordingPublishedIdentity_;
     audio::RecordingSessionId nextRecordingSession_{1};
     std::uint64_t nextRecordingTemporaryNonce_{1};
+    std::uint64_t nextExportTemporaryNonce_{1};
     bool recordingWriterFailed_{};
     std::string recordingWriterError_;
     std::string recordingRecoverySessionId_;
@@ -282,6 +299,8 @@ private:
     std::string recordingRecoveryWarning_;
     // Test-only fault seam; production retains the all-clear default.
     audio::RecordingRecoveryMarkerWriteOptions recordingRecoveryMarkerWriteOptions_;
+    // Test-only fault seam for the synchronous WAV export control path.
+    WavExportFaultInjection wavExportFaults_;
     // Control-side input demand. It is deliberately independent from the RT
     // render bit: the former owns physical-route lifetime, the latter owns
     // audio mixing.  At most the first mono/stereo foundation channels count.

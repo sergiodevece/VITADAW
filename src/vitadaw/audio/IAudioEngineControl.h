@@ -5,6 +5,7 @@
 #include "vitadaw/audio/InputMonitoring.h"
 #include "vitadaw/audio/LoopbackLatency.h"
 #include "vitadaw/audio/OfflineRenderer.h"
+#include "vitadaw/audio/WavExport.h"
 #include "vitadaw/audio/PreparedProcessingPlan.h"
 #include "vitadaw/audio/PreparedTemporalContext.h"
 #include "vitadaw/audio/RecordingTypes.h"
@@ -180,6 +181,16 @@ public:
         OfflineRenderCallbacks = {}) {
         return {OfflineRenderStatus::preparationFailed, {}, {},
                 "Offline rendering is not supported"};
+    }
+    // Synchronous, control-side streaming export. Implementations must retain
+    // the same prepared PCM resources as renderOffline for the duration only;
+    // it must never touch the physical realtime callback or application state.
+    // For this operation, total/total progress is a terminal confirmation and
+    // is emitted only after finalization, publication and directory sync.
+    [[nodiscard]] virtual WavExportResult exportWav(
+        const WavExportRequest&, OfflineRenderCallbacks = {}) {
+        return {WavExportStatus::preparationFailed, {}, {}, {},
+                "WAV export is not supported", {}};
     }
     // Complete document adoption. Deliberately separate from within-project imports:
     // IDs in this vector never resolve through the active project's source cache.

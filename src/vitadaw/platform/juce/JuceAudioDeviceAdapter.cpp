@@ -7,6 +7,8 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <climits>
 #include <cstdint>
@@ -72,6 +74,150 @@ public:
 private:
     files::RecordingFileHandle& file_;
     juce::int64 position_{};
+};
+
+// Float32 WAV streaming is deliberately a small platform-side sink, rather
+// than a second renderer. The header is complete before rendering starts,
+// while the sample payload is consumed block-by-block from OfflineRenderer.
+class FloatWavStreamWriter final {
+public:
+    FloatWavStreamWriter(JuceAudioDeviceAdapter::ExclusiveTemporaryFile&& temporary,
+                         std::uint32_t sampleRate, std::uint32_t channels,
+                         std::uint32_t dataBytes, std::size_t blockCapacity,
+                         files::RecordingIoFaultInjection* fileFaults,
+                         bool failInitialisation, bool failWrite,
+                         bool failFinalization)
+        // release() occurs only while directly constructing this noexcept RAII
+        // owner. If allocation of the writer itself fails, temporary still owns
+        // the descriptor; if later construction throws, file_ closes it.
+        : file_(temporary.release(), fileFaults), blockCapacity_(blockCapacity),
+          failWrite_(failWrite), failFinalization_(failFinalization) {
+        if (failInitialisation) throw std::bad_alloc{};
+        writeHeader(sampleRate, channels, dataBytes);
+        if (error_ == nullptr) {
+            const auto bytes = blockCapacity * static_cast<std::size_t>(channels) *
+                               sizeof(float);
+            interleaved_.resize(bytes);
+        }
+    }
+
+    [[nodiscard]] bool ready() const noexcept { return error_ == nullptr; }
+    [[nodiscard]] const char* error() const noexcept { return error_; }
+
+    [[nodiscard]] bool write(audio::ConstAudioBlockView block) noexcept {
+        if (!ready() || !block.isValid() ||
+            block.channelCount != channelCount_ ||
+            block.frameCount > blockCapacity_) {
+            fail("WAV export received an invalid audio block");
+            return false;
+        }
+        if (failWrite_) {
+            fail("Injected WAV export write failure");
+            return false;
+        }
+        std::size_t byteOffset{};
+        for (std::size_t frame = 0; frame < block.frameCount; ++frame) {
+            for (std::size_t channel = 0; channel < block.channelCount; ++channel) {
+                const auto bits = std::bit_cast<std::uint32_t>(
+                    block.channels[channel][frame]);
+                writeUint32(interleaved_.data() + byteOffset, bits);
+                byteOffset += sizeof(std::uint32_t);
+            }
+        }
+        if (!file_.write(interleaved_.data(), byteOffset, false)) {
+            fail(file_.error() == nullptr ? "WAV export audio write failed"
+                                          : file_.error());
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool finalize() noexcept {
+        if (!ready()) return false;
+        if (failFinalization_) {
+            fail("Injected WAV export finalization failure");
+            return false;
+        }
+        file_.setFinalizing();
+        if (!file_.sync()) {
+            fail(file_.error() == nullptr ? "WAV export file fsync failed"
+                                          : file_.error());
+            return false;
+        }
+        if (!file_.close()) {
+            fail(file_.error() == nullptr ? "WAV export file close failed"
+                                          : file_.error());
+            return false;
+        }
+        return true;
+    }
+
+private:
+    static void writeUint16(std::byte* destination, std::uint16_t value) noexcept {
+        destination[0] = static_cast<std::byte>(value & 0xffU);
+        destination[1] = static_cast<std::byte>((value >> 8U) & 0xffU);
+    }
+
+    static void writeUint32(std::byte* destination, std::uint32_t value) noexcept {
+        for (std::size_t index = 0; index < 4; ++index) {
+            destination[index] = static_cast<std::byte>(
+                (value >> (index * 8U)) & 0xffU);
+        }
+    }
+
+    void fail(const char* message) noexcept {
+        if (error_ == nullptr) error_ = message;
+    }
+
+    void writeHeader(std::uint32_t sampleRate, std::uint32_t channels,
+                     std::uint32_t dataBytes) noexcept {
+        static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
+        if (channels == 0 || channels > 2) {
+            fail("WAV export writer configuration is invalid");
+            return;
+        }
+        const auto blockAlign = static_cast<std::uint64_t>(channels) * sizeof(float);
+        const auto byteRate = static_cast<std::uint64_t>(sampleRate) * blockAlign;
+        if (blockAlign > std::numeric_limits<std::uint16_t>::max() ||
+            byteRate > std::numeric_limits<std::uint32_t>::max() ||
+            dataBytes > std::numeric_limits<std::uint32_t>::max() - 36U) {
+            fail("WAV export size exceeds classic WAV limits");
+            return;
+        }
+        channelCount_ = channels;
+        std::array<std::byte, 44> header{};
+        constexpr std::array<char, 4> riff{'R', 'I', 'F', 'F'};
+        constexpr std::array<char, 4> wave{'W', 'A', 'V', 'E'};
+        constexpr std::array<char, 4> format{'f', 'm', 't', ' '};
+        constexpr std::array<char, 4> data{'d', 'a', 't', 'a'};
+        for (std::size_t index = 0; index < 4; ++index) {
+            header[index] = static_cast<std::byte>(riff[index]);
+            header[8 + index] = static_cast<std::byte>(wave[index]);
+            header[12 + index] = static_cast<std::byte>(format[index]);
+            header[36 + index] = static_cast<std::byte>(data[index]);
+        }
+        writeUint32(header.data() + 4, 36U + dataBytes);
+        writeUint32(header.data() + 16, 16U);
+        writeUint16(header.data() + 20, 3U); // IEEE float
+        writeUint16(header.data() + 22, static_cast<std::uint16_t>(channels));
+        writeUint32(header.data() + 24, sampleRate);
+        writeUint32(header.data() + 28, static_cast<std::uint32_t>(byteRate));
+        writeUint16(header.data() + 32, static_cast<std::uint16_t>(blockAlign));
+        writeUint16(header.data() + 34, 32U);
+        writeUint32(header.data() + 40, dataBytes);
+        if (!file_.write(header.data(), header.size(), false)) {
+            fail(file_.error() == nullptr ? "WAV export header write failed"
+                                          : file_.error());
+        }
+    }
+
+    files::RecordingFileHandle file_;
+    std::vector<std::byte> interleaved_;
+    std::size_t blockCapacity_{};
+    std::size_t channelCount_{};
+    const char* error_{};
+    bool failWrite_{};
+    bool failFinalization_{};
 };
 
 [[nodiscard]] std::optional<JuceAudioDeviceAdapter::FileIdentity> descriptorIdentity(
@@ -217,6 +363,12 @@ struct JuceAudioDeviceAdapter::PreparedJuceProcessingPlan final
         : preparedProject(std::move(project)) {}
 
     std::unique_ptr<PreparedProject> preparedProject;
+};
+
+struct JuceAudioDeviceAdapter::OfflineRenderSnapshot {
+    audio::ProcessingPlanSpecification specification;
+    std::vector<PreparedProject::TrackResource> resources;
+    std::vector<audio::PreparedSourceView> sources;
 };
 
 JuceAudioDeviceAdapter::JuceAudioDeviceAdapter() = default;
@@ -673,31 +825,27 @@ JuceAudioDeviceAdapter::prepareProcessingPlan(
     }
 }
 
-audio::OfflineRenderResult JuceAudioDeviceAdapter::renderOffline(
-    const audio::OfflineRenderRequest& request,
-    audio::OfflineRenderCallbacks callbacks) {
+bool JuceAudioDeviceAdapter::captureOfflineRenderSnapshot(
+    OfflineRenderSnapshot& snapshot, std::string& errorMessage) const {
     try {
-        audio::ProcessingPlanSpecification specification;
-        std::vector<PreparedProject::TrackResource> resourceSnapshot;
         if (preparedProject_ != nullptr) {
-            specification = preparedProject_->specification;
-            resourceSnapshot = preparedProject_->resources;
+            snapshot.specification = preparedProject_->specification;
+            snapshot.resources = preparedProject_->resources;
         } else {
-            specification.projectSampleRate = projectSampleRate_;
-            specification.masterMix = masterMix_;
+            snapshot.specification.projectSampleRate = projectSampleRate_;
+            snapshot.specification.masterMix = masterMix_;
         }
 
-        std::vector<audio::PreparedSourceView> sources;
-        sources.reserve(specification.sources.size());
-        for (const auto& sourceSpecification : specification.sources) {
-            const auto found = std::find_if(
-                resourceSnapshot.begin(), resourceSnapshot.end(),
+        snapshot.sources.reserve(snapshot.specification.sources.size());
+        for (const auto& sourceSpecification : snapshot.specification.sources) {
+            const auto found = std::find_if(snapshot.resources.begin(),
+                snapshot.resources.end(),
                 [id = sourceSpecification.id](const auto& resource) {
                     return resource.id == id;
                 });
-            if (found == resourceSnapshot.end() || found->audio == nullptr) {
-                return {audio::OfflineRenderStatus::preparationFailed, {}, {},
-                        "Project source has no prepared PCM resource"};
+            if (found == snapshot.resources.end() || found->audio == nullptr) {
+                errorMessage = "Project source has no prepared PCM resource";
+                return false;
             }
             audio::PreparedSourceView view;
             view.id = sourceSpecification.id;
@@ -712,17 +860,235 @@ audio::OfflineRenderResult JuceAudioDeviceAdapter::renderOffline(
                 view.channels[channel] = found->audio->samples.getReadPointer(
                     static_cast<int>(channel));
             }
-            sources.push_back(view);
+            snapshot.sources.push_back(view);
         }
-        return audio::renderOffline(std::move(specification), sources,
-                                    request, callbacks);
+        return true;
     } catch (const std::bad_alloc&) {
-        return {audio::OfflineRenderStatus::preparationFailed, {}, {},
-                "Not enough memory to snapshot the project for offline rendering"};
+        errorMessage = "Not enough memory to snapshot the project for offline rendering";
     } catch (...) {
-        return {audio::OfflineRenderStatus::preparationFailed, {}, {},
-                "Project snapshot could not be prepared for offline rendering"};
+        errorMessage = "Project snapshot could not be prepared for offline rendering";
     }
+    return false;
+}
+
+audio::OfflineRenderResult JuceAudioDeviceAdapter::renderOffline(
+    const audio::OfflineRenderRequest& request,
+    audio::OfflineRenderCallbacks callbacks) {
+    OfflineRenderSnapshot snapshot;
+    std::string error;
+    if (!captureOfflineRenderSnapshot(snapshot, error)) {
+        return {audio::OfflineRenderStatus::preparationFailed, {}, {},
+                std::move(error)};
+    }
+    return audio::renderOffline(std::move(snapshot.specification), snapshot.sources,
+                                request, callbacks);
+}
+
+audio::WavExportResult JuceAudioDeviceAdapter::exportWav(
+    const audio::WavExportRequest& request,
+    audio::OfflineRenderCallbacks callbacks) {
+    audio::WavExportResult result;
+    if (request.destination.empty() || request.destination.filename().empty() ||
+        request.destination.extension() != ".wav") {
+        result.errorMessage = "WAV export requires a destination ending in .wav";
+        return result;
+    }
+
+    OfflineRenderSnapshot snapshot;
+    std::string snapshotError;
+    if (!captureOfflineRenderSnapshot(snapshot, snapshotError)) {
+        result.status = audio::WavExportStatus::preparationFailed;
+        result.errorMessage = std::move(snapshotError);
+        return result;
+    }
+    const auto totalFrames = audio::offlineRenderOutputFrameCount(
+        request.render, snapshot.specification.projectSampleRate);
+    if (!totalFrames) {
+        result.errorMessage = "Invalid WAV export range or configuration";
+        return result;
+    }
+    const auto rate = request.render.sampleRate.hertz();
+    if (!std::isfinite(rate) || rate < 1.0 || std::floor(rate) != rate ||
+        rate > static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+        result.errorMessage = "WAV export requires an integral representable sample rate";
+        return result;
+    }
+    const auto channelCount = request.render.outputChannelCount;
+    const auto bytesPerFrame = static_cast<std::uint64_t>(channelCount) * sizeof(float);
+    const auto totalFrameCount = static_cast<std::uint64_t>(*totalFrames);
+    if (channelCount < 1 || channelCount > 2 ||
+        totalFrameCount > (std::numeric_limits<std::uint32_t>::max() - 36U) /
+                              bytesPerFrame) {
+        result.errorMessage = "WAV export exceeds the classic WAV 4 GiB data limit";
+        return result;
+    }
+    if (request.render.processingBlockSize >
+        std::numeric_limits<std::size_t>::max() /
+            (static_cast<std::size_t>(channelCount) * sizeof(float))) {
+        result.errorMessage = "WAV export block size overflows the platform size type";
+        return result;
+    }
+
+    std::error_code filesystemError;
+    const auto directory = request.destination.parent_path();
+    if (directory.empty() || !std::filesystem::is_directory(directory, filesystemError) ||
+        filesystemError) {
+        result.errorMessage = "WAV export destination directory is unavailable";
+        return result;
+    }
+    if (std::filesystem::exists(request.destination, filesystemError)) {
+        result.status = audio::WavExportStatus::destinationExists;
+        result.errorMessage = "WAV export destination already exists and will not be replaced";
+        return result;
+    }
+    if (filesystemError) {
+        result.status = audio::WavExportStatus::temporaryCreationFailed;
+        result.errorMessage = "WAV export destination could not be inspected";
+        return result;
+    }
+
+    std::filesystem::path temporary;
+    std::optional<ExclusiveTemporaryFile> exclusive;
+    for (;;) {
+        if (nextExportTemporaryNonce_ == 0) {
+            result.status = audio::WavExportStatus::temporaryCreationFailed;
+            result.errorMessage = "WAV export temporary counter exhausted";
+            return result;
+        }
+        temporary = directory / ("." + request.destination.filename().string() +
+            ".export." + std::to_string(nextExportTemporaryNonce_++) + ".part.wav");
+        exclusive = createExclusiveTemporaryFile(temporary, filesystemError);
+        if (exclusive) break;
+        if (filesystemError == std::errc::file_exists) {
+            filesystemError.clear();
+            continue;
+        }
+        result.status = audio::WavExportStatus::temporaryCreationFailed;
+        result.errorMessage = "WAV export temporary could not be created";
+        return result;
+    }
+    result.retainedTemporaryFile = temporary;
+    const auto retainFailure = [&result](audio::WavExportStatus status,
+                                         std::string message) {
+        result.status = status;
+        result.errorMessage = std::move(message) +
+            (!result.publishedFile.empty()
+                 ? "; published final retained after incomplete export"
+                 : "") +
+            "; export temporary retained as an ownership-safe orphan";
+        return result;
+    };
+
+    files::RecordingIoFaultInjection fileFaults;
+    fileFaults.failSync = wavExportFaults_.failFileSync;
+    fileFaults.failClose = wavExportFaults_.failFileClose;
+    std::unique_ptr<FloatWavStreamWriter> writer;
+    try {
+        writer = std::make_unique<FloatWavStreamWriter>(
+            std::move(*exclusive), static_cast<std::uint32_t>(rate), channelCount,
+            static_cast<std::uint32_t>(totalFrameCount * bytesPerFrame),
+            request.render.processingBlockSize, &fileFaults,
+            wavExportFaults_.failInitialisation, wavExportFaults_.failWrite,
+            wavExportFaults_.failFinalization);
+    } catch (const std::bad_alloc&) {
+        return retainFailure(audio::WavExportStatus::wavInitialisationFailed,
+                             "Not enough memory to initialise WAV export");
+    } catch (...) {
+        return retainFailure(audio::WavExportStatus::wavInitialisationFailed,
+                             "WAV export writer could not be initialised");
+    }
+    if (!writer->ready()) {
+        return retainFailure(audio::WavExportStatus::wavInitialisationFailed,
+                             writer->error() == nullptr
+                                 ? "WAV export writer could not be initialised"
+                                 : writer->error());
+    }
+
+    struct ExportProgressBridge {
+        audio::OfflineRenderCallbacks callbacks;
+
+        static bool cancelled(void* context) noexcept {
+            const auto& bridge = *static_cast<const ExportProgressBridge*>(context);
+            return bridge.callbacks.cancellationRequested != nullptr &&
+                   bridge.callbacks.cancellationRequested(bridge.callbacks.context);
+        }
+
+        static void reportRenderProgress(void* context,
+                                         timeline::DeviceFrameCount completed,
+                                         timeline::DeviceFrameCount total) noexcept {
+            const auto& bridge = *static_cast<const ExportProgressBridge*>(context);
+            if (bridge.callbacks.progress == nullptr) return;
+            // Reserve the single terminal frame-count value for confirmed
+            // finalization and publication. This remains monotonic and avoids
+            // reporting 100% for a WAV which can still fail to commit.
+            const auto visible = completed.value == total.value
+                                     ? timeline::DeviceFrameCount{total.value - 1U}
+                                     : completed;
+            bridge.callbacks.progress(bridge.callbacks.context, visible, total);
+        }
+    } bridge{callbacks};
+
+    const auto streamed = audio::renderOfflineBlocks(
+        std::move(snapshot.specification), snapshot.sources, request.render,
+        {writer.get(), [](void* context, audio::ConstAudioBlockView block) noexcept {
+             return static_cast<FloatWavStreamWriter*>(context)->write(block);
+         }}, {&bridge, &ExportProgressBridge::cancelled,
+              &ExportProgressBridge::reportRenderProgress});
+    result.renderedFrames = streamed.renderedFrames;
+    if (streamed.status == audio::OfflineRenderStatus::cancelled) {
+        return retainFailure(audio::WavExportStatus::cancelled, "WAV export cancelled");
+    }
+    if (!streamed.success()) {
+        if (streamed.status == audio::OfflineRenderStatus::consumerFailed) {
+            return retainFailure(audio::WavExportStatus::wavWriteFailed,
+                writer->error() == nullptr ? "WAV export audio write failed" : writer->error());
+        }
+        const auto status = streamed.status == audio::OfflineRenderStatus::invalidRequest
+                                ? audio::WavExportStatus::invalidRequest
+                                : audio::WavExportStatus::preparationFailed;
+        return retainFailure(status, streamed.errorMessage.empty()
+            ? "WAV export render failed" : streamed.errorMessage);
+    }
+    // This is the last cancellable boundary. Once finalization/publication has
+    // started, cancellation cannot interrupt an ownership-critical operation.
+    if (bridge.cancelled(&bridge)) {
+        return retainFailure(audio::WavExportStatus::cancelled, "WAV export cancelled");
+    }
+    if (!writer->finalize()) {
+        return retainFailure(audio::WavExportStatus::wavFinalizationFailed,
+            writer->error() == nullptr ? "WAV export finalization failed" : writer->error());
+    }
+    if (!pathHasIdentity(temporary, exclusive->identity)) {
+        return retainFailure(audio::WavExportStatus::publicationFailed,
+                             "WAV export temporary was replaced before publication");
+    }
+    const char* storageError{};
+    if (wavExportFaults_.failPublication ||
+        !files::publishRecordingNoReplace(temporary, request.destination, nullptr, storageError)) {
+        return retainFailure(audio::WavExportStatus::publicationFailed,
+                             wavExportFaults_.failPublication
+                                 ? "Injected WAV export publication failure"
+                                 : "WAV export final file could not be published");
+    }
+    result.publishedFile = request.destination;
+    if (!pathHasIdentity(request.destination, exclusive->identity)) {
+        return retainFailure(audio::WavExportStatus::publicationFailed,
+                             "WAV export publication identity could not be verified");
+    }
+    if (wavExportFaults_.failDirectorySync ||
+        !files::syncRecordingDirectory(directory, nullptr, storageError)) {
+        return retainFailure(audio::WavExportStatus::publicationFailed,
+                             wavExportFaults_.failDirectorySync
+                                 ? "Injected WAV export directory fsync failure"
+                                 : "WAV export directory fsync failed");
+    }
+    result.status = audio::WavExportStatus::success;
+    result.warningMessage =
+        "WAV export published; temporary retained as an ownership-safe orphan";
+    if (callbacks.progress != nullptr) {
+        callbacks.progress(callbacks.context, streamed.totalFrames, streamed.totalFrames);
+    }
+    return result;
 }
 
 audio::StructuralPlanPreparationResult

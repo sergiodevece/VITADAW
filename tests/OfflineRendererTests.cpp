@@ -113,6 +113,13 @@ struct CancellationProbe {
     std::uint64_t total{};
 };
 
+struct StreamingProbe {
+    std::uint64_t frames{};
+    std::size_t blocks{};
+    std::size_t largestBlock{};
+    bool silenceOnly{true};
+};
+
 bool cancelAfterFirstBlock(void* context) noexcept {
     return static_cast<CancellationProbe*>(context)->completed >= 3;
 }
@@ -122,6 +129,20 @@ void captureProgress(void* context, timeline::DeviceFrameCount completed,
     auto& probe = *static_cast<CancellationProbe*>(context);
     probe.completed = completed.value;
     probe.total = total.value;
+}
+
+bool consumeStreaming(void* context, audio::ConstAudioBlockView block) noexcept {
+    auto& probe = *static_cast<StreamingProbe*>(context);
+    if (!block.isValid()) return false;
+    probe.frames += block.frameCount;
+    ++probe.blocks;
+    probe.largestBlock = std::max(probe.largestBlock, block.frameCount);
+    for (std::size_t channel = 0; channel < block.channelCount; ++channel) {
+        for (std::size_t frame = 0; frame < block.frameCount; ++frame) {
+            if (block.channels[channel][frame] != 0.0F) probe.silenceOnly = false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -229,6 +250,19 @@ int main() {
         monoSpec, std::span{&mono, 1}, 0, 8, 3);
     check(tailBlock.channels == realtime,
           "offline and realtime must share identical production rendering");
+
+    // The streaming primitive keeps only processing-sized buffers regardless
+    // of the requested duration. It reports a real partial final block and
+    // never materialises an output vector for this consumer.
+    StreamingProbe streaming;
+    auto streamed = audio::renderOfflineBlocks(
+        baseSpecification(), {},
+        {{0}, {200003}, timeline::SampleRate{8.0}, 2, 257},
+        {&streaming, consumeStreaming});
+    check(streamed.success() && streamed.renderedFrames.value == 200003 &&
+              streaming.frames == 200003 && streaming.blocks > 1 &&
+              streaming.largestBlock == 257 && streaming.silenceOnly,
+          "streaming render must consume bounded silent blocks including a tail");
 
     // The requested output rate uses the same exact device/project clock ratio.
     auto halfRate = render(monoSpec, std::span{&mono, 1}, 0, 8, 3, 4.0);
