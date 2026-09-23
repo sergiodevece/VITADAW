@@ -1,10 +1,15 @@
-# VitaDAW 0.7.3 — Device Latency, Recording Placement & Physical Loopback Validation
+# VitaDAW 0.8.2 — Media & Recovery Foundation
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
-incremental. La aplicación actual abre una ventana mínima, inicializa y observa
-el dispositivo de audio y carga y reproduce una colección variable de pistas WAV
-sincronizadas. El incremento 0.2.0 sustituye la suma directa al master por un
-plan portable preparado con buses estéreo, destinos de pista y metering de bus.
+incremental. La aplicación actual abre una ventana nativa, inicializa y observa
+el dispositivo de audio, y permite cargar y editar una colección variable de
+pistas WAV, reproducirla sincronizada y grabar tomas mono o estéreo sobre una
+única pista armada, con input monitoring manual. El núcleo expone además,
+mediante APIs control-side todavía sin UI, render offline, exportación WAV por
+streaming y un inventario read-only de artefactos de grabación y exportación
+para futuras operaciones de recuperación. El incremento 0.2.0 sustituye la suma
+directa al master por un plan portable preparado con buses estéreo, destinos de
+pista y metering de bus.
 El incremento 0.2.1 convierte esos buses en canales funcionales con gain,
 balance, mute, solo y smoothing sample-accurate. VitaDAW 0.2.2 permite que la
 salida principal de un bus alimente otro bus mediante un DAG validado y ordenado
@@ -434,6 +439,63 @@ El smoke también confirmó que un segundo comando Record terminaliza la toma en
 Stopped sin Play implícito, y que las capacidades físicas de input permanecen
 enumeradas con Monitoring OFF. Detalles: [`docs/validation-0.7.3.md`](docs/validation-0.7.3.md).
 
+## 0.8.0 - Offline Render Foundation
+
+VitaDAW 0.8.0 añade una entrada síncrona no-UI para renderizar un rango explícito
+`[startSample,endSample)` del proyecto preparado. El adaptador retiene los
+recursos PCM del snapshot y construye un `RealtimeAudioEngine` local en modo
+offline, de modo que reutiliza `processBlock()` sin dispositivo físico y sin
+compartir ni modificar el motor realtime instalado, el transporte, Loop,
+Monitoring o Recording.
+
+El render admite salida mono o estéreo, sample rate y tamaño de bloque
+explícitos, progreso y cancelación entre bloques. Un rango vacío de contenido
+produce silencio determinista y el último bloque conserva su tamaño exacto. La
+API inicial reúne el resultado en memoria, por lo que su uso crece con la
+duración solicitada. Hasta que exista un contrato de concurrencia explícito, el
+render no debe solaparse con mutaciones del proyecto o sus medios, sustituciones
+del plan preparado ni reconfiguración del adaptador.
+
+## 0.8.1 - Audio Export Foundation
+
+VitaDAW 0.8.1 extiende ese motor con consumo por bloques y una entrada síncrona
+no-UI para exportar WAV float32 mono o estéreo sin materializar la mezcla
+completa en memoria. Conserva el rango y sample rate explícitos del render, no
+altera el estado realtime y reserva el progreso terminal para un archivo ya
+finalizado, publicado y sincronizado.
+
+La exportación usa un temporal exclusivo junto al destino, rechaza reemplazar
+un archivo existente y publica sin reemplazo tras sincronizar y cerrar el WAV,
+verificar su identidad y sincronizar el directorio. Cancelación o fallo no se
+presentan como éxito y conservan el temporal como artefacto seguro; la
+implementación actual también lo conserva después de publicar. Solo admite
+RIFF/WAV clásico: no hay RF64 y se rechazan antes de escribir los tamaños que
+excederían su límite de 32 bits.
+
+## 0.8.2 - Media & Recovery Foundation
+
+VitaDAW 0.8.2 añade un inventario síncrono, control-side y read-only sobre roots
+explícitos y confiables. Reconoce candidatos de grabación respaldados por un
+recovery marker válido y temporales de exportación con el naming exacto de
+0.8.1; distingue candidatos potencialmente recuperables, artefactos reconocidos
+pero incompletos, aliases entre temporal y final publicados, y WAV cuya
+procedencia VitaDAW no está demostrada.
+
+El scanner rechaza roots que sean symlinks y no sigue entradas symlink/reparse,
+vincula cada inspección a un descriptor read-only/no-follow, conserva identidad
+estable cuando la plataforma la ofrece y registra fallos parciales sin abortar
+candidatos no relacionados. Los probes son acotados: 64 KiB para la estructura
+RIFF/WAVE y 8 KiB para markers, con límites adicionales de campos y líneas. No
+carga el payload de audio ni actúa como decoder o repair.
+
+Este inventario solo aporta discovery: un resultado no autoriza una mutación
+posterior. 0.8.2 no incorpora UI, watcher, trabajo en background, escaneo
+automático al arrancar, recuperación, adopción, borrado, garbage collection,
+cleanup automático, mutación del proyecto ni reparación post-crash. Cualquier
+fase mutante futura deberá reabrir y revalidar identidad, containment,
+procedencia y los datos necesarios justo antes de actuar. Detalles:
+[`docs/design-recovery-inventory-0.8.2.md`](docs/design-recovery-inventory-0.8.2.md).
+
 ## Tecnología propuesta
 
 - **C++20** para el núcleo y el callback de audio.
@@ -860,6 +922,17 @@ La arquitectura y las reglas de tiempo real se describen en
   buffer y latencias reportadas con reconfiguración transaccional, placement por
   toma sin tocar WAV, y medición RTT física diagnóstica mediante MLS; validación
   Volt 176 en cinco buffers y fixes de Record-toggle/capacidad de input.
+- **0.8.0 — Offline Render Foundation:** render síncrono no-UI de rangos
+  explícitos mediante un motor local en modo offline, con salida mono/estéreo,
+  sample rate configurable, progreso/cancelación y aislamiento del estado
+  realtime.
+- **0.8.1 — Audio Export Foundation:** render por bloques y exportación WAV
+  float32 mono/estéreo con memoria acotada, publicación no-replace, persistencia
+  sincronizada y temporales conservados de forma segura.
+- **0.8.2 — Media & Recovery Foundation:** inventario read-only y acotado de
+  artefactos de grabación/exportación sobre roots autorizados, clasificación por
+  evidencia e identidad y diagnósticos parciales, sin operaciones de recuperación
+  o borrado.
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
