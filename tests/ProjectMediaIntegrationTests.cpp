@@ -9,6 +9,8 @@
 #include <iostream>
 #include <new>
 #include <optional>
+#include <vector>
+#include <memory>
 #include <unistd.h>
 
 namespace {
@@ -177,6 +179,19 @@ public:
         adapter.recordingPublishedIdentity_ = publishedIdentity;
         return adapter.discardRecording(removePublished);
     }
+    // Drives the production audio callback exactly as the device would. The
+    // virtual device has no thread, so this is the only callback source.
+    static void callback(JuceAudioDeviceAdapter& adapter, const float* input, int frames) {
+        std::array<float, 256> left{}, right{};
+        std::array<float*, 2> output{left.data(), right.data()};
+        const std::array<const float*, 1> inputs{input};
+        adapter.audioDeviceIOCallbackWithContext(inputs.data(), 1, output.data(), 2, frames,
+                                                 juce::AudioIODeviceCallbackContext{});
+    }
+    static audio::RecordingCaptureTelemetry recordingTelemetry(
+        const JuceAudioDeviceAdapter& adapter) {
+        return adapter.realtimeEngine_.recordingTelemetry();
+    }
     static float render(JuceAudioDeviceAdapter& adapter) {
         // Never initialise AudioDeviceManager: exclusive, synchronous test consumer.
         adapter.realtimeEngine_.deviceInitialising();
@@ -204,8 +219,153 @@ void wav(const juce::File& file,float sample,double rate){
     check(writer!=nullptr&&writer->writeFromAudioSampleBuffer(buffer,0,480),"write real WAV");
 }
 }
+// 0.8.3-B2 regression: overflow -> cleanup -> new Record -> real PCM -> Stop ->
+// published clip, on the real JUCE adapter and DawApplication. Mirrors the P-8c
+// physical smoke without audio hardware: the virtual device has no thread, so
+// every callback below is the production callback, invoked deterministically.
+float overflowPattern(std::uint64_t frame, bool secondTake) {
+    // Dyadic values are exact in a float WAV; the sign separates the takes.
+    const auto phase = static_cast<float>(frame % 8192) / 8192.0F - 0.5F;
+    return secondTake ? -phase : phase;
+}
+
+std::vector<float> readMonoWav(const std::filesystem::path& file) {
+    juce::WavAudioFormat format;
+    std::unique_ptr<juce::AudioFormatReader> reader{format.createReaderFor(
+        new juce::FileInputStream(juce::File{juce::String(file.string())}), true)};
+    if (!reader || reader->numChannels != 1) return {};
+    juce::AudioBuffer<float> buffer(1, static_cast<int>(reader->lengthInSamples));
+    if (!reader->read(&buffer, 0, buffer.getNumSamples(), 0, true, false)) return {};
+    return {buffer.getReadPointer(0), buffer.getReadPointer(0) + buffer.getNumSamples()};
+}
+
+bool matchesPattern(const std::vector<float>& samples, bool secondTake) {
+    for (std::size_t frame = 0; frame < samples.size(); ++frame)
+        if (samples[frame] != overflowPattern(frame, secondTake)) return false;
+    return true;
+}
+
+void recordingRecoversAfterOverflow() {
+    using Access = platform::juce_adapter::PersistenceIntegrationAccess;
+    constexpr int blockFrames = 256; // the virtual device buffer
+    const auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                         .getNonexistentChildFile("vitadaw-overflow-recovery", "", false);
+    check(dir.createDirectory().wasOk(), "overflow recovery: temporary directory");
+    const auto path = [&](const char* name) {
+        return std::filesystem::path{dir.getChildFile(name).getFullPathName().toStdString()};
+    };
+    const auto audioDir = path("recovery Audio");
+
+    platform::juce_adapter::JuceAudioDeviceAdapter adapter;
+    check(Access::configureHardwareFreeRecordingDevice(adapter),
+          "overflow recovery: hardware-free device is operational");
+    application::DawApplication app{adapter, timeline::SampleRate{48000}};
+    const auto accepted = [&](commands::Command command) {
+        return app.handle(command).status == commands::CommandStatus::accepted;
+    };
+    check(accepted(commands::AddAudioTrack{"Take"}) &&
+              accepted(commands::SaveProjectAs{path("recovery.vitadaw")}) &&
+              accepted(commands::SetTrackRecordArmed{{1}, true}),
+          "overflow recovery: saved project with one armed mono track");
+    const auto historyCursor = app.history().cursor();
+    const auto historyToken = app.history().currentStateToken();
+
+    std::array<float, blockFrames> block{};
+    std::uint64_t offered{};
+    const auto feed = [&](bool secondTake) {
+        for (int index = 0; index < blockFrames; ++index)
+            block[static_cast<std::size_t>(index)] = overflowPattern(
+                offered + static_cast<std::uint64_t>(index), secondTake);
+        Access::callback(adapter, block.data(), blockFrames);
+        offered += blockFrames;
+    };
+
+    // --- Take A: the service never runs, so the ring must overflow. --------
+    check(accepted(commands::Record{}), "overflow recovery: first Record accepted");
+    for (int guard = 0; guard < 1000 &&
+                        adapter.recordingSnapshot().phase != audio::RecordingPhase::failed;
+         ++guard)
+        feed(false);
+    const auto overflowed = adapter.recordingSnapshot();
+    const auto overflowTelemetry = Access::recordingTelemetry(adapter);
+    check(overflowed.phase == audio::RecordingPhase::failed &&
+              overflowed.failure == audio::RecordingFailure::overflow &&
+              overflowTelemetry.overflowEvents == 1 &&
+              overflowTelemetry.droppedFrames == blockFrames &&
+              overflowed.acceptedDeviceFrames.value == overflowTelemetry.ringCapacityFrames,
+          "overflow recovery: the real adapter ring fails explicitly with one rejected callback");
+
+    // The application timer drains the published prefix, observes the
+    // failure, cleans up and stops the transport.
+    app.synchroniseTransport();
+    feed(false); // consumes the Stop the failure path requested
+    app.synchroniseTransport();
+    check(app.recordingPhase() == audio::RecordingPhase::failed &&
+              app.recordingError().find(
+                  "Recording stopped because the capture buffer overflowed") == 0 &&
+              app.recordingError().find("retained for recovery") != std::string::npos,
+          "overflow recovery: the take fails and its media is retained");
+    check(app.project().sources().empty() && app.project().tracks()[0].clips.empty() &&
+              !app.session().dirty() && app.history().cursor() == historyCursor &&
+              app.history().currentStateToken() == historyToken,
+          "overflow recovery: nothing of the failed take is committed");
+    check(app.transport().playback == transport::PlaybackState::stopped,
+          "overflow recovery: transport is stopped after the failure");
+    const auto failedTemporary = audioDir / ".Recording 000001.1.part.wav";
+    const auto retained = readMonoWav(failedTemporary);
+    check(retained.size() == overflowed.acceptedDeviceFrames.value &&
+              matchesPattern(retained, false),
+          "overflow recovery: the retained temporary is a readable WAV holding exactly "
+          "the accepted prefix");
+
+    // --- Take B: same process, same project, no restart. --------------------
+    check(accepted(commands::Record{}), "overflow recovery: a new Record is accepted");
+    offered = 0;
+    constexpr int takeBlocks = 40;
+    for (int index = 0; index < takeBlocks; ++index) {
+        feed(true);
+        if (index % 4 == 3) app.synchroniseTransport(); // the writer service
+    }
+    const auto capturing = adapter.recordingSnapshot();
+    const auto fresh = Access::recordingTelemetry(adapter);
+    check(capturing.phase == audio::RecordingPhase::capturing && capturing.session == 2 &&
+              capturing.acceptedDeviceFrames.value == takeBlocks * blockFrames,
+          "overflow recovery: the new take really captures PCM");
+    check(fresh.overflowEvents == 0 && fresh.droppedFrames == 0 &&
+              fresh.producedFrames == takeBlocks * blockFrames &&
+              fresh.peakOccupancyFrames < fresh.ringCapacityFrames,
+          "overflow recovery: no overflow counter is inherited from the failed take");
+
+    check(accepted(commands::Stop{}), "overflow recovery: Stop accepted");
+    feed(true); // the callback consumes Stop; this block is excluded from the take
+    app.synchroniseTransport();
+    // A successful publication always reports its retained hidden temporary;
+    // that warning is the success path of the retention policy, not a failure.
+    check(app.recordingPhase() == audio::RecordingPhase::complete &&
+              app.recordingError() ==
+                  "Recorded WAV published; temporary retained as an ownership-safe orphan",
+          "overflow recovery: the new take completes and finalizes");
+    check(app.project().sources().size() == 1 && app.project().tracks()[0].clips.size() == 1 &&
+              app.project().sources()[0].frameCount ==
+                  timeline::SourceFrameCount{takeBlocks * blockFrames},
+          "overflow recovery: exactly one source and clip are committed");
+    const auto published = audioDir / "Recording 000002.wav";
+    check(std::filesystem::exists(published) && !std::filesystem::exists(
+                                                    audioDir / "Recording 000001.wav"),
+          "overflow recovery: only the new take is published");
+    const auto publishedPcm = readMonoWav(published);
+    check(publishedPcm.size() == takeBlocks * blockFrames && matchesPattern(publishedPcm, true),
+          "overflow recovery: the published clip holds the new take's PCM exactly");
+    check(readMonoWav(failedTemporary) == retained,
+          "overflow recovery: the failed take's retained media is untouched by the new take");
+
+    adapter.shutdown();
+    check(dir.deleteRecursively(), "overflow recovery: remove own temporary files");
+}
+
 int main(){
     using namespace vitadaw;
+    recordingRecoversAfterOverflow();
     const auto dir=juce::File::getSpecialLocation(juce::File::tempDirectory).getNonexistentChildFile("vitadaw-media", "",false);
     check(dir.createDirectory().wasOk(),"temporary directory");
     const auto a=dir.getChildFile("a.wav"),b=dir.getChildFile("b.wav");wav(a,0.25F,44100);wav(b,-0.5F,48000);

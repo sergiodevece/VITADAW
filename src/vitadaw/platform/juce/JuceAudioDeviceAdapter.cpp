@@ -24,6 +24,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+#endif
+
 #if defined(_WIN32)
 #include <io.h>
 #include <sys/stat.h>
@@ -41,6 +47,28 @@ namespace {
 // capture, draining or any recording decision, so a different UI timer rate
 // would change only the interpretation of a diagnostic counter.
 constexpr double expectedRecordingServiceRateHz = 30.0;
+
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+void logRecordingServiceDiagnostics(const juce::String& message) {
+    juce::Logger::writeToLog("[VitaDAW recording diagnostics] " + message);
+}
+
+// One summary per finished take is appended here; nothing is written while a
+// take is being measured. VITADAW_DIAG_SUMMARY_FILE overrides the location.
+juce::File recordingServiceDiagnosticsFile() {
+    if (const char* path = std::getenv("VITADAW_DIAG_SUMMARY_FILE");
+        path != nullptr && *path != '\0')
+        return juce::File::getCurrentWorkingDirectory().getChildFile(
+            juce::String::fromUTF8(path));
+#if JUCE_MAC
+    return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile("Library/Logs/VitaDAW/recording-service-diagnostics.log");
+#else
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("VitaDAW/recording-service-diagnostics.log");
+#endif
+}
+#endif
 
 void closeDescriptor(int descriptor) noexcept {
 #if defined(_WIN32)
@@ -392,6 +420,9 @@ void JuceAudioDeviceAdapter::beginDeviceReinitialisation() noexcept {
 }
 
 bool JuceAudioDeviceAdapter::initialise() {
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+    announceRecordingServiceDiagnostics();
+#endif
     beginDeviceReinitialisation();
     deviceManager_.addChangeListener(this);
     changeListenerRegistered_ = true;
@@ -2161,7 +2192,16 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
 audio::AudioControlRequestResult JuceAudioDeviceAdapter::tryRequestRecord(
     audio::RecordingRequest request) noexcept {
     if (!recordingWriter_ || request.session == 0) return {};
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+    // Taken before the request can reach the callback, so the first measured
+    // gap covers the whole time the ring is unattended once capture starts.
+    const auto requested = RecordingServiceDiagnostics::Clock::now();
+    const auto result = realtimeEngine_.tryRequestRecord(request);
+    if (result.accepted) beginRecordingServiceDiagnostics(requested, request);
+    return result;
+#else
     return realtimeEngine_.tryRequestRecord(request);
+#endif
 }
 
 bool JuceAudioDeviceAdapter::tryCancelRecording() noexcept {
@@ -2171,6 +2211,9 @@ bool JuceAudioDeviceAdapter::tryCancelRecording() noexcept {
 void JuceAudioDeviceAdapter::serviceRecording() noexcept {
     if (!recordingWriter_) return;
     const auto snapshot = realtimeEngine_.recordingSnapshot();
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+    observeRecordingService(snapshot);
+#endif
     const auto channels = static_cast<int>(media::channelCount(snapshot.layout));
     if (channels < 1 || channels > recordingDrainBuffer_.getNumChannels()) return;
     std::array<float*, 2> output{};
@@ -2347,6 +2390,9 @@ audio::RecordingCleanupResult JuceAudioDeviceAdapter::discardRecordingWithDiagno
     recordingRecoveryDirectory_.clear();
     recordingRecoveryMetadataAvailable_ = false;
     recordingRecoveryWarning_.clear();
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+    finishRecordingServiceDiagnostics();
+#endif
     realtimeEngine_.resetRecordingCapture();
     return result;
 }
@@ -2407,8 +2453,96 @@ void JuceAudioDeviceAdapter::confirmRecordingCommit() noexcept {
     recordingRecoveryDirectory_.clear();
     recordingRecoveryMetadataAvailable_ = false;
     recordingRecoveryWarning_.clear();
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+    finishRecordingServiceDiagnostics();
+#endif
     realtimeEngine_.resetRecordingCapture();
 }
+
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+void JuceAudioDeviceAdapter::announceRecordingServiceDiagnostics() noexcept {
+    if (recordingServiceDiagnosticsAnnounced_) return;
+    recordingServiceDiagnosticsAnnounced_ = true;
+    recordingServiceStallPlan_ = parseRecordingServiceStallPlan(
+        std::getenv("VITADAW_DIAG_SERVICE_STALLS_MS"),
+        std::getenv("VITADAW_DIAG_SERVICE_STALL_FIRST_MS"),
+        std::getenv("VITADAW_DIAG_SERVICE_STALL_SPACING_MS"));
+    try {
+        juce::String plan;
+        if (!recordingServiceStallPlan_.valid) {
+            plan = "INVALID - ignored, no stall will be injected";
+        } else if (recordingServiceStallPlan_.count == 0) {
+            plan = "none";
+        } else {
+            for (std::size_t index = 0; index < recordingServiceStallPlan_.count; ++index)
+                plan << (index == 0 ? "" : ",")
+                     << static_cast<int>(recordingServiceStallPlan_.stallsMs[index]);
+            plan << " ms, first after "
+                 << static_cast<int>(recordingServiceStallPlan_.firstAfterMs)
+                 << " ms, spacing "
+                 << static_cast<int>(recordingServiceStallPlan_.spacingMs) << " ms";
+        }
+        logRecordingServiceDiagnostics(
+            "DEVELOPMENT BUILD - service-latency diagnostics enabled; stall plan: " +
+            plan + "; summaries appended to " +
+            recordingServiceDiagnosticsFile().getFullPathName());
+    } catch (...) {
+    }
+}
+
+void JuceAudioDeviceAdapter::beginRecordingServiceDiagnostics(
+    RecordingServiceDiagnostics::Clock::time_point requested,
+    const audio::RecordingRequest& request) noexcept {
+    JUCE_ASSERT_MESSAGE_THREAD
+    announceRecordingServiceDiagnostics();
+    recordingServiceDiagnostics_.begin(requested, request.session,
+                                       request.placement.deviceSampleRate.hertz(),
+                                       request.placement.deviceBufferFrames,
+                                       1.0 / expectedRecordingServiceRateHz);
+    recordingServiceStalls_.begin(recordingServiceStallPlan_);
+}
+
+void JuceAudioDeviceAdapter::observeRecordingService(
+    const audio::RecordingSnapshot& snapshot) noexcept {
+    if (!recordingServiceDiagnostics_.accepting()) return;
+    JUCE_ASSERT_MESSAGE_THREAD
+    using Clock = RecordingServiceDiagnostics::Clock;
+    if (snapshot.phase == audio::RecordingPhase::capturing) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - recordingServiceDiagnostics_.anchor());
+        if (const auto stall = recordingServiceStalls_.take(elapsed); stall != 0) {
+            // Development-only stall of the service thread itself - exactly
+            // what a slow main-thread operation does to the writer. The audio
+            // callback never calls serviceRecording(), so it cannot reach this.
+            std::this_thread::sleep_for(std::chrono::milliseconds(stall));
+            recordingServiceDiagnostics_.recordInjectedStall();
+        }
+    }
+    // Timestamped after any stall and before draining: the gap is the time
+    // between two drains, which is what the ring has to absorb.
+    recordingServiceDiagnostics_.recordService(Clock::now(), snapshot.phase,
+                                               snapshot.failure);
+}
+
+void JuceAudioDeviceAdapter::finishRecordingServiceDiagnostics() noexcept {
+    const auto ending = recordingSnapshot();
+    const auto summary = recordingServiceDiagnostics_.finish(
+        realtimeEngine_.recordingTelemetry(), ending.phase, ending.failure);
+    if (!summary) return;
+    // Formatting and the single append happen after the take has ended, so
+    // they cannot perturb the interval they report.
+    try {
+        const juce::String text{formatRecordingServiceSummary(*summary)};
+        logRecordingServiceDiagnostics("take finished\n" + text);
+        const auto file = recordingServiceDiagnosticsFile();
+        static_cast<void>(file.getParentDirectory().createDirectory());
+        static_cast<void>(file.appendText(
+            juce::Time::getCurrentTime().toISO8601(true) + "\n" + text + "\n"));
+    } catch (...) {
+        // Diagnostics must never disturb take cleanup.
+    }
+}
+#endif
 
 void JuceAudioDeviceAdapter::audioDeviceIOCallbackWithContext(
     const float* const* input, int inputChannels,

@@ -5,6 +5,9 @@
 #include "vitadaw/audio/RecordingRecovery.h"
 #include "vitadaw/audio/RealtimeAudioEngine.h"
 #include "vitadaw/platform/files/RecordingMediaIO.h"
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+#include "vitadaw/platform/juce/RecordingServiceDiagnostics.h"
+#endif
 
 #include <juce_audio_devices/juce_audio_devices.h>
 
@@ -310,6 +313,20 @@ private:
     std::string monitoringDiagnostic_;
     bool callbackRegistered_{};
     bool changeListenerRegistered_{};
+#if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+    // Development-only service-latency diagnostics (0.8.3-B2), compiled only
+    // when CMake enables VITADAW_RECORDING_SERVICE_DIAGNOSTICS. Message thread
+    // only: the audio callback never reads or writes any of this state.
+    void announceRecordingServiceDiagnostics() noexcept;
+    void beginRecordingServiceDiagnostics(RecordingServiceDiagnostics::Clock::time_point,
+                                          const audio::RecordingRequest&) noexcept;
+    void observeRecordingService(const audio::RecordingSnapshot&) noexcept;
+    void finishRecordingServiceDiagnostics() noexcept;
+    RecordingServiceDiagnostics recordingServiceDiagnostics_;
+    RecordingServiceStallPlan recordingServiceStallPlan_;
+    RecordingServiceStallSchedule recordingServiceStalls_;
+    bool recordingServiceDiagnosticsAnnounced_{};
+#endif
 };
 
 } // namespace vitadaw::platform::juce_adapter

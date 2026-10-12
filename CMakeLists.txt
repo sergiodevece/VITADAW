@@ -14,6 +14,9 @@ option(VITADAW_BUILD_TESTS "Build VitaDAW unit tests" ON)
 option(VITADAW_BUILD_APP "Build the native JUCE application" ON)
 option(VITADAW_FETCH_JUCE "Download the pinned JUCE version when it is not installed" ON)
 option(VITADAW_BUILD_BENCHMARKS "Build VitaDAW non-gating benchmarks" OFF)
+option(VITADAW_RECORDING_SERVICE_DIAGNOSTICS
+    "Development only: measure recording writer service latency and allow injected service stalls"
+    OFF)
 
 add_library(vitadaw_core
     src/vitadaw/application/DawApplication.cpp
@@ -105,6 +108,13 @@ if(VITADAW_BUILD_APP)
         JUCE_USE_CURL=0
         JUCE_WEB_BROWSER=0
     )
+    if(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
+        message(WARNING
+            "VITADAW_RECORDING_SERVICE_DIAGNOSTICS is ON: this application build measures "
+            "recording service latency and honours VITADAW_DIAG_SERVICE_STALLS_MS. "
+            "Development use only - never distribute this build.")
+        target_compile_definitions(vitadaw_app PRIVATE VITADAW_RECORDING_SERVICE_DIAGNOSTICS=1)
+    endif()
 
     if(MSVC)
         target_compile_options(vitadaw_app PRIVATE /W4 /permissive-)
@@ -212,6 +222,11 @@ if(VITADAW_BUILD_TESTS)
             juce::juce_audio_devices)
         add_test(NAME vitadaw_juce_recording_input_setup_policy_tests
             COMMAND vitadaw_juce_recording_input_setup_policy_tests)
+        add_executable(vitadaw_recording_service_diagnostics_tests
+            tests/RecordingServiceDiagnosticsTests.cpp)
+        target_link_libraries(vitadaw_recording_service_diagnostics_tests PRIVATE vitadaw_core)
+        add_test(NAME vitadaw_recording_service_diagnostics_tests
+            COMMAND vitadaw_recording_service_diagnostics_tests)
         add_executable(vitadaw_input_monitoring_device_lifecycle_tests
             tests/InputMonitoringDeviceLifecycleTests.cpp
             src/vitadaw/platform/juce/JuceAudioDeviceAdapter.cpp)
