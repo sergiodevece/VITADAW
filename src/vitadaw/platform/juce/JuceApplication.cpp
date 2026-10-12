@@ -109,6 +109,10 @@ public:
                         mainWindow_->setAudioDeviceState(state);
                     }
                 });
+            // Platform/UI refresh rate. This timer also happens to service the
+            // recording writer, so JuceAudioDeviceAdapter mirrors this value as
+            // its expected service cadence for capture telemetry only; changing
+            // the rate here affects no recording behaviour.
             startTimerHz(30);
             phase_ = StartupPhase::running;
             logLifecycle("startup completed");

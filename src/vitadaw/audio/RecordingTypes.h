@@ -122,6 +122,51 @@ struct RecordingSnapshot {
     }
 };
 
+// Length of the non-RT capture ring, in seconds of device audio. This is a
+// recording-domain decision: together with the cadence at which the host
+// platform actually services the writer, it defines the headroom the ring has
+// to absorb. Core deliberately does not describe that cadence - the layer
+// which owns the service timer does.
+inline constexpr double recordingCaptureRingSeconds = 2.0;
+
+// Bounded capture telemetry. Every field is published through a plain
+// lock-free integer counter: the audio callback writes only the producer-owned
+// counters, the recording service writes only the consumer-owned ones, and no
+// path allocates, locks, formats a string or performs I/O. Reading a snapshot
+// is non-RT and may observe producer and consumer counters a bounded distance
+// apart; it is a diagnostic, never a synchronisation mechanism.
+struct RecordingCaptureTelemetry {
+    std::size_t ringCapacityFrames{};
+    // Instantaneous ring occupancy and the producer-observed high-water mark.
+    std::size_t occupancyFrames{};
+    std::size_t peakOccupancyFrames{};
+    // capacity - peakOccupancy: the smallest margin the take ever had.
+    std::size_t minimumHeadroomFrames{};
+    // Consumer-observed backlog at service entry, i.e. the frames the writer
+    // had to absorb because of its own scheduling lateness.
+    std::size_t peakServiceBacklogFrames{};
+    std::size_t serviceBudgetFrames{};
+    std::uint64_t producedFrames{};
+    std::uint64_t consumedFrames{};
+    std::uint64_t droppedFrames{};
+    std::uint64_t captureCalls{};
+    std::uint64_t overflowEvents{};
+    // Drain calls, not service passes: a pass drains in bounded chunks until
+    // the ring is empty, so a healthy pass contributes one or more draining
+    // calls plus the empty call that ends it.
+    std::uint64_t drainCalls{};
+    // Drain calls that found the ring empty. Recording has no underrun: an
+    // empty ring is the normal steady state of a writer which keeps up.
+    std::uint64_t emptyDrainCalls{};
+    // Drain calls which observed a backlog above the nominal budget. One very
+    // late service pass can report several, one per chunk it has to catch up.
+    std::uint64_t lateServiceEvents{};
+
+    [[nodiscard]] bool lossless() const noexcept {
+        return droppedFrames == 0 && overflowEvents == 0;
+    }
+};
+
 struct RecordingPreflightRequest {
     tracks::TrackId track;
     media::AudioChannelLayout layout{media::AudioChannelLayout::mono};

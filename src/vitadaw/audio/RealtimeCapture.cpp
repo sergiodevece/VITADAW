@@ -5,6 +5,21 @@
 
 namespace vitadaw::audio {
 
+// Counters are zeroed with the ring itself: prepare() and reset() run while
+// capture is inactive, and begin() runs in the callback before any consumer
+// can observe the session, so no concurrent writer of these fields exists.
+void RealtimeCapture::resetTelemetryCounters() noexcept {
+    peakOccupancyFrames_.store(0, std::memory_order_relaxed);
+    droppedFrames_.store(0, std::memory_order_relaxed);
+    captureCalls_.store(0, std::memory_order_relaxed);
+    overflowEvents_.store(0, std::memory_order_relaxed);
+    consumedFrames_.store(0, std::memory_order_relaxed);
+    drainCalls_.store(0, std::memory_order_relaxed);
+    emptyDrainCalls_.store(0, std::memory_order_relaxed);
+    peakServiceBacklogFrames_.store(0, std::memory_order_relaxed);
+    lateServiceEvents_.store(0, std::memory_order_relaxed);
+}
+
 bool RealtimeCapture::prepare(std::size_t frameCapacity) {
     if (frameCapacity == 0 || isActive()) return false;
     try {
@@ -19,6 +34,7 @@ bool RealtimeCapture::prepare(std::size_t frameCapacity) {
     writeFrame_.store(0, std::memory_order_relaxed);
     readFrame_.store(0, std::memory_order_relaxed);
     acceptedFrames_.store(0, std::memory_order_relaxed);
+    resetTelemetryCounters();
     session_ = 0;
     track_ = {};
     projectStart_ = {};
@@ -34,6 +50,7 @@ void RealtimeCapture::reset() noexcept {
     writeFrame_.store(0, std::memory_order_relaxed);
     readFrame_.store(0, std::memory_order_relaxed);
     acceptedFrames_.store(0, std::memory_order_relaxed);
+    resetTelemetryCounters();
     session_ = 0;
     track_ = {};
     projectStart_ = {};
@@ -91,6 +108,7 @@ bool RealtimeCapture::begin(const RecordingRequest& request,
     writeFrame_.store(0, std::memory_order_relaxed);
     readFrame_.store(0, std::memory_order_relaxed);
     acceptedFrames_.store(0, std::memory_order_relaxed);
+    resetTelemetryCounters();
     status_.store(encode(RecordingPhase::capturing, RecordingFailure::none),
                   std::memory_order_release);
     return true;
@@ -110,13 +128,19 @@ void RealtimeCapture::capture(ConstAudioBlockView input) noexcept {
         }
     }
 
+    captureCalls_.fetch_add(1, std::memory_order_relaxed);
     const auto write = writeFrame_.load(std::memory_order_relaxed);
     const auto read = readFrame_.load(std::memory_order_acquire);
     const auto used = write - read;
     if (used > capacity_ || input.frameCount > capacity_ - used) {
+        droppedFrames_.fetch_add(input.frameCount, std::memory_order_relaxed);
+        overflowEvents_.fetch_add(1, std::memory_order_relaxed);
         fail(RecordingFailure::overflow);
         return;
     }
+    const auto occupancy = used + input.frameCount;
+    if (occupancy > peakOccupancyFrames_.load(std::memory_order_relaxed))
+        peakOccupancyFrames_.store(occupancy, std::memory_order_relaxed);
 
     const auto first = static_cast<std::size_t>(write % capacity_);
     const auto firstCount = std::min(input.frameCount, capacity_ - first);
@@ -165,8 +189,16 @@ std::size_t RealtimeCapture::drain(AudioBlockView output) noexcept {
 
     const auto read = readFrame_.load(std::memory_order_relaxed);
     const auto write = writeFrame_.load(std::memory_order_acquire);
+    const auto backlog = write - read;
+    drainCalls_.fetch_add(1, std::memory_order_relaxed);
+    if (backlog == 0) emptyDrainCalls_.fetch_add(1, std::memory_order_relaxed);
+    if (backlog > peakServiceBacklogFrames_.load(std::memory_order_relaxed))
+        peakServiceBacklogFrames_.store(backlog, std::memory_order_relaxed);
+    const auto budget = serviceBudgetFrames_.load(std::memory_order_relaxed);
+    if (budget != 0 && backlog > budget)
+        lateServiceEvents_.fetch_add(1, std::memory_order_relaxed);
     const auto count = static_cast<std::size_t>(
-        std::min<std::uint64_t>(write - read, output.frameCount));
+        std::min<std::uint64_t>(backlog, output.frameCount));
     const auto first = static_cast<std::size_t>(read % capacity_);
     const auto firstCount = std::min(count, capacity_ - first);
     const auto secondCount = count - firstCount;
@@ -179,7 +211,37 @@ std::size_t RealtimeCapture::drain(AudioBlockView output) noexcept {
         }
     }
     readFrame_.store(read + count, std::memory_order_release);
+    consumedFrames_.fetch_add(count, std::memory_order_relaxed);
     return count;
+}
+
+RecordingCaptureTelemetry RealtimeCapture::telemetry() const noexcept {
+    RecordingCaptureTelemetry result;
+    result.ringCapacityFrames = capacity_;
+    const auto write = writeFrame_.load(std::memory_order_acquire);
+    const auto read = readFrame_.load(std::memory_order_acquire);
+    result.occupancyFrames = static_cast<std::size_t>(write >= read ? write - read : 0);
+    const auto peak = peakOccupancyFrames_.load(std::memory_order_relaxed);
+    result.peakOccupancyFrames = static_cast<std::size_t>(peak);
+    result.minimumHeadroomFrames = capacity_ > peak
+        ? capacity_ - static_cast<std::size_t>(peak) : 0;
+    result.peakServiceBacklogFrames = static_cast<std::size_t>(
+        peakServiceBacklogFrames_.load(std::memory_order_relaxed));
+    result.serviceBudgetFrames = static_cast<std::size_t>(
+        serviceBudgetFrames_.load(std::memory_order_relaxed));
+    result.producedFrames = acceptedFrames_.load(std::memory_order_relaxed);
+    result.consumedFrames = consumedFrames_.load(std::memory_order_relaxed);
+    result.droppedFrames = droppedFrames_.load(std::memory_order_relaxed);
+    result.captureCalls = captureCalls_.load(std::memory_order_relaxed);
+    result.overflowEvents = overflowEvents_.load(std::memory_order_relaxed);
+    result.drainCalls = drainCalls_.load(std::memory_order_relaxed);
+    result.emptyDrainCalls = emptyDrainCalls_.load(std::memory_order_relaxed);
+    result.lateServiceEvents = lateServiceEvents_.load(std::memory_order_relaxed);
+    return result;
+}
+
+void RealtimeCapture::setServiceBudgetFrames(std::size_t frames) noexcept {
+    serviceBudgetFrames_.store(frames, std::memory_order_relaxed);
 }
 
 RecordingSnapshot RealtimeCapture::snapshot() const noexcept {

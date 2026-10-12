@@ -664,6 +664,14 @@ RecordingSnapshot RealtimeAudioEngine::recordingSnapshot() const noexcept {
     return capture_.snapshot();
 }
 
+RecordingCaptureTelemetry RealtimeAudioEngine::recordingTelemetry() const noexcept {
+    return capture_.telemetry();
+}
+
+void RealtimeAudioEngine::setRecordingServiceBudgetFrames(std::size_t frames) noexcept {
+    capture_.setServiceBudgetFrames(frames);
+}
+
 std::size_t RealtimeAudioEngine::drainRecording(AudioBlockView output) noexcept {
     return capture_.drain(output);
 }

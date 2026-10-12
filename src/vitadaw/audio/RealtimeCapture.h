@@ -34,6 +34,11 @@ public:
 
     [[nodiscard]] std::size_t drain(AudioBlockView) noexcept;
     [[nodiscard]] RecordingSnapshot snapshot() const noexcept;
+    // Bounded diagnostic counters. telemetry() is a non-RT reader; the budget
+    // is the nominal frame distance between two service calls and is installed
+    // only while capture is inactive.
+    [[nodiscard]] RecordingCaptureTelemetry telemetry() const noexcept;
+    void setServiceBudgetFrames(std::size_t frames) noexcept;
     [[nodiscard]] bool isCapturing() const noexcept {
         return phase(status_.load(std::memory_order_acquire)) == RecordingPhase::capturing;
     }
@@ -51,6 +56,7 @@ public:
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
 private:
+    void resetTelemetryCounters() noexcept;
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
     static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
     static constexpr std::uint32_t encode(RecordingPhase phase,
@@ -70,6 +76,20 @@ private:
     std::atomic<std::uint64_t> writeFrame_{};
     std::atomic<std::uint64_t> readFrame_{};
     std::atomic<std::uint64_t> acceptedFrames_{};
+    // Producer-owned telemetry: written only by the audio callback through
+    // relaxed integer atomics, and zeroed with the ring before a take begins.
+    std::atomic<std::uint64_t> peakOccupancyFrames_{};
+    std::atomic<std::uint64_t> droppedFrames_{};
+    std::atomic<std::uint64_t> captureCalls_{};
+    std::atomic<std::uint64_t> overflowEvents_{};
+    // Consumer-owned telemetry: written only by the recording service.
+    std::atomic<std::uint64_t> consumedFrames_{};
+    std::atomic<std::uint64_t> drainCalls_{};
+    std::atomic<std::uint64_t> emptyDrainCalls_{};
+    std::atomic<std::uint64_t> peakServiceBacklogFrames_{};
+    std::atomic<std::uint64_t> lateServiceEvents_{};
+    // Non-RT configuration read by the consumer only.
+    std::atomic<std::uint64_t> serviceBudgetFrames_{};
     // A single atomic publication makes terminal snapshots coherent. Stop and
     // failure race by CAS; whichever transition wins is the terminal result.
     std::atomic<std::uint32_t> status_{encode(RecordingPhase::idle,

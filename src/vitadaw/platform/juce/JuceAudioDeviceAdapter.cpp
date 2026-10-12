@@ -35,6 +35,13 @@
 namespace vitadaw::platform::juce_adapter {
 
 namespace {
+// Cadence at which the application timer in JuceApplication services
+// serviceRecording(). It is a platform scheduling fact mirrored here for one
+// purpose only: labelling late service in capture telemetry. It never gates
+// capture, draining or any recording decision, so a different UI timer rate
+// would change only the interpretation of a diagnostic counter.
+constexpr double expectedRecordingServiceRateHz = 30.0;
+
 void closeDescriptor(int descriptor) noexcept {
 #if defined(_WIN32)
     if (descriptor >= 0) static_cast<void>(::_close(descriptor));
@@ -2030,14 +2037,22 @@ audio::RecordingPreflightResult JuceAudioDeviceAdapter::prepareRecording(
     placement.effectiveCompensationProjectFrames = *effective;
 
     try {
-        constexpr double captureSeconds = 2.0;
-        const auto capacityDouble = std::ceil(deviceSampleRate_.hertz() * captureSeconds);
+        const auto capacityDouble = std::ceil(
+            deviceSampleRate_.hertz() * audio::recordingCaptureRingSeconds);
         if (capacityDouble <= 0.0 ||
             capacityDouble > static_cast<double>(std::numeric_limits<std::size_t>::max()) ||
             !realtimeEngine_.prepareRecordingCapture(
                 static_cast<std::size_t>(capacityDouble))) {
             return rollback("The realtime recording buffer could not be prepared");
         }
+        // Nominal writer backlog, expressed in device frames: one service
+        // period plus the one callback a punctual service may still have to
+        // absorb. It only labels late service in telemetry; it never gates
+        // capture or draining.
+        realtimeEngine_.setRecordingServiceBudgetFrames(
+            static_cast<std::size_t>(
+                std::ceil(deviceSampleRate_.hertz() / expectedRecordingServiceRateHz)) +
+            placement.deviceBufferFrames);
 
         const auto audioDirectory = request.projectFile.parent_path() /
             (request.projectFile.stem().string() + " Audio");

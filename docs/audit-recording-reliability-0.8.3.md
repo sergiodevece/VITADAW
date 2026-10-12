@@ -72,8 +72,8 @@ orthogonal to capture state: a failed take must not silently disarm the track.
 
 | Priority | Gap | Why it matters | Intended closure |
 |---|---|---|---|
-| P0 | No endurance test of the real producer/drain/writer path | Passing unit tests do not show stable file growth, bounded memory, or lack of callback starvation over time. | Deterministic endurance harness plus physical 30/60/120-minute smoke tiers; record telemetry. |
-| P0 | Writer service runs on the UI timer at 30 Hz; ring holds about two seconds | A blocked UI or slow storage can fill the ring. Current safe behavior is an `overflow` failure, but this has no measured headroom or user-visible root cause. | Measure drain lag/high-water mark and write latency; test timer stalls and slow/short writes; define the accepted abort/recovery UX. |
+| P0 | No endurance test of the real producer/drain/writer path | Passing unit tests do not show stable file growth, bounded memory, or lack of callback starvation over time. | **Closed in 0.8.3-B** for the deterministic half (`vitadaw_recording_endurance_tests`, LR-1…LR-6, up to 4 simulated hours). Physical 30/60/120-minute tiers remain. |
+| P0 | Writer service runs on the UI timer at 30 Hz; ring holds about two seconds | A blocked UI or slow storage can fill the ring. Current safe behavior is an `overflow` failure, but this has no measured headroom or user-visible root cause. | **Measured in 0.8.3-B** (see below): the ring absorbs a 1.9947 s writer outage at 512-frame buffers and nominal service uses 2.1 % of it. Still open: real UI-timer lateness and the abort/recovery UX. |
 | P0 | Device/configuration change during capture has no explicit recording policy test | `pollDeviceLifecycle` may reprepare an observed configuration change. A rate change is eventually failed in RT; same-rate device/buffer changes have no take-specific contract proving no silent discontinuity. | Decide policy: abort any active take before reconfiguration (recommended for 0.8.3), retain/recover it, stop transport, and prove it. |
 | P0 | Input route disappearance is not separately tested while recording | Monitoring route loss is handled, but recording must independently fail safely if active inputs vanish/change. | Add adapter-level fault seams and tests for zero/changed inputs during Record, with no project commit. |
 | P1 | The app-level phase can briefly project `capturing` before the callback consumes `beginRecord` | This is intentional asynchronous command behavior, but needs transition-table coverage for Stop/Cancel/device loss before first callback. | Exhaustive transition tests for prepared/begin-pending states and stale commands. |
@@ -144,3 +144,19 @@ The following is the release contract to encode in tests before hardware work:
 > existing overflow failure without corrupting earlier drained PCM. Keep all
 > existing tests green. Report the files changed, tests run, and any design
 > decision that would affect the subsequent device-failure phase.
+
+## Phase status
+
+| Phase | State | Evidence |
+|---|---|---|
+| 0.8.3-A — audit and test matrix | complete | this document |
+| 0.8.3-B — recording endurance | complete | [`audit-recording-endurance-0.8.3B.md`](audit-recording-endurance-0.8.3B.md) |
+
+0.8.3-B added bounded RT-safe capture telemetry and a deterministic endurance
+harness, and measured the headroom of the existing writer model without
+changing it. Its verdict is `DISEÑO ACTUAL JUSTO / REQUIERE MÁS PRUEBAS`: the
+ring absorbs about sixty consecutive missed 30 Hz service ticks and fails
+explicitly beyond that with no corruption and no commit, but the real lateness
+of the UI timer under this application's own main-thread work has not yet been
+measured. LR-01 and LR-02 of the matrix above are covered deterministically;
+LR-03 (physical tiers) and the DF/RI rows remain open.
