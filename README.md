@@ -26,6 +26,37 @@ Sus prioridades son:
 - **un Command System** como única vía para modificar el proyecto;
 - **modularidad**, para crecer sin reescribir el dominio.
 
+## Cómo desarrollamos VitaDAW
+
+VitaDAW se construye mediante un flujo **dirigido por el desarrollador y
+verificado con evidencias**. Las herramientas de IA colaboran con funciones
+distintas, pero ninguna sustituye la validación técnica ni la decisión final:
+
+- **Dirección del producto y aceptación:** el responsable del proyecto define
+  las necesidades musicales, prioriza, revisa resultados y realiza los smokes
+  físicos en el DAW y en dispositivos reales.
+- **Arquitectura y planificación:** ChatGPT (GPT) ayuda a evaluar alternativas,
+  riesgos, alcance, criterios de aceptación y decisiones de ingeniería. La
+  decisión final corresponde al responsable del proyecto.
+- **Implementación e investigación:** Claude Code desarrolla, depura, ejecuta
+  pruebas y también realiza auditorías de código y análisis forenses con
+  alcance explícito, como las fases 0.8.3-C1 y C2.
+- **Contraste independiente cuando aporta valor:** Codex y, en etapas
+  anteriores, GitHub Copilot pueden realizar revisiones acotadas contra código
+  concreto. No son un paso obligatorio de cada cambio ni se emplean para
+  generar cadenas de agentes auditando los informes de otros agentes.
+- **Cierre por evidencias:** revisión de diffs, tests, sanitizers cuando
+  proceden y smoke físico para las funciones de audio; después,
+  documentación, commit y publicación controlados.
+
+Este reparto puede evolucionar. **No existe la regla de que Claude Code
+únicamente implemente y Codex audite siempre.** El criterio es elegir la
+herramienta adecuada para cada trabajo y evitar revisiones redundantes.
+
+Las decisiones de arquitectura y sus razones se registran en
+[`docs/decisions/`](docs/decisions/README.md); los informes de cada fase
+conservan las pruebas, limitaciones y resultados técnicos.
+
 ## Estado actual — 0.8.3
 
 0.8.3 se dedica a que grabar sea fiable: que una toma no se pierda, no se
@@ -47,7 +78,8 @@ Lo que ya está reforzado:
 
 - **supervisión de callbacks:** si el dispositivo deja de entregar audio sin
   avisar (por ejemplo, al dormir el Mac), la toma termina como fallida tras
-  al menos 1 s sin audio, en vez de quedarse bloqueada;
+  un umbral de ausencia de callbacks de al menos 1 s, adaptable al periodo
+  del dispositivo. Grabar silencio legítimo no provoca este fallo;
 - **pérdida de dispositivo:** la toma falla de forma segura, no se publica,
   y el material capturado se conserva para recuperación;
 - **estados de grabación atómicos:** cada transición es una operación atómica

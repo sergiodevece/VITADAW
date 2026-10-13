@@ -128,6 +128,12 @@ The following is the release contract to encode in tests before hardware work:
 4. Execute physical smoke tiers and record results per interface, aggregate,
    sample rate, buffer and storage target.
 
+> **Nota histórica del flujo de trabajo:** el siguiente prompt recoge una
+> propuesta inicial para GPT-5 mini / GitHub Copilot local durante 0.8.3-A.
+> Se conserva como evidencia del proceso seguido entonces; **no describe el
+> reparto actual de responsabilidades** ni obliga a utilizar Copilot o Codex
+> en las fases posteriores. Véase [Cómo desarrollamos VitaDAW](../README.md#cómo-desarrollamos-vitadaw).
+
 ## First implementation prompt (GPT-5 mini / local Copilot)
 
 > Work on VitaDAW 0.8.3-B foundation only. First read
