@@ -1,4 +1,148 @@
-# VitaDAW 0.8.2 — Media & Recovery Foundation
+# VitaDAW
+
+**Digital Audio Workstation — C++20 / JUCE**
+
+**Versión en desarrollo: 0.8.3 — Recording Reliability**
+
+**Última fase publicada: 0.8.3-C2 — Device Watchdog and Recording State Hardening**
+
+0.8.3 sigue abierta y todavía no tiene tag de cierre. El último hito cerrado y
+etiquetado es **0.8.2 — Media & Recovery Foundation**
+(`v0.8.2-media-recovery-foundation`). Es un hito de desarrollo, no una release
+estable para usuarios.
+
+## Qué es VitaDAW
+
+VitaDAW es una estación de trabajo de audio digital (DAW) nativa, en
+desarrollo. Está escrita en C++20 y usa JUCE como capa de aplicación y de
+integración con el sistema y los dispositivos de audio.
+
+Sus prioridades son:
+
+- **el audio primero:** un motor robusto, con reglas estrictas de tiempo real
+  (sin locks, memoria dinámica ni E/S en el callback de audio);
+- **separación entre Core e interfaz:** el núcleo no depende de JUCE y se
+  prueba sin hardware;
+- **un Command System** como única vía para modificar el proyecto;
+- **modularidad**, para crecer sin reescribir el dominio.
+
+## Estado actual — 0.8.3
+
+0.8.3 se dedica a que grabar sea fiable: que una toma no se pierda, no se
+corrompa en silencio y no deje la aplicación bloqueada cuando el dispositivo
+falla. Fases completadas y publicadas:
+
+- **0.8.3-A — Recording Reliability Audit:** auditoría del camino de grabación.
+- **0.8.3-B — Recording Endurance:** resistencia en tomas largas, medida de
+  forma determinista, con telemetría del buffer de captura.
+- **0.8.3-B2 — Physical Recording Service Diagnostics:** diagnóstico de la
+  latencia real del servicio de escritura, solo en builds de diagnóstico.
+- **0.8.3-C1 — Device Lifecycle & Reconfiguration Audit:** qué ocurre cuando
+  el dispositivo cambia, se detiene o desaparece durante una grabación.
+- **0.8.3-C2 — Callback Watchdog and Recording State Concurrency Hardening:**
+  tests de fallo de dispositivo con JUCE real, watchdog y protocolo de estados
+  de grabación.
+
+Lo que ya está reforzado:
+
+- **supervisión de callbacks:** si el dispositivo deja de entregar audio sin
+  avisar (por ejemplo, al dormir el Mac), la toma termina como fallida tras
+  al menos 1 s sin audio, en vez de quedarse bloqueada;
+- **pérdida de dispositivo:** la toma falla de forma segura, no se publica,
+  y el material capturado se conserva para recuperación;
+- **estados de grabación atómicos:** cada transición es una operación atómica
+  ligada a la sesión de la toma, y un fallo no puede perderse por un inicio
+  concurrente;
+- **protección contra órdenes antiguas:** una orden de una toma anterior no
+  puede iniciar ni cancelar una toma posterior;
+- **recuperación operativa:** tras un fallo se puede grabar de nuevo sin
+  reiniciar VitaDAW;
+- **instrumentación y tests de integridad** del camino de grabación.
+
+Siguen abiertos tres defectos conocidos (ver [Validación](#validación)) y la
+fase 0.8.3 continúa.
+
+## Capacidades implementadas
+
+- Ventana nativa y gestión observable del dispositivo de audio.
+- Proyecto con número variable de pistas de audio mono o estéreo, modelo
+  `AudioSource → AudioClip → AudioTrack` y edición no destructiva (Move,
+  Duplicate, Split, Trim, Delete, multiselección) con Undo/Redo.
+- Timeline visual con formas de onda, zoom, scroll, Time Selection y Snap.
+- Transporte Play/Pause/Stop/Seek, tempo y métrica, loop y metrónomo.
+- Mixer con gain, balance, mute y solo; buses, envíos (sends) pre/post y
+  routing entre buses validado como grafo sin ciclos.
+- Cadenas de inserts con un procesador interno de ganancia (todavía sin
+  plugins externos).
+- Grabación mono o estéreo sobre una pista armada, con input monitoring manual,
+  compensación de latencia documentada y validación por loopback físico.
+- Guardar y cargar proyectos (`.vitadaw`) de forma atómica.
+- APIs del núcleo, todavía sin interfaz, para render offline, exportación WAV
+  e inventario de artefactos de grabación y exportación.
+
+## Visión (todavía no implementada)
+
+Objetivos a largo plazo, **no disponibles hoy**:
+
+- alojamiento de plugins AU/VST e integración de VitaPlug;
+- routing más flexible;
+- MIDI avanzado;
+- control por voz.
+
+## Validación
+
+Batería de CTest de la fase 0.8.3-C2:
+
+| | |
+|---|---|
+| Tests registrados | 101 |
+| Línea base protegida | **98/98 PASS** |
+| Tests RED de caracterización | 3, fallan a propósito |
+| Tests históricos anteriores a 0.8.3-C | 60/60 PASS |
+| ASan + UBSan, TSan `-O0` y TSan `-O1` | sin avisos en las últimas baterías documentadas |
+
+Los tres RED describen contratos que VitaDAW todavía **no** cumple. Se
+mantienen visibles hasta corregirlos:
+
+- **H-1:** una discontinuidad temporal del dispositivo no se detecta.
+- **H-2:** un cambio externo de sample rate durante la grabación puede acabar
+  en una toma publicada incorrecta.
+- **R-2:** una interfaz que desaparece y vuelve no se reabre sin reiniciar
+  VitaDAW.
+
+Comandos en [Build actual](#build-actual).
+
+**Pruebas físicas** (MacBook Air, macOS, build de diagnóstico de 0.8.3-C2):
+grabación normal y Stop inmediato; estrés de la interfaz durante una grabación
+de dos minutos; buffer de 4096 frames; y reposo y despertar del Mac durante una
+grabación. En todas se observó el comportamiento esperado: sin frames perdidos
+en las tomas completas, sin falsos fallos del watchdog, la toma interrumpida por
+el reposo terminó como fallida sin publicarse, y la siguiente grabación funcionó
+sin reiniciar. Son observaciones de esas sesiones, no garantías generales; la
+recuperación del contenido parcial no está validada todavía. Detalles en
+[`docs/audit-recording-state-hardening-0.8.3C2-2b.md`](docs/audit-recording-state-hardening-0.8.3C2-2b.md) §12.
+
+Informes técnicos de 0.8.3:
+[auditoría](docs/audit-recording-reliability-0.8.3.md),
+[resistencia](docs/audit-recording-endurance-0.8.3B.md),
+[diagnóstico físico](docs/audit-recording-physical-latency-0.8.3B2.md),
+[ciclo de vida del dispositivo](docs/audit-recording-device-reconfiguration-0.8.3C1.md),
+[tests de fallo](docs/audit-recording-device-tests-0.8.3C2-1.md),
+[watchdog](docs/audit-recording-watchdog-0.8.3C2-2.md) y
+[estados de grabación](docs/audit-recording-state-hardening-0.8.3C2-2b.md).
+
+## Roadmap de 0.8.3
+
+1. Pruebas físicas pendientes de 0.8.3-C2 (toma larga, primer Record tras
+   arrancar, recuperación del contenido parcial).
+2. **C2-R2:** reabrir una interfaz reconectada (R-2).
+3. **C2-3:** telemetría de xruns.
+4. **C2-4:** continuidad temporal (H-1, H-2).
+
+Fuera de Recording Reliability queda pendiente, entre otras mejoras, poder
+activar el metrónomo durante Play o Record.
+
+## Historial de desarrollo
 
 Base arquitectónica para un DAW nativo de escritorio, construida de forma
 incremental. La aplicación actual abre una ventana nativa, inicializa y observa
@@ -944,6 +1088,9 @@ La arquitectura y las reglas de tiempo real se describen en
   artefactos de grabación/exportación sobre roots autorizados, clasificación por
   evidencia e identidad y diagnósticos parciales, sin operaciones de recuperación
   o borrado.
+- **0.8.3 — Recording Reliability (en desarrollo):** auditoría, resistencia,
+  diagnóstico físico, ciclo de vida del dispositivo, watchdog de callbacks y
+  protocolo atómico de estados de grabación (fases A a C2).
 
 Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validation-0.0.2.md),
 [`docs/validation-0.0.3.md`](docs/validation-0.0.3.md) y
