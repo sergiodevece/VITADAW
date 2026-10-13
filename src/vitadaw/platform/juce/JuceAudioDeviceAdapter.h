@@ -12,6 +12,7 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -253,6 +254,11 @@ private:
         const std::filesystem::path&, const audio::RecordingRecoveryMarker&,
         audio::RecordingRecoveryMarkerWriteOptions = {});
     [[nodiscard]] bool finalizeRecordingFile(std::string&) noexcept;
+    // M-1 / M-1b (0.8.3-C2-2, C2-2b): fails a prepared or capturing take whose
+    // callbacks have stopped. Message thread only; reads lock-free capture
+    // state, and writes RT-shared state only through the capture's
+    // session-scoped terminal CAS (failRecording).
+    void superviseRecordingCallbacks() noexcept;
     [[nodiscard]] bool commitPreparedProject(
         std::unique_ptr<PreparedProject>& candidate,
         audio::AudioFileCommitAction modelCommit,
@@ -295,6 +301,17 @@ private:
     std::uint64_t nextRecordingTemporaryNonce_{1};
     std::uint64_t nextExportTemporaryNonce_{1};
     bool recordingWriterFailed_{};
+    // Last observed progress of the active take: its session, its phase
+    // (prepared until the first callback begins it), its accepted-frame count,
+    // and when that combination was first seen. Message thread only; re-armed
+    // by any change of session, phase or count.
+    struct RecordingCallbackWatchdog {
+        audio::RecordingSessionId session{};
+        audio::RecordingPhase phase{audio::RecordingPhase::idle};
+        std::uint64_t acceptedFrames{};
+        std::chrono::steady_clock::time_point progressObserved{};
+    };
+    RecordingCallbackWatchdog recordingCallbackWatchdog_;
     std::string recordingWriterError_;
     std::string recordingRecoverySessionId_;
     std::filesystem::path recordingRecoveryDirectory_;

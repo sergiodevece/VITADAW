@@ -67,6 +67,9 @@ enum class RecordingFailure : std::uint8_t {
     writerFailed,
     finalizationFailed,
     shutdown,
+    // The device stopped delivering callbacks during a take without any
+    // lifecycle notification (0.8.3-C2-2 watchdog, finding M-1).
+    deviceStalled,
 };
 
 // These values describe retained media only.  They are deliberately not an

@@ -317,6 +317,7 @@ private:
     case audio::RecordingFailure::writerFailed: return "writerFailed";
     case audio::RecordingFailure::finalizationFailed: return "finalizationFailed";
     case audio::RecordingFailure::shutdown: return "shutdown";
+    case audio::RecordingFailure::deviceStalled: return "deviceStalled";
     }
     return "?";
 }

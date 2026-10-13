@@ -107,6 +107,8 @@ const char* recordingFailureMessage(audio::RecordingFailure failure) noexcept {
         return "Recording could not be finalized";
     case Failure::shutdown:
         return "Recording cancelled during application shutdown";
+    case Failure::deviceStalled:
+        return "Recording stopped because the audio device stopped delivering audio";
     case Failure::none:
         return "Recording failed";
     }

@@ -640,24 +640,27 @@ AudioControlRequestResult RealtimeAudioEngine::tryRequestRecord(
 }
 
 bool RealtimeAudioEngine::tryCancelRecording() noexcept {
-    if (capture_.isPrepared()) {
-        capture_.cancel();
-        return true;
-    }
+    const auto session = capture_.activeSession();
+    if (session == 0) return false;
+    // A take that has not begun is cancelled directly. If the callback begins
+    // it concurrently, the session-scoped CAS still terminalizes that session.
+    if (capture_.isPrepared())
+        return capture_.failSession(session, RecordingFailure::cancelled);
     if (!capture_.isCapturing()) return false;
-    return enqueue(CommandType::cancelRecord).accepted;
+    // A capturing take is cancelled by the callback, which also stops the
+    // clock. The command names its session, so it cannot cancel a later take.
+    RecordingRequest cancelled;
+    cancelled.session = session;
+    return enqueue(CommandType::cancelRecord, {}, 0.0F, cancelled).accepted;
 }
 
 bool RealtimeAudioEngine::failRecording(RecordingSessionId session,
                                         RecordingFailure reason) noexcept {
-    // Writer failures occur on the non-RT service thread.  They must terminalize
-    // the same capture directly rather than depending on command-queue space.
-    const auto snapshot = capture_.snapshot();
-    if (session == 0 || snapshot.session != session ||
-        (snapshot.phase != RecordingPhase::prepared &&
-         snapshot.phase != RecordingPhase::capturing)) return false;
-    capture_.fail(reason);
-    return true;
+    // Writer failures and the callback watchdog act on the non-RT service
+    // thread. They terminalize the named session directly, without depending on
+    // command-queue space, and a single CAS makes the session check and the
+    // transition one atomic step.
+    return capture_.failSession(session, reason);
 }
 
 RecordingSnapshot RealtimeAudioEngine::recordingSnapshot() const noexcept {
@@ -709,10 +712,12 @@ void RealtimeAudioEngine::processBlock(ConstAudioBlockView input,
     }
     consumeMonitorGain(deviceSampleRate);
 
-    const auto captureState = capture_.snapshot();
-    if (captureState.phase == RecordingPhase::capturing &&
-        captureState.deviceSampleRate != deviceSampleRate) {
-        capture_.fail(RecordingFailure::sampleRateChanged);
+    // Lock-free reads; the callback never takes a capture snapshot, whose
+    // request metadata belongs to the control thread (0.8.3-C2-2b, C-1). The
+    // rate failure names the session observed capturing.
+    const auto capturing = capture_.capturingSession();
+    if (capturing != 0 && capture_.capturingSampleRate() != deviceSampleRate) {
+        static_cast<void>(capture_.failSession(capturing, RecordingFailure::sampleRateChanged));
     } else {
         capture_.capture(input);
     }
@@ -1556,12 +1561,24 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
             } else if (queued.type == CommandType::play) {
                 static_cast<void>(clock_.play());
             } else if (queued.type == CommandType::beginRecord) {
+                // begin() succeeds only for the session prepared right now. A
+                // rejected command (stale, cancelled, failed, cleaned up, or
+                // for another session) changes neither the capture nor the
+                // transport; the control side observes it through the
+                // transport snapshot and the capture phase.
                 if (capture_.begin(queued.recording, clock_.publicPosition(),
                                    processingFormat_.sampleRate)) {
                     static_cast<void>(clock_.record());
                 }
             } else if (queued.type == CommandType::cancelRecord) {
-                capture_.cancel();
+                // The capture cancel names its session, so a stale cancel
+                // cannot terminalize a later take. The transport stop is
+                // unconditional, as before: the projection already replayed
+                // this command as a stop, and in FIFO order a later take can
+                // at most be prepared here (its beginRecord was enqueued after
+                // this command).
+                static_cast<void>(capture_.failSession(queued.recording.session,
+                                                       RecordingFailure::cancelled));
                 clock_.stop();
                 clock_.setPlaybackPolicy(std::nullopt, metronomeEnabled_);
                 resetProcessors();

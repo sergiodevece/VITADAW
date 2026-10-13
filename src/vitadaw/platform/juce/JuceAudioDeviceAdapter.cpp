@@ -48,6 +48,30 @@ namespace {
 // would change only the interpretation of a diagnostic counter.
 constexpr double expectedRecordingServiceRateHz = 30.0;
 
+// Callback-absence threshold for a capturing take (finding M-1, 0.8.3-C2-2).
+// The watchdog compares the producer's accepted-frame count between two
+// message-thread observations, so it can only fire after a REAL callback gap
+// at least this long; a late message thread delays detection but cannot cause
+// it. The 1 s floor keeps it far above callback jitter and short scheduling
+// hiccups, which are continuity questions for C2-4 rather than liveness; ten
+// device periods keep very large buffers (e.g. 8192 frames at 44.1 kHz,
+// 186 ms per callback) from tripping it.
+constexpr std::chrono::milliseconds recordingCallbackStallFloor{1000};
+constexpr double recordingCallbackStallPeriods = 10.0;
+
+std::chrono::steady_clock::duration recordingCallbackStallTimeout(
+    const audio::RecordingSnapshot& capture) noexcept {
+    // The preflight's device rate: known in "prepared", before begin() records
+    // the rate the take actually starts with.
+    const auto rate = capture.placement.deviceSampleRate.hertz();
+    const auto frames = static_cast<double>(capture.placement.deviceBufferFrames);
+    const std::chrono::steady_clock::duration floor = recordingCallbackStallFloor;
+    if (!(rate > 0.0) || !(frames > 0.0)) return floor;
+    const auto periods = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(recordingCallbackStallPeriods * frames / rate));
+    return std::max(floor, periods);
+}
+
 #if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
 void logRecordingServiceDiagnostics(const juce::String& message) {
     juce::Logger::writeToLog("[VitaDAW recording diagnostics] " + message);
@@ -2214,6 +2238,7 @@ void JuceAudioDeviceAdapter::serviceRecording() noexcept {
 #if defined(VITADAW_RECORDING_SERVICE_DIAGNOSTICS)
     observeRecordingService(snapshot);
 #endif
+    superviseRecordingCallbacks();
     const auto channels = static_cast<int>(media::channelCount(snapshot.layout));
     if (channels < 1 || channels > recordingDrainBuffer_.getNumChannels()) return;
     std::array<float*, 2> output{};
@@ -2237,6 +2262,37 @@ void JuceAudioDeviceAdapter::serviceRecording() noexcept {
     if (recordingWriterFailed_ && snapshot.phase == audio::RecordingPhase::capturing)
         static_cast<void>(realtimeEngine_.failRecording(
             snapshot.session, audio::RecordingFailure::writerFailed));
+}
+
+void JuceAudioDeviceAdapter::superviseRecordingCallbacks() noexcept {
+    // A fresh read (a development stall may have run since this pass began).
+    // Race-free in every phase since 0.8.3-C2-2b: request metadata is written
+    // only by this thread, and what the callback also writes or reads is atomic.
+    const auto capture = realtimeEngine_.recordingSnapshot();
+    auto& watchdog = recordingCallbackWatchdog_;
+    if (capture.phase != audio::RecordingPhase::prepared &&
+        capture.phase != audio::RecordingPhase::capturing) {
+        watchdog = {};
+        return;
+    }
+    // Progress is any change of session, of phase (a prepared take is begun by
+    // its first callback; no frame exists before that), or of accepted frames.
+    // The deadline therefore starts at the first observation of a prepared
+    // take, and again at every observed progress.
+    const auto now = std::chrono::steady_clock::now();
+    if (watchdog.session != capture.session || watchdog.phase != capture.phase ||
+        watchdog.acceptedFrames != capture.acceptedDeviceFrames.value) {
+        watchdog = {capture.session, capture.phase, capture.acceptedDeviceFrames.value, now};
+        return;
+    }
+    if (now - watchdog.progressObserved < recordingCallbackStallTimeout(capture)) return;
+    // Session-scoped terminal CAS: it acts only on this session, and only if it
+    // is still active. If Stop, overflow, a cancel or a device event got there
+    // first, it has no effect; a begin() still in progress on the callback
+    // loses its publication and the take stays failed.
+    static_cast<void>(realtimeEngine_.failRecording(
+        capture.session, audio::RecordingFailure::deviceStalled));
+    watchdog = {};
 }
 
 audio::RecordingSnapshot JuceAudioDeviceAdapter::recordingSnapshot() const noexcept {

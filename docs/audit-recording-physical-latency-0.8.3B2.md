@@ -407,3 +407,11 @@ were observed during the smoke and are unrelated to recording reliability.
 | **UI-1** | Clips visually overlap neighbouring tracks while the timeline is scrolled. |
 | **UI-2** | A double Stop returns the playhead to zero but does not scroll the arrange viewport back to zero. |
 
+
+Added during the 0.8.3-C consolidation (not fixed; outside Recording
+Reliability):
+
+| ID | Priority | Issue |
+|---|---|---|
+| **UX-METRONOME-LIVE** | High (product) | The metronome cannot be switched on or off during Play or Record. Required contract: switch in real time while playing and recording; without stopping the transport or restarting the take; without introducing clicks or discontinuities; without altering the recorded input; through the Command System |
+| **UX-LOOPBACK-STATUS** | Low | The loopback panel shows the test `Completed` while the bottom line still reads "Physical loopback latency test started". Verified: that line (`MainWindow` `resultLabel_`) shows the result of the last command, and the start command's acceptance text (`DawApplication.cpp`) is never replaced on completion. A stale command-result message, not a wrong test state |

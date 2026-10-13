@@ -531,8 +531,19 @@ La integración técnica de JUCE no debe interpretarse como esa decisión.
 ```sh
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -LE characterization-red
 ```
+
+La línea base protegida es la de arriba: debe pasar al 100 %. Las pruebas con la
+etiqueta `characterization-red` son contratos de VitaDAW 0.8.3 que todavía no se
+cumplen (H-1, H-2, R-2). Fallan a propósito con `CONTRACT VIOLATED` y código 3
+hasta que se corrijan, y se ejecutan de forma explícita:
+
+```sh
+ctest --test-dir build --output-on-failure -L characterization-red
+```
+
+Un `ctest` sin filtro ejecuta ambas y termina con esos tres fallos esperados.
 
 La primera configuración descarga JUCE 9.0.2 si no está instalado. Para
 compilar únicamente el núcleo y sus tests, sin JUCE:

@@ -149,6 +149,8 @@ public:
         RecordingRequest) noexcept;
     [[nodiscard]] bool tryCancelRecording() noexcept;
     [[nodiscard]] bool failRecording(RecordingSessionId, RecordingFailure) noexcept;
+    // Control thread only: the snapshot reads request metadata that the control
+    // thread itself writes. The callback uses lock-free capture accessors.
     [[nodiscard]] RecordingSnapshot recordingSnapshot() const noexcept;
     [[nodiscard]] RecordingCaptureTelemetry recordingTelemetry() const noexcept;
     // Non-RT: the nominal frame distance between two writer service calls.

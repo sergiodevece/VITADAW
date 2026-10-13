@@ -231,8 +231,9 @@ void concurrentProducerConsumer() {
     constexpr std::size_t frameCount = 20000;
     audio::RealtimeCapture capture;
     check(capture.prepare(frameCount), "concurrent SPSC ring prepared");
-    check(capture.begin({42, {8}, media::AudioChannelLayout::mono},
-                        {31}, timeline::SampleRate{48000}),
+    const audio::RecordingRequest concurrentRequest{42, {8}, media::AudioChannelLayout::mono};
+    check(capture.prepareRequest(concurrentRequest) &&
+              capture.begin(concurrentRequest, {31}, timeline::SampleRate{48000}),
           "concurrent SPSC session begins");
     std::thread producer([&] {
         std::array<float, 37> block{};
@@ -312,8 +313,9 @@ void preparedLifecycleAndTerminalConsistency() {
     }
     {
         audio::RealtimeCapture capture;
-        check(capture.prepare(8) && capture.begin(
-                  {64, {8}, media::AudioChannelLayout::mono}, {}, timeline::SampleRate{48000}),
+        const audio::RecordingRequest stopRace{64, {8}, media::AudioChannelLayout::mono};
+        check(capture.prepare(8) && capture.prepareRequest(stopRace) &&
+                  capture.begin(stopRace, {}, timeline::SampleRate{48000}),
               "terminal-race fixture begins");
         capture.stop();
         capture.fail(audio::RecordingFailure::deviceLost);
@@ -322,8 +324,9 @@ void preparedLifecycleAndTerminalConsistency() {
                   stopWins.failure == audio::RecordingFailure::none,
               "Stop wins terminal CAS without a stale failure reason");
         capture.reset();
-        check(capture.prepare(8) && capture.begin(
-                  {65, {8}, media::AudioChannelLayout::mono}, {}, timeline::SampleRate{48000}),
+        const audio::RecordingRequest failRace{65, {8}, media::AudioChannelLayout::mono};
+        check(capture.prepare(8) && capture.prepareRequest(failRace) &&
+                  capture.begin(failRace, {}, timeline::SampleRate{48000}),
               "failure-wins fixture begins");
         capture.fail(audio::RecordingFailure::deviceLost);
         capture.stop();

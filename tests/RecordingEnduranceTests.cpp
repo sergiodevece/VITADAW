@@ -749,7 +749,7 @@ public:
     }
     audio::AudioControlRequestResult tryRequestRecord(
         audio::RecordingRequest request) noexcept override {
-        if (request.session != prepared.session ||
+        if (request.session != prepared.session || !capture.prepareRequest(request) ||
             !capture.begin(request, transport.position, deviceRate)) return {};
         return result(transport::PlaybackState::playing, transport.position);
     }

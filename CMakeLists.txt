@@ -222,6 +222,69 @@ if(VITADAW_BUILD_TESTS)
             juce::juce_audio_devices)
         add_test(NAME vitadaw_juce_recording_input_setup_policy_tests
             COMMAND vitadaw_juce_recording_input_setup_policy_tests)
+        # 0.8.3-C2-1 device-failure characterization: one CTest per case.
+        # RED cases reproduce defects from audit 0.8.3-C1 and exit 3 until the
+        # matching C2 change lands; run the green baseline with
+        # `ctest -LE characterization-red`.
+        add_executable(vitadaw_recording_device_failure_tests
+            tests/RecordingDeviceFailureTests.cpp
+            src/vitadaw/platform/juce/JuceAudioDeviceAdapter.cpp)
+        target_link_libraries(vitadaw_recording_device_failure_tests PRIVATE vitadaw_core
+            juce::juce_audio_devices juce::juce_audio_formats)
+        target_compile_definitions(vitadaw_recording_device_failure_tests PRIVATE
+            JUCE_USE_FLAC=0 JUCE_USE_MP3AUDIOFORMAT=0 JUCE_USE_OGGVORBIS=0 JUCE_USE_CURL=0)
+        foreach(case
+                t1_device_stop_fails_take_and_recovers
+                t2a_juce_drops_device_errors
+                t2b_direct_error_path_is_fail_safe
+                t3_restart_fails_take_without_silent_continuation
+                t4_divergence_fails_before_reprepare
+                t5_buffer_change_rejected_while_capturing
+                t8_device_loss_during_finalization
+                c_rate_window_then_restart_fails_take
+                e_suspected_xruns_do_not_abort
+                e_missing_host_time_is_not_a_failure
+                f_interface_loss_fails_take_and_leaves_no_device
+                g1_stop_then_device_loss_publishes
+                g2_device_loss_before_stop_is_consumed
+                g3_overflow_then_device_loss
+                g4_stop_pending_then_restart
+                m1_stop_pending_stall_fails_take
+                m1_sustained_stall_fails_take
+                m1_cancel_pending_stall_fails_take
+                m1_continuous_callbacks_never_trip
+                m1_silent_input_is_not_a_stall
+                m1_message_thread_delay_with_live_callbacks
+                m1_late_callback_rearms_watchdog
+                m1_concurrent_callbacks_then_stall
+                m1_overflow_wins_over_watchdog
+                m1_watchdog_and_stop_notification
+                m1_shutdown_during_stall
+                m1_device_resumes_after_stall_failure
+                m1_short_pause_is_left_to_continuity_checks
+                # 0.8.3-C2-2b: M-1b and P-1 (formerly RED), C-1 (formerly
+                # labelled characterization-tsan; clean under ThreadSanitizer).
+                m1b_prepared_stall_terminalizes
+                p1_stale_begin_cannot_revive_cleaned_session
+                c1_prepared_transition_under_concurrency
+                m1b_prepared_stall_without_commands
+                m1b_first_callback_rearms_watchdog
+                m1b_slow_first_callback_is_not_a_stall
+                m1b_device_resumes_after_prepared_failure
+                stop_before_first_callback_leaves_nothing
+                cycles_of_failure_and_recovery)
+            add_test(NAME vitadaw_device_failure_${case}
+                COMMAND vitadaw_recording_device_failure_tests ${case})
+        endforeach()
+        foreach(case
+                red_h2_stop_inside_rate_window
+                red_h1_host_time_gap
+                red_r2_reconnected_interface_unusable)
+            add_test(NAME vitadaw_device_failure_${case}
+                COMMAND vitadaw_recording_device_failure_tests ${case})
+            set_tests_properties(vitadaw_device_failure_${case} PROPERTIES
+                LABELS characterization-red)
+        endforeach()
         add_executable(vitadaw_recording_service_diagnostics_tests
             tests/RecordingServiceDiagnosticsTests.cpp)
         target_link_libraries(vitadaw_recording_service_diagnostics_tests PRIVATE vitadaw_core)
@@ -332,6 +395,10 @@ if(VITADAW_BUILD_TESTS)
     add_executable(vitadaw_recording_capture_tests tests/RecordingCaptureTests.cpp)
     target_link_libraries(vitadaw_recording_capture_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_recording_capture_tests COMMAND vitadaw_recording_capture_tests)
+    add_executable(vitadaw_recording_state_protocol_tests tests/RecordingStateProtocolTests.cpp)
+    target_link_libraries(vitadaw_recording_state_protocol_tests PRIVATE vitadaw_core)
+    add_test(NAME vitadaw_recording_state_protocol_tests
+        COMMAND vitadaw_recording_state_protocol_tests)
     add_executable(vitadaw_recording_application_tests tests/RecordingApplicationTests.cpp)
     target_link_libraries(vitadaw_recording_application_tests PRIVATE vitadaw_core)
     add_test(NAME vitadaw_recording_application_tests COMMAND vitadaw_recording_application_tests)
