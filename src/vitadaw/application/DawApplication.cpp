@@ -174,6 +174,7 @@ commands::CommandResult DawApplication::handle(const commands::Command& command)
             !std::holds_alternative<Stop>(command) &&
             !std::holds_alternative<Record>(command) &&
             !std::holds_alternative<CancelRecording>(command) &&
+            !std::holds_alternative<SetMetronomeEnabled>(command) &&
             !std::holds_alternative<EnableInputMonitoring>(command) &&
             !std::holds_alternative<DisableInputMonitoring>(command) &&
             !std::holds_alternative<ToggleInputMonitoring>(command) &&

@@ -1,9 +1,12 @@
 #include "vitadaw/platform/juce/JuceAudioDeviceAdapter.h"
 #include "vitadaw/application/DawApplication.h"
+#include "vitadaw/commands/CommandDispatcher.h"
 #include "vitadaw/persistence/ProjectPersistence.h"
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <array>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
@@ -181,12 +184,16 @@ public:
     }
     // Drives the production audio callback exactly as the device would. The
     // virtual device has no thread, so this is the only callback source.
-    static void callback(JuceAudioDeviceAdapter& adapter, const float* input, int frames) {
+    static float callback(JuceAudioDeviceAdapter& adapter, const float* input, int frames) {
         std::array<float, 256> left{}, right{};
         std::array<float*, 2> output{left.data(), right.data()};
         const std::array<const float*, 1> inputs{input};
         adapter.audioDeviceIOCallbackWithContext(inputs.data(), 1, output.data(), 2, frames,
                                                  juce::AudioIODeviceCallbackContext{});
+        float peak{};
+        for (int frame = 0; frame < frames; ++frame)
+            peak = std::max(peak, std::abs(left[static_cast<std::size_t>(frame)]));
+        return peak;
     }
     static audio::RecordingCaptureTelemetry recordingTelemetry(
         const JuceAudioDeviceAdapter& adapter) {
@@ -363,8 +370,112 @@ void recordingRecoversAfterOverflow() {
     check(dir.deleteRecursively(), "overflow recovery: remove own temporary files");
 }
 
+void metronomeHotToggleRecordingIsolation() {
+    using Access = platform::juce_adapter::PersistenceIntegrationAccess;
+    constexpr int blockFrames = 256;
+    constexpr int blocks = 240;
+    for (const bool monitoring : {false, true}) {
+        const auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+            .getNonexistentChildFile("vitadaw-metronome-isolation", "", false);
+        check(dir.createDirectory().wasOk(), "hot toggle temporary directory");
+        const auto projectPath = std::filesystem::path{
+            dir.getChildFile("hot.vitadaw").getFullPathName().toStdString()};
+        platform::juce_adapter::JuceAudioDeviceAdapter adapter;
+        check(Access::configureHardwareFreeRecordingDevice(adapter),
+              "hot toggle virtual device starts");
+        application::DawApplication app{adapter, timeline::SampleRate{48000}};
+        commands::CommandDispatcher dispatcher{app};
+        const auto accepted = [&](commands::Command command) {
+            return dispatcher.dispatch(command).status == commands::CommandStatus::accepted;
+        };
+        check(accepted(commands::AddAudioTrack{"Hot toggle"}) &&
+                  accepted(commands::SaveProjectAs{projectPath}) &&
+                  accepted(commands::SetTrackRecordArmed{{1}, true}) &&
+                  accepted(commands::SetMonitorGain{{0.0F}}),
+              "hot toggle saved armed fixture");
+        if (monitoring) check(accepted(commands::EnableInputMonitoring{}), "manual Monitoring ON");
+        std::array<float, blockFrames> input{};
+        Access::callback(adapter, input.data(), blockFrames);
+        app.synchroniseTransport();
+        check(accepted(commands::Record{}), "hot toggle Record starts OFF");
+        const auto prepared = adapter.recordingSnapshot();
+        const auto historyToken = app.history().currentStateToken();
+        bool metronome{};
+        bool heardClick{};
+        for (int block = 0; block < blocks; ++block) {
+            const bool toggle = block == 80 || block == 94 || block == 180 || block == 188;
+            if (toggle) {
+                const auto before = adapter.recordingSnapshot();
+                const auto position = app.transport().position;
+                const auto telemetry = Access::recordingTelemetry(adapter);
+                metronome = !metronome;
+                check(accepted(commands::SetMetronomeEnabled{metronome}),
+                      "metronome command admitted during Recording");
+                check(adapter.recordingSnapshot().session == before.session &&
+                          adapter.recordingSnapshot().phase == before.phase &&
+                          Access::recordingTelemetry(adapter).producedFrames == telemetry.producedFrames &&
+                          app.transport().position == position,
+                      "queued toggle changes neither capture nor transport position");
+            }
+            // Exact dyadic input, alternating silence and a known signal. At
+            // the beat blocks input is silent, making output click energy an
+            // unambiguous witness even with Monitoring manually ON.
+            for (int frame = 0; frame < blockFrames; ++frame) {
+                const auto absolute = static_cast<std::size_t>(block * blockFrames + frame);
+                input[static_cast<std::size_t>(frame)] = block >= 90 && block <= 95
+                    ? 0.0F : overflowPattern(absolute, false);
+            }
+            realtimeAllocations = 0;
+            countRealtimeAllocations = true;
+            const auto outputPeak = Access::callback(adapter, input.data(), blockFrames);
+            countRealtimeAllocations = false;
+            check(realtimeAllocations == 0, "recording hot toggle callback allocates nothing");
+            if (block >= 90 && block <= 95 && outputPeak > 0.001F) heardClick = true;
+            app.synchroniseTransport(); // existing writer service; no stall injection
+            const auto capture = adapter.recordingSnapshot();
+            check(capture.phase == audio::RecordingPhase::capturing &&
+                      capture.failure == audio::RecordingFailure::none &&
+                      capture.session == prepared.session && capture.track == prepared.track &&
+                      capture.projectStart.value == 0 &&
+                      capture.placement.projectSampleRate == prepared.placement.projectSampleRate &&
+                      capture.placement.deviceSampleRate == prepared.placement.deviceSampleRate &&
+                      capture.placement.manualOffsetProjectFrames == prepared.placement.manualOffsetProjectFrames &&
+                      capture.placement.effectiveCompensationProjectFrames == prepared.placement.effectiveCompensationProjectFrames &&
+                      capture.acceptedDeviceFrames.value == static_cast<std::uint64_t>((block + 1) * blockFrames),
+                  "same take/placement captures every frame through ON/OFF");
+            check(app.transport().playback == transport::PlaybackState::playing &&
+                      app.transport().position.value == (block + 1) * blockFrames &&
+                      app.metronomeEnabled() == metronome &&
+                      app.inputMonitoringEnabled() == monitoring &&
+                      app.armedTrack() == tracks::TrackId{1} &&
+                      app.history().currentStateToken() == historyToken && !app.session().dirty(),
+                  "hot toggle preserves time, manual Monitoring, arm and document state");
+        }
+        const auto telemetry = Access::recordingTelemetry(adapter);
+        check(heardClick && telemetry.droppedFrames == 0 && telemetry.overflowEvents == 0 &&
+                  telemetry.producedFrames == blocks * blockFrames,
+              "click reaches output while capture has zero drops or overflow");
+        check(accepted(commands::Stop{}), "hot toggle take Stop");
+        Access::callback(adapter, input.data(), blockFrames);
+        app.synchroniseTransport();
+        check(app.recordingPhase() == audio::RecordingPhase::complete &&
+                  app.inputMonitoringEnabled() == monitoring,
+              "take finalizes with manual Monitoring unchanged");
+        const auto recorded = readMonoWav(projectPath.parent_path() / "hot Audio" / "Recording 000001.wav");
+        check(recorded.size() == blocks * blockFrames, "hot toggle WAV length is exact");
+        for (std::size_t frame = 0; frame < recorded.size(); ++frame) {
+            const auto block = frame / blockFrames;
+            const auto expected = block >= 90 && block <= 95 ? 0.0F : overflowPattern(frame, false);
+            check(recorded[frame] == expected, "WAV equals raw input exactly, with no metronome energy");
+        }
+        adapter.shutdown();
+        check(dir.deleteRecursively(), "remove only hot toggle test-owned temporary files");
+    }
+}
+
 int main(){
     using namespace vitadaw;
+    metronomeHotToggleRecordingIsolation();
     recordingRecoversAfterOverflow();
     const auto dir=juce::File::getSpecialLocation(juce::File::tempDirectory).getNonexistentChildFile("vitadaw-media", "",false);
     check(dir.createDirectory().wasOk(),"temporary directory");

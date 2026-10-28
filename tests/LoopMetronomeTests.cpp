@@ -12,6 +12,7 @@
 #include <limits>
 #include <new>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1219,6 +1220,129 @@ void metronomeTransportAndLevelMatrix() {
           "metronome levels -100/-12/0 use the prepared gain contract");
 }
 
+void metronomeHotToggleContinuity() {
+    // Real prepared click tables, not diagnostic impulses: OFF inside a tick
+    // must preserve its entire natural envelope, sample for sample.
+    for (const auto rate : {44100.0, 48000.0, 96000.0}) {
+        const auto beat = static_cast<std::size_t>(rate / 2.0); // 120 BPM
+        auto temporal = audio::prepareTemporalContext({}, std::nullopt,
+            timeline::SampleRate{rate}, timeline::SampleRate{rate}, 78);
+        check(temporal.success(), "hot toggle context prepares");
+        const auto tail = temporal.prepared->clicks.frameCount;
+        const auto frames = 2 * beat + tail + 32;
+        const auto reference = renderMetronomeGrid({}, rate, frames, {}, false);
+        std::vector<float> source(frames, 0.125F);
+        const audio::PreparedTrackView track{{1}, {{source.data(), nullptr}}, 1,
+            {static_cast<std::uint64_t>(frames)}, timeline::SampleRate{rate}, {0},
+            {static_cast<std::int64_t>(frames)}, {0}, {}};
+        for (const auto cut : {std::size_t{1}, std::size_t{17}, tail - 1}) {
+            audio::RealtimeAudioEngine engine;
+            engine.configure({timeline::SampleRate{rate},
+                {static_cast<std::int64_t>(frames)},
+                std::span<const audio::PreparedTrackView>{&track, 1}});
+            check(engine.configureTemporalContext(temporal.prepared.get()),
+                  "hot toggle context configures");
+            enterOperational(engine, rate);
+            check(engine.trySetMetronomeLevel({0.0F}).accepted,
+                  "hot toggle unity level");
+            std::vector<float> settle(512), settleRight(512), empty;
+            process(engine, settle, settleRight, rate);
+            check(engine.tryRequestPlay().accepted, "hot toggle Play starts OFF");
+            std::vector<float> left(frames), right(frames);
+            const auto enableAt = beat / 2;
+            processRange(engine, left, right, 0, enableAt, rate);
+            const auto backing = left[enableAt - 1];
+            check(backing > 0.0F, "backing audio plays before hot toggle");
+            check(!engine.transportSnapshot().metronomeEnabled &&
+                      engine.transportSnapshot().position.value ==
+                          static_cast<std::int64_t>(enableAt),
+                  "Play advances with metronome initially OFF");
+            check(engine.trySetMetronomeEnabled(true).accepted,
+                  "ON accepted during Play");
+            const auto allocationsBefore = realtimeAllocations.load();
+            countRealtimeAllocations = true;
+            process(engine, empty, empty, rate); // apply without advancing time
+            countRealtimeAllocations = false;
+            check(engine.transportSnapshot().metronomeEnabled &&
+                      engine.transportSnapshot().position.value ==
+                          static_cast<std::int64_t>(enableAt),
+                  "ON applies without moving the playhead");
+            const auto disableAt = beat + cut;
+            countRealtimeAllocations = true;
+            processRange(engine, left, right, enableAt, disableAt - enableAt, rate);
+            countRealtimeAllocations = false;
+            check(engine.trySetMetronomeEnabled(false).accepted,
+                  "OFF accepted inside an active tick");
+            countRealtimeAllocations = true;
+            process(engine, empty, empty, rate);
+            countRealtimeAllocations = false;
+            const auto off = engine.transportSnapshot();
+            check(!off.metronomeEnabled && off.playback == transport::PlaybackState::playing &&
+                      off.position.value == static_cast<std::int64_t>(disableAt),
+                  "OFF applies without stopping or moving time");
+            countRealtimeAllocations = true;
+            processRange(engine, left, right, disableAt, frames - disableAt, rate);
+            countRealtimeAllocations = false;
+            check(realtimeAllocations.load() == allocationsBefore,
+                  "hot toggle processing performs zero allocations");
+            for (std::size_t frame = 0; frame < frames; ++frame) {
+                const auto expected = backing + (frame >= beat && frame < beat + tail
+                    ? reference.left[frame] : 0.0F);
+                check(left[frame] == expected && right[frame] == expected,
+                      "ON waits for exact beat; OFF finishes tick unchanged and schedules no more");
+            }
+            check(engine.transportSnapshot().playback == transport::PlaybackState::playing &&
+                      engine.transportSnapshot().position.value == static_cast<std::int64_t>(frames),
+                  "hot toggles preserve monotonic uninterrupted playback");
+        }
+    }
+}
+
+void metronomeConcurrentHotToggle() {
+    auto temporal = audio::prepareTemporalContext({}, std::nullopt,
+        timeline::SampleRate{48000}, timeline::SampleRate{48000}, 79);
+    check(temporal.success(), "concurrent hot toggle context prepares");
+    audio::RealtimeAudioEngine engine;
+    engine.configure({timeline::SampleRate{48000}, {0},
+                      std::span<const audio::PreparedTrackView>{}});
+    check(engine.configureTemporalContext(temporal.prepared.get()),
+          "concurrent hot toggle context configures");
+    enterOperational(engine, 48000);
+    check(engine.trySetMetronomeEnabled(true).accepted && engine.tryRequestPlay().accepted,
+          "concurrent hot toggle starts open playback");
+    std::vector<float> left(64), right(64);
+    std::atomic<bool> start{};
+    std::thread audioThread([&] {
+        while (!start.load(std::memory_order_acquire)) {}
+        for (int block = 0; block < 2000; ++block)
+            process(engine, left, right, 48000);
+    });
+    start.store(true, std::memory_order_release);
+    std::size_t accepted{};
+    std::int64_t previousPosition{};
+    for (int command = 0; command < 2000; ++command) {
+        accepted += engine.trySetMetronomeEnabled(command % 2 == 0).accepted ? 1 : 0;
+        // The transport exchange has one non-RT reader, just like production.
+        const auto state = engine.transportSnapshot();
+        check(state.position.value >= previousPosition && !state.monitoringEnabled &&
+                  (state.position.value == 0 || state.playback == transport::PlaybackState::playing),
+              "concurrent metronome commands never reset time or Monitoring");
+        previousPosition = state.position.value;
+    }
+    audioThread.join();
+    // Queue saturation is allowed; no retry loop or timing assumption. Drain
+    // once after joining and prove a final command reaches the same consumer.
+    std::vector<float> empty;
+    process(engine, empty, empty, 48000);
+    check(accepted > 0 && engine.trySetMetronomeEnabled(false).accepted,
+          "concurrent delivery accepts commands and recovers queue capacity");
+    process(engine, empty, empty, 48000);
+    check(!engine.transportSnapshot().metronomeEnabled &&
+              engine.transportSnapshot().position.value == 128000 &&
+              engine.transportSnapshot().playback == transport::PlaybackState::playing,
+          "final OFF applies after concurrent delivery without moving the playhead");
+}
+
 void metronomeLargeAndDensePreparation() {
     musical::MusicalTimeMap dense;
     dense.tempo.events.clear();
@@ -1315,6 +1439,8 @@ int main() {
     pauseResumeMetronomeContract();
     loopBoundaryMetronomeMatrix();
     metronomeTransportAndLevelMatrix();
+    metronomeHotToggleContinuity();
+    metronomeConcurrentHotToggle();
     metronomeLargeAndDensePreparation();
     std::cout << "Loop and metronome tests passed\n";
 }

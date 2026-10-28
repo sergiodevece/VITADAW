@@ -1549,8 +1549,8 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
             } else if (queued.type == CommandType::pause) {
                 clock_.pause();
                 // Pause cancels already-started click tails, but deliberately
-                // preserves an unrendered musical boundary obligation. Stop,
-                // Seek and metronome-off clear both voices and pending state.
+                // preserves an unrendered musical boundary obligation. Stop
+                // and Seek clear both voices and pending state.
                 clearMetronomeVoices();
             } else if (queued.type == CommandType::seek) {
                 if (clock_.seek(queued.target)) {
@@ -1593,7 +1593,13 @@ void RealtimeAudioEngine::consumeCommands() noexcept {
             } else if (queued.type == CommandType::setMetronomeEnabled) {
                 const auto wasUnbounded = clock_.isRunUntilStop();
                 metronomeEnabled_ = queued.value != 0.0F;
-                if (!metronomeEnabled_) clearMetronomeRuntime();
+                if (!metronomeEnabled_) {
+                    // While running, let an already-started 4 ms click finish
+                    // its prepared envelope. Only future beats are cancelled:
+                    // cutting the voice here would create a discontinuity.
+                    if (clock_.isPlaying()) clearMetronomePendingScheduling();
+                    else clearMetronomeRuntime();
+                }
                 const auto loop = loopEnabled_ && temporalContext_ != nullptr &&
                                           temporalContext_->loop
                     ? std::optional<RealtimeProjectClock::LoopBounds>{temporalContext_->loop->clockBounds}
