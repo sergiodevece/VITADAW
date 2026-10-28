@@ -778,7 +778,10 @@ private:
     }
 
     void dispatch(const commands::Command& command) {
+        const auto transportBefore = application_.transport();
         const auto result = dispatcher_.dispatch(command);
+        if (std::holds_alternative<commands::Stop>(command))
+            timeline_.stopCommandCompleted(transportBefore, result);
         if (result.persistence.code == persistence::PersistenceCode::unsavedChanges) {
             const auto path = std::get<commands::LoadProject>(command).path;
             juce::Component::SafePointer<AudioStatusComponent> safe{this};

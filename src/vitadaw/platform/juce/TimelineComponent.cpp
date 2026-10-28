@@ -87,6 +87,18 @@ void TimelineComponent::setTransportState(const transport::TransportState& state
     repaint();
 }
 
+void TimelineComponent::stopCommandCompleted(const transport::TransportState& before,
+                                            const commands::CommandResult& result) {
+    const auto& after = application_.transport();
+    if (!ui::timeline::revealOriginAfterStop(transform_, before, after,
+            result.status == commands::CommandStatus::accepted)) return;
+    // The accepted application projection already includes both queued Stops;
+    // update the playhead and scroll synchronously, without waiting for audio.
+    setTransportState(after);
+    updateScrollBars();
+    repaint();
+}
+
 juce::Rectangle<int> TimelineComponent::viewportBounds() const noexcept {
     return {headerWidth, toolbarHeight + rulerHeight,
             std::max(0, getWidth() - headerWidth - scrollBarThickness),

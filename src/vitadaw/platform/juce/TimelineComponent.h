@@ -19,6 +19,8 @@ public:
 
     void refreshModel(bool resetViewport = false);
     void setTransportState(const transport::TransportState&);
+    void stopCommandCompleted(const transport::TransportState& before,
+                              const commands::CommandResult&);
     void paint(juce::Graphics&) override;
     void resized() override;
     void mouseDown(const juce::MouseEvent&) override;

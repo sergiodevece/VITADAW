@@ -92,6 +92,10 @@ private:
     double visibleStartSeconds_{};
 };
 
+// Explicit Stop completion only; ordinary transport snapshots never move the view.
+bool revealOriginAfterStop(CoordinateTransform&, const transport::TransportState& before,
+                           const transport::TransportState& after, bool accepted) noexcept;
+
 struct TimeSelection {
     ::vitadaw::timeline::ProjectFramePosition startFrame;
     ::vitadaw::timeline::ProjectFramePosition exclusiveEndFrame;

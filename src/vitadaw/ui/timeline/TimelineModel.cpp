@@ -101,6 +101,16 @@ void CoordinateTransform::zoomAround(double newPixelsPerSecond, double anchorX) 
     setVisibleStartSeconds(anchorSeconds - anchorX / pixelsPerSecond_);
 }
 
+bool revealOriginAfterStop(CoordinateTransform& view,
+    const transport::TransportState& before, const transport::TransportState& after,
+    bool accepted) noexcept {
+    if (!accepted || before.playback != transport::PlaybackState::stopped ||
+        after.playback != transport::PlaybackState::stopped || after.position.value != 0)
+        return false;
+    view.setVisibleStartSeconds(0.0);
+    return true;
+}
+
 SnapResult SnapPolicy::resolve(
     ::vitadaw::timeline::ProjectFramePosition raw,
     std::int64_t toleranceFrames, bool enabled,

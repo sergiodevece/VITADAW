@@ -1,6 +1,7 @@
 #include "vitadaw/persistence/ProjectPersistence.h"
 #include "vitadaw/history/UndoManager.h"
 #include "vitadaw/ui/timeline/TimelineModel.h"
+#include "vitadaw/transport/TransportReducer.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -50,6 +51,41 @@ void coordinateTests() {
     check(view.visibleStartSeconds() == 0.0 &&
               view.pixelsPerSecond() == CoordinateTransform::maximumPixelsPerSecond,
           "scroll and zoom limits must be bounded");
+}
+
+void doubleStopViewTests() {
+    CoordinateTransform view{timeline::SampleRate{48000.0}, 200.0, 120.0};
+    transport::TransportState playing;
+    playing.synchronise(true, {96000}, {9600000});
+    const auto first = transport::reduceTransport(playing,
+        {transport::TransportActionKind::stop, {}});
+    check(first.accepted && first.state.position.value == 96000 &&
+              !revealOriginAfterStop(view, playing, first.state, true) &&
+              view.visibleStartSeconds() == 120.0,
+          "first Stop preserves transport position and horizontal viewport");
+    const auto second = transport::reduceTransport(first.state,
+        {transport::TransportActionKind::stop, {}});
+    check(second.accepted && second.state.position.value == 0 &&
+              revealOriginAfterStop(view, first.state, second.state, true) &&
+              view.visibleStartSeconds() == 0.0 &&
+              view.projectFrameToX(second.state.position) == 0.0 &&
+              view.pixelsPerSecond() == 200.0,
+          "second Stop immediately reveals origin and playhead without changing zoom");
+    view.setVisibleStartSeconds(90.0);
+    check(!revealOriginAfterStop(view, first.state, second.state, false) &&
+              view.visibleStartSeconds() == 90.0,
+          "rejected Stop leaves viewport unchanged");
+    auto paused = playing;
+    paused.playback = transport::PlaybackState::paused;
+    const auto pausedStop = transport::reduceTransport(paused,
+        {transport::TransportActionKind::stop, {}});
+    check(!revealOriginAfterStop(view, paused, pausedStop.state, true) &&
+              pausedStop.state.position == playing.position &&
+              view.visibleStartSeconds() == 90.0,
+          "Stop from Paused preserves its existing position and viewport");
+    check(revealOriginAfterStop(view, second.state, second.state, true) &&
+              view.visibleStartSeconds() == 0.0,
+          "Stop already at zero reveals origin after manual scrolling");
 }
 
 void snapshotAndSelectionTests() {
@@ -596,6 +632,7 @@ void largeSessionTest() {
 
 int main() {
     coordinateTests();
+    doubleStopViewTests();
     snapshotAndSelectionTests();
     gestureTests();
     crossTrackInteractionTests();
