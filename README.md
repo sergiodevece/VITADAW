@@ -1162,3 +1162,7 @@ Las validaciones están registradas en [`docs/validation-0.0.2.md`](docs/validat
 [`docs/validation-0.7.1.md`](docs/validation-0.7.1.md) y
 [`docs/validation-0.7.2.md`](docs/validation-0.7.2.md) y
 [`docs/validation-0.7.3.md`](docs/validation-0.7.3.md).
+
+---
+
+**Autor:** Sergio Devece · SerxDev — [Portfolio](https://serxdev.org)
